@@ -1,0 +1,29 @@
+name = "checkin-hub"
+main = "src/index.js"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# Allow importing ui.html as a text module
+rules = [
+  { type = "Text", globs = ["**/*.html"], fallthrough = true }
+]
+
+# Optional: store channels for scheduled check-in
+# [[kv_namespaces]]
+# binding = "CHECKIN_KV"
+# id = "your-kv-namespace-id"
+
+# Optional cron (UTC). Uncomment after binding KV and setting CRON_SECRET.
+# [triggers]
+# crons = ["0 1 * * *"]
+
+[vars]
+# APP_TITLE = "Check-in Hub"
+# Leave empty / unset to disable access password (open panel)
+# ACCESS_PASSWORD is better set as a secret:
+#   npx wrangler secret put ACCESS_PASSWORD
+# Optional dedicated signing secret (falls back to ACCESS_PASSWORD):
+#   npx wrangler secret put SESSION_SECRET
+# SESSION_TTL_SECONDS = "604800"
+# Leave empty to disable cron endpoint
+# CRON_SECRET = ""

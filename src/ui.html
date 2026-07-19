@@ -1,0 +1,1457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Check-in Hub · 多渠道自动签到</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #121a2b;
+      --panel2: #182338;
+      --border: #2a3854;
+      --text: #e8eefc;
+      --muted: #93a4c7;
+      --accent: #5b8cff;
+      --accent2: #22c55e;
+      --danger: #f87171;
+      --warn: #fbbf24;
+      --shadow: 0 10px 40px rgba(0,0,0,.35);
+      --radius: 16px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1d4ed833, transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, #0ea5e933, transparent 55%),
+        var(--bg);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 18px 60px; }
+    header {
+      display: flex; flex-wrap: wrap; gap: 12px;
+      align-items: flex-end; justify-content: space-between;
+      margin-bottom: 18px;
+    }
+    h1 { margin: 0; font-size: 1.65rem; letter-spacing: .2px; }
+    .sub { color: var(--muted); margin-top: 6px; font-size: .95rem; line-height: 1.5; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 10px; border-radius: 999px;
+      background: #1e293b; border: 1px solid var(--border);
+      color: var(--muted); font-size: .82rem;
+      white-space: nowrap;
+    }
+    .card {
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }
+    .card h2 {
+      margin: 0; font-size: 1.05rem;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    label { display: block; font-size: .82rem; color: var(--muted); margin: 10px 0 6px; }
+    input, select, textarea {
+      width: 100%;
+      background: #0b1324;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: inherit;
+      outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px #5b8cff33; }
+    textarea { min-height: 88px; resize: vertical; font-family: var(--mono); font-size: .85rem; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+    .btns, .header-actions, .hero-actions, .toolbar-actions {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    }
+    .btns { margin-top: 14px; }
+    button, .btn {
+      appearance: none; border: 0; cursor: pointer;
+      border-radius: 10px; padding: 10px 14px;
+      font: inherit; font-weight: 600;
+      background: var(--accent); color: white;
+      transition: transform .05s ease, opacity .15s ease, background .15s ease;
+    }
+    button:hover { opacity: .92; }
+    button:active { transform: translateY(1px); }
+    button.secondary { background: #334155; }
+    button.success { background: var(--accent2); color: #052e16; }
+    button.danger { background: #7f1d1d; color: #fecaca; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    button.icon { width: 36px; height: 36px; padding: 0; display: inline-grid; place-items: center; border-radius: 999px; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { color: var(--muted); font-size: .8rem; margin-top: 8px; line-height: 1.45; }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 14px;
+      overflow: hidden;
+      position: relative;
+    }
+    .hero::after {
+      content: "";
+      position: absolute; inset: auto -80px -120px auto;
+      width: 280px; height: 280px; border-radius: 999px;
+      background: #22c55e22; filter: blur(12px); pointer-events: none;
+    }
+    .hero h2 { justify-content: flex-start; margin-bottom: 4px; }
+    @media (max-width: 860px) { .hero { grid-template-columns: 1fr; } }
+    .channel-panel { margin-top: 14px; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 12px;
+    }
+    .filters {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) minmax(150px, 220px);
+      gap: 10px;
+      align-items: end;
+    }
+    @media (max-width: 760px) {
+      .toolbar { grid-template-columns: 1fr; }
+      .filters { grid-template-columns: 1fr; }
+    }
+    .list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .channel {
+      border: 1px solid var(--border);
+      background: #0c1528;
+      border-radius: 14px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      min-height: 218px;
+    }
+    .channel .top {
+      display: flex; gap: 10px; align-items: flex-start; justify-content: space-between;
+      min-width: 0;
+    }
+    .channel .name { font-weight: 750; font-size: 1rem; word-break: break-word; }
+    .channel .name a {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px dashed transparent;
+      transition: color .15s ease, border-color .15s ease;
+    }
+    .channel .name a:hover {
+      color: #93c5fd;
+      border-bottom-color: #60a5fa88;
+    }
+    .channel .meta { color: var(--muted); font-size: .82rem; margin-top: 4px; word-break: break-all; line-height: 1.4; }
+    .channel .quota {
+      margin-top: 8px; font-size: .82rem; color: #bfdbfe;
+      font-family: var(--mono); line-height: 1.45;
+    }
+    .channel .result-detail {
+      margin-top: 8px; font-size: .8rem; color: #cbd5e1;
+      line-height: 1.45; word-break: break-word;
+    }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .tag {
+      font-size: .75rem; padding: 3px 8px; border-radius: 999px;
+      background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+    }
+    .tag.ok { background: #052e16; color: #86efac; border-color: #166534; }
+    .tag.warn { background: #422006; color: #fde68a; border-color: #a16207; }
+    .tag.err { background: #450a0a; color: #fecaca; border-color: #991b1b; }
+    .tag.quota { background: #0c1a33; color: #93c5fd; border-color: #1d4ed8; }
+    .channel .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 12px; }
+    .channel .actions button { padding: 7px 10px; font-size: .85rem; }
+    pre {
+      margin: 0; white-space: pre-wrap; word-break: break-word;
+      font-family: var(--mono); font-size: .8rem; line-height: 1.45;
+      max-height: 420px; overflow: auto;
+      background: #070d18; border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px;
+    }
+    .log-line { margin-bottom: .6rem; }
+    .log-line .t { color: #64748b; }
+    .log-line .ok { color: #86efac; }
+    .log-line .err { color: #fca5a5; }
+    .log-line .info { color: #93c5fd; }
+    .log-line .warn { color: #fde68a; }
+    details { margin-top: 14px; }
+    summary { cursor: pointer; color: var(--muted); }
+    .empty { color: var(--muted); text-align: center; padding: 34px 10px; grid-column: 1 / -1; }
+
+    /* Access gate */
+    #authGate {
+      position: fixed; inset: 0; z-index: 1000;
+      display: none; align-items: center; justify-content: center;
+      background:
+        radial-gradient(900px 500px at 20% 0%, #1d4ed855, transparent 55%),
+        radial-gradient(700px 400px at 90% 100%, #0ea5e944, transparent 50%),
+        rgba(7, 12, 22, .92);
+      backdrop-filter: blur(8px);
+      padding: 20px;
+    }
+    #authGate.show { display: flex; }
+    #authGate .box {
+      width: min(420px, 100%);
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+    }
+    #authGate h2 { margin: 0 0 6px; font-size: 1.2rem; }
+    #authGate .desc { color: var(--muted); font-size: .9rem; margin-bottom: 14px; line-height: 1.45; }
+    #authGate .err {
+      display: none; margin-top: 10px; color: #fecaca; font-size: .85rem;
+      background: #450a0a; border: 1px solid #991b1b; border-radius: 10px; padding: 8px 10px;
+    }
+    #authGate .err.show { display: block; }
+    #appRoot.locked { filter: blur(2px); pointer-events: none; user-select: none; }
+
+    /* Modal */
+    .modal-backdrop, .drawer-backdrop {
+      position: fixed; inset: 0; display: none;
+      background: rgba(2, 6, 23, .68);
+      backdrop-filter: blur(6px);
+      z-index: 700;
+    }
+    .modal-backdrop.show, .drawer-backdrop.show { display: block; }
+    .modal {
+      position: fixed; inset: 0; display: none;
+      z-index: 720; padding: 22px;
+      align-items: center; justify-content: center;
+      pointer-events: none;
+    }
+    .modal.show { display: flex; }
+    .modal-card {
+      width: min(760px, 100%);
+      max-height: min(86vh, 900px);
+      overflow: auto;
+      pointer-events: auto;
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+    .modal-head h2 { margin: 0; }
+
+    /* Log drawer */
+    .log-drawer {
+      position: fixed; top: 0; right: 0; bottom: 0;
+      width: min(520px, 100%);
+      z-index: 730;
+      transform: translateX(104%);
+      transition: transform .18s ease;
+      background: linear-gradient(180deg, var(--panel), #0b1324);
+      border-left: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .log-drawer.show { transform: translateX(0); }
+    .drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .drawer-head h2 { margin: 0; font-size: 1.05rem; }
+    #log {
+      min-height: 0;
+      flex: 1;
+      overflow: auto;
+      background: #070d18;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    /* Floating toast (top-center) */
+    #toastStack {
+      position: fixed;
+      top: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 900;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      width: min(520px, calc(100vw - 28px));
+      pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto;
+      width: fit-content;
+      max-width: 100%;
+      background: rgba(15, 23, 42, .88);
+      border: 1px solid rgba(148, 163, 184, .28);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .35);
+      border-radius: 999px;
+      padding: 10px 18px;
+      color: var(--text);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      animation: toastIn .18s ease both;
+      line-height: 1.4;
+      font-size: .9rem;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+    }
+    .toast.ok { border-color: rgba(34, 197, 94, .45); background: rgba(6, 40, 22, .9); }
+    .toast.err { border-color: rgba(248, 113, 113, .5); background: rgba(69, 10, 10, .9); }
+    .toast.warn { border-color: rgba(251, 191, 36, .45); background: rgba(66, 32, 6, .9); }
+    .toast .title { font-weight: 700; }
+    .toast .desc { color: #cbd5e1; font-size: .8rem; max-width: 46ch; }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateY(-10px) scale(.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+  </style>
+</head>
+<body>
+  <div id="authGate" aria-modal="true" role="dialog">
+    <div class="box">
+      <h2>访问受保护</h2>
+      <div class="desc">此 Check-in Hub 已启用访问密码。输入密码后可管理渠道并执行签到。</div>
+      <label for="accessPassword">访问密码</label>
+      <input id="accessPassword" type="password" autocomplete="current-password" placeholder="请输入访问密码" />
+      <div class="btns">
+        <button id="btnAuthLogin" class="success" type="button">解锁进入</button>
+      </div>
+      <div class="err" id="authError"></div>
+      <div class="hint">密码在 Cloudflare 环境变量 <code>ACCESS_PASSWORD</code> 中配置；会话 Cookie 默认 7 天。</div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modalBackdrop"></div>
+  <div class="modal" id="channelModal" aria-modal="true" role="dialog" aria-labelledby="modalTitle">
+    <section class="modal-card">
+      <div class="modal-head">
+        <h2 id="modalTitle">新增渠道</h2>
+        <button id="btnCloseModal" class="secondary icon" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="hint">新增/编辑渠道在弹窗中完成，保存后会回到首页卡片列表。</div>
+      <input type="hidden" id="editId" />
+      <label>显示名称</label>
+      <input id="name" placeholder="例如：林夕公益 / 100x / Free Claude" />
+
+      <div class="row">
+        <div>
+          <label>渠道类型</label>
+          <select id="type"></select>
+        </div>
+        <div>
+          <label>站点 Base URL</label>
+          <input id="baseUrl" placeholder="https://example.com" />
+        </div>
+      </div>
+
+      <div id="dynamicFields"></div>
+
+      <div class="btns">
+        <button id="btnSave" class="success">保存渠道</button>
+        <button id="btnTestForm" class="secondary" type="button">测试当前表单</button>
+        <button id="btnReset" class="secondary" type="button">清空表单</button>
+        <button id="btnCancelModal" class="ghost" type="button">取消</button>
+      </div>
+      <div class="hint">
+        凭证只保存在你浏览器的 <code>localStorage</code>，不会上传到本 Worker，除非你主动点「测试/签到」时由 Worker 代发请求。<br />
+        点击渠道卡片上的<strong>显示名称</strong>可直接打开对应站点。NewAPI OAuth 站通常无账密登录，需自行维护 Cookie / Token。
+      </div>
+    </section>
+  </div>
+
+  <div class="drawer-backdrop" id="logBackdrop"></div>
+  <aside class="log-drawer" id="logDrawer" aria-label="运行日志">
+    <div class="drawer-head">
+      <h2>运行日志</h2>
+      <div class="toolbar-actions">
+        <button id="btnClearLog" class="secondary" style="padding:7px 10px;font-size:.82rem">清空</button>
+        <button id="btnCloseLog" class="secondary icon" type="button" aria-label="关闭日志">×</button>
+      </div>
+    </div>
+    <div class="hint">按钮操作只弹出简短提示；完整请求结果与错误信息会保留在这里。</div>
+    <div id="log"></div>
+  </aside>
+
+  <div id="toastStack" aria-live="polite" aria-atomic="true"></div>
+
+  <div class="wrap" id="appRoot">
+    <header>
+      <div>
+        <h1>Check-in Hub</h1>
+        <div class="sub">多渠道自动签到面板 · 首页总览所有渠道 · 支持筛选、排序与弹窗编辑</div>
+      </div>
+      <div class="header-actions">
+        <div class="badge" id="adapterBadge">加载适配器中…</div>
+        <button id="btnOpenLog" class="secondary" type="button" style="padding:7px 10px;font-size:.82rem">Log</button>
+        <button id="btnLogout" class="secondary" type="button" style="display:none;padding:7px 10px;font-size:.82rem">退出登录</button>
+      </div>
+    </header>
+
+    <section class="card hero">
+      <div>
+        <h2>渠道总览</h2>
+        <div class="sub">所有渠道卡片直接显示在首页。新增或编辑会以弹窗打开；签到、状态、登录等动作通过 Toast 给出即时反馈。</div>
+      </div>
+      <div class="hero-actions">
+        <button id="btnAddChannel" class="success" type="button">新增渠道</button>
+        <button id="btnRunAll" type="button">全部签到</button>
+        <button id="btnExport" class="secondary" type="button">导出 JSON</button>
+        <button id="btnImport" class="secondary" type="button">导入 JSON</button>
+      </div>
+    </section>
+
+    <section class="card channel-panel">
+      <div class="toolbar">
+        <div>
+          <h2>
+            <span>渠道卡片</span>
+            <span class="badge" id="countBadge">0</span>
+          </h2>
+          <div class="hint" id="listHint">按筛选和排序展示渠道。</div>
+        </div>
+        <div class="filters">
+          <div>
+            <label>筛选类型</label>
+            <select id="filterType"><option value="">全部类型</option></select>
+          </div>
+          <div>
+            <label>排序</label>
+            <select id="sortBy">
+              <option value="recent">最近运行优先</option>
+              <option value="created">添加顺序</option>
+              <option value="name">名称 A-Z</option>
+              <option value="type">类型</option>
+              <option value="status">成功优先</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="list" id="channelList"><div class="empty">还没有渠道，点击「新增渠道」。</div></div>
+    </section>
+  </div>
+
+  <script>
+    const STORAGE_KEY = "checkin_hub_channels_v1";
+    const SESSION_KEY = "checkin_hub_session_token";
+    let adapters = [];
+    let channels = loadChannels();
+    let authState = { authRequired: false, authenticated: true, token: localStorage.getItem(SESSION_KEY) || "" };
+    let filterType = "";
+    let sortBy = "recent";
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+
+    function loadChannels() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
+      catch { return []; }
+    }
+    function saveChannels() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(channels));
+      renderList();
+    }
+
+    function uid() {
+      return "ch_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    }
+
+    function log(msg, level = "info") {
+      const div = document.createElement("div");
+      div.className = "log-line";
+      const t = new Date().toLocaleTimeString();
+      div.innerHTML = `<span class="t">[${t}]</span> <span class="${level}">${escapeHtml(msg)}</span>`;
+      logEl.prepend(div);
+    }
+
+    function showToast(title, desc = "", level = "info", timeout = 2800) {
+      const stack = $("toastStack");
+      const div = document.createElement("div");
+      div.className = `toast ${level}`;
+      div.innerHTML = `<div class="title">${escapeHtml(title)}</div>${desc ? `<div class="desc">${escapeHtml(desc)}</div>` : ""}`;
+      stack.appendChild(div);
+      // keep only a few floating toasts to avoid stacking the whole screen
+      while (stack.children.length > 3) stack.firstElementChild.remove();
+      const close = () => {
+        div.style.opacity = "0";
+        div.style.transform = "translateY(-8px) scale(.98)";
+        div.style.transition = "opacity .16s ease, transform .16s ease";
+        setTimeout(() => div.remove(), 180);
+      };
+      div.addEventListener("click", close);
+      setTimeout(close, timeout);
+    }
+
+    function openChannelModal(ch = null) {
+      if (ch) {
+        fillForm(ch);
+        $("modalTitle").textContent = "编辑渠道";
+      } else {
+        resetForm();
+        $("modalTitle").textContent = "新增渠道";
+      }
+      $("modalBackdrop").classList.add("show");
+      $("channelModal").classList.add("show");
+      setTimeout(() => $("name").focus(), 0);
+    }
+
+    function closeChannelModal() {
+      $("modalBackdrop").classList.remove("show");
+      $("channelModal").classList.remove("show");
+    }
+
+    function openLogDrawer() {
+      $("logBackdrop").classList.add("show");
+      $("logDrawer").classList.add("show");
+    }
+
+    function closeLogDrawer() {
+      $("logBackdrop").classList.remove("show");
+      $("logDrawer").classList.remove("show");
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function setSessionToken(token) {
+      authState.token = token || "";
+      if (token) localStorage.setItem(SESSION_KEY, token);
+      else localStorage.removeItem(SESSION_KEY);
+    }
+
+    function authHeaders(extra = {}) {
+      const h = { ...extra };
+      if (authState.token) h.Authorization = `Bearer ${authState.token}`;
+      return h;
+    }
+
+    function showGate(show, errMsg = "") {
+      const gate = $("authGate");
+      const root = $("appRoot");
+      if (show) {
+        gate.classList.add("show");
+        root.classList.add("locked");
+        $("btnLogout").style.display = "none";
+      } else {
+        gate.classList.remove("show");
+        root.classList.remove("locked");
+        $("btnLogout").style.display = authState.authRequired ? "inline-block" : "none";
+      }
+      const err = $("authError");
+      if (errMsg) {
+        err.textContent = errMsg;
+        err.classList.add("show");
+      } else {
+        err.textContent = "";
+        err.classList.remove("show");
+      }
+    }
+
+    async function fetchAuthStatus() {
+      const res = await fetch("/api/auth/status", {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      });
+      const data = await res.json().catch(() => ({}));
+      authState.authRequired = !!data.authRequired;
+      authState.authenticated = data.authenticated !== false;
+      // if server says not authenticated, drop stale token
+      if (authState.authRequired && !authState.authenticated) {
+        // keep token only if cookie path still works — status uses bearer too
+        // if both fail, clear
+        setSessionToken("");
+      }
+      return data;
+    }
+
+    async function doLogin(password) {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || data.message || `登录失败 HTTP ${res.status}`);
+      }
+      if (data.token) setSessionToken(data.token);
+      authState.authRequired = data.authRequired !== false;
+      authState.authenticated = true;
+      return data;
+    }
+
+    async function doLogout() {
+      try {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: authHeaders(),
+          credentials: "same-origin",
+        });
+      } catch { /* ignore */ }
+      setSessionToken("");
+      authState.authenticated = false;
+      showGate(!!authState.authRequired);
+      log("已退出登录", "info");
+      showToast("已退出登录", "", "info");
+    }
+
+    function setByPath(obj, path, value) {
+      const parts = path.split(".");
+      let cur = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const p = parts[i];
+        if (cur[p] == null || typeof cur[p] !== "object") cur[p] = {};
+        cur = cur[p];
+      }
+      cur[parts[parts.length - 1]] = value;
+    }
+
+    function getByPath(obj, path) {
+      return path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
+    }
+
+    function currentType() {
+      return $("type").value;
+    }
+
+    function adapterOf(type) {
+      return adapters.find((a) => a.id === type);
+    }
+
+    function renderTypeOptions() {
+      const sel = $("type");
+      sel.innerHTML = adapters.map((a) => `<option value="${a.id}">${a.name} — ${a.description}</option>`).join("");
+      const filter = $("filterType");
+      const current = filter.value;
+      filter.innerHTML = `<option value="">全部类型</option>` + adapters.map((a) => `<option value="${a.id}">${a.name}</option>`).join("");
+      filter.value = adapters.some((a) => a.id === current) ? current : "";
+      filterType = filter.value;
+      renderFields();
+    }
+
+    function renderFields() {
+      const a = adapterOf(currentType());
+      const box = $("dynamicFields");
+      if (!a) { box.innerHTML = ""; return; }
+      // baseUrl already in form; skip if field is baseUrl
+      const fields = (a.fields || []).filter((f) => f.key !== "baseUrl");
+      box.innerHTML = fields.map((f) => {
+        const type = f.type || "text";
+        const ph = escapeHtml(f.placeholder || "");
+        const key = escapeHtml(f.key);
+        const label = escapeHtml(f.label || f.key);
+        if (type === "textarea") {
+          return `
+            <label>${label}</label>
+            <textarea data-field="${key}" rows="4" placeholder="${ph}" style="width:100%;min-height:88px;font-family:var(--mono);font-size:.8rem;line-height:1.4;"></textarea>
+          `;
+        }
+        return `
+          <label>${label}</label>
+          <input data-field="${key}" type="${type}" placeholder="${ph}" />
+        `;
+      }).join("");
+    }
+
+    function normalizeCookieInput(val) {
+      let s = String(val || "").replace(/^\uFEFF/, "").trim();
+      if (!s) return "";
+      s = s.replace(/^cookie\s*:\s*/i, "");
+      if (s.includes("\n")) {
+        const pairs = [];
+        for (const line of s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+          if (/^(name|cookie)\b/i.test(line) && !line.includes("=")) continue;
+          if (line.includes("\t")) {
+            const [n, ...rest] = line.split("\t");
+            if (n && rest.length) pairs.push(`${n.trim()}=${rest.join("\t").trim()}`);
+            continue;
+          }
+          if (line.includes("=")) pairs.push(line.replace(/;\s*$/, ""));
+        }
+        s = pairs.join("; ");
+      }
+      return s
+        .split(";")
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .filter((p) => !p.split("=")[0].trim().toLowerCase().startsWith("_cfpre_"))
+        .join("; ");
+    }
+
+    function readForm() {
+      const type = currentType();
+      const channel = {
+        id: $("editId").value || uid(),
+        name: $("name").value.trim() || "未命名渠道",
+        type,
+        baseUrl: $("baseUrl").value.trim().replace(/\/+$/, ""),
+        auth: {},
+        options: {},
+      };
+      document.querySelectorAll("[data-field]").forEach((el) => {
+        const key = el.getAttribute("data-field");
+        let val = el.value;
+        if (key === "auth.cookie" || key.endsWith(".cookie") || key.endsWith(".session")) {
+          val = normalizeCookieInput(val);
+        } else {
+          val = String(val || "").trim();
+        }
+        if (val !== "") setByPath(channel, key, val);
+      });
+      return channel;
+    }
+
+    function fillForm(ch) {
+      $("editId").value = ch.id || "";
+      $("name").value = ch.name || "";
+      $("type").value = ch.type;
+      renderFields();
+      $("baseUrl").value = ch.baseUrl || "";
+      document.querySelectorAll("[data-field]").forEach((el) => {
+        const key = el.getAttribute("data-field");
+        const val = getByPath(ch, key);
+        el.value = val == null ? "" : String(val);
+      });
+    }
+
+    function resetForm() {
+      $("editId").value = "";
+      $("name").value = "";
+      $("baseUrl").value = "";
+      renderFields();
+      document.querySelectorAll("[data-field]").forEach((el) => { el.value = ""; });
+    }
+
+    function numOrNull(v) {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function fmtNum(n, digits = 4) {
+      if (n == null || !Number.isFinite(Number(n))) return null;
+      const x = Number(n);
+      if (Math.abs(x) >= 1000 || Number.isInteger(x)) return x.toLocaleString("zh-CN");
+      return x.toLocaleString("zh-CN", { maximumFractionDigits: digits });
+    }
+
+    function pickQuotaPerUnit(raw) {
+      const u = raw || {};
+      return numOrNull(u.quota_per_unit ?? u.QuotaPerUnit ?? u.quotaPerUnit) || 500000;
+    }
+
+    function formatUsdAmount(value, digits = 2) {
+      const n = numOrNull(value);
+      if (n == null) return null;
+      const abs = Math.abs(n);
+      const maxDigits = abs > 0 && abs < 0.01 ? 4 : digits;
+      return `$${n.toLocaleString("en-US", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: maxDigits,
+      })}`;
+    }
+
+    function formatUsdFromQuota(quota, perUnit) {
+      const q = numOrNull(quota);
+      const p = numOrNull(perUnit);
+      if (q == null || !p || p <= 0) return null;
+      return formatUsdAmount(q / p);
+    }
+
+    function moneyLabel(quotaOrAmount, perUnit, alreadyMoney = false) {
+      if (alreadyMoney) return formatUsdAmount(quotaOrAmount);
+      return formatUsdFromQuota(quotaOrAmount, perUnit) || formatUsdAmount(quotaOrAmount);
+    }
+
+    function extractQuotaInfo(type, data = {}, prev = null) {
+      const user = data.user || {};
+      const status = data.status || {};
+      const result = data.result || {};
+      const raw = user.raw || data.raw?.data || data.raw || {};
+      const info = { ...(prev || {}) };
+
+      const balance = numOrNull(
+        user.balance ?? status.balance ?? result.balance ?? raw.balance ?? raw.balance_after
+      );
+      if (balance != null) info.balance = balance;
+
+      // 哈基米等站 data.quota 可能为 0，真实额度在 gift_quota / total_quota
+      const quota = numOrNull(
+        user.quota ??
+          user.giftQuota ??
+          user.totalQuota ??
+          raw.gift_quota ??
+          raw.total_quota ??
+          raw.quota
+      );
+      const usedQuota = numOrNull(user.usedQuota ?? user.used_quota ?? raw.used_quota);
+      if (quota != null) info.quota = quota;
+      if (usedQuota != null) info.usedQuota = usedQuota;
+      const giftQuota = numOrNull(user.giftQuota ?? raw.gift_quota);
+      const totalQuota = numOrNull(user.totalQuota ?? raw.total_quota);
+      const walletQuota = numOrNull(user.walletQuota ?? raw.quota);
+      if (giftQuota != null) info.giftQuota = giftQuota;
+      if (totalQuota != null) info.totalQuota = totalQuota;
+      if (walletQuota != null) info.walletQuota = walletQuota;
+
+      const perUnit = pickQuotaPerUnit(raw);
+      if (type === "newapi" || type === "agentrouter" || quota != null || usedQuota != null) {
+        info.quotaPerUnit = perUnit;
+      }
+
+      const reward = numOrNull(result.reward ?? result.quota_awarded ?? status.todayReward);
+      if (reward != null) info.lastReward = reward;
+
+      if (result.currentStreak != null) info.streak = result.currentStreak;
+      else if (status.currentStreak != null) info.streak = status.currentStreak;
+
+      if (user.username || user.email || user.displayName) {
+        info.account = user.username || user.displayName || user.email;
+      }
+
+      info.updatedAt = Date.now();
+      return info;
+    }
+
+    function formatQuotaLine(type, q) {
+      if (!q) return "";
+      const parts = [];
+      const perUnit = q.quotaPerUnit || 500000;
+      if (type === "newapi" || type === "agentrouter" || q.quota != null || q.usedQuota != null) {
+        if (q.quota != null) {
+          const usd = moneyLabel(q.quota, perUnit);
+          if (usd) parts.push(`余额 ${usd}`);
+        }
+        if (q.usedQuota != null) {
+          const usd = moneyLabel(q.usedQuota, perUnit);
+          if (usd) parts.push(`已用 ${usd}`);
+        }
+      }
+      if (q.balance != null && (type === "sub2api" || parts.length === 0 || q.quota == null)) {
+        // Sub2API balance 本身就是金额
+        const usd = type === "sub2api" ? formatUsdAmount(q.balance) : moneyLabel(q.balance, perUnit, true);
+        if (usd) parts.push(`余额 ${usd}`);
+      }
+      if (q.lastReward != null) {
+        const usd =
+          type === "sub2api"
+            ? formatUsdAmount(q.lastReward)
+            : moneyLabel(q.lastReward, perUnit);
+        if (usd) parts.push(`奖励 ${usd}`);
+      }
+      if (q.streak != null) parts.push(`连续 ${q.streak} 天`);
+      return parts.join(" · ");
+    }
+
+    function actionLabel(action) {
+      return ({
+        checkin: "签到",
+        status: "状态",
+        me: "用户",
+        login: "登录",
+        refresh: "刷新",
+      })[action] || action;
+    }
+
+    function buildSummary(action, data = {}) {
+      const parts = [];
+      const result = data.result || {};
+      const status = data.status || {};
+      const user = data.user || {};
+      const raw = user.raw || data.raw?.data || data.raw || {};
+      const perUnit = pickQuotaPerUnit(raw);
+      const msg = String(data.message || data.error || "").trim();
+      // 原始 message 常夹带大数字额度，优先用结构化字段生成 $ 文案
+      const msgLooksNoisy = /\d{5,}|quota|额度\s*[\d,]+/i.test(msg);
+      if (data.ok === false && msg) parts.push(msg);
+      else if (msg && !msgLooksNoisy && !/^(ok|success|failed|成功)$/i.test(msg)) {
+        parts.push(msg);
+      }
+
+      if (result.alreadyCheckedIn) parts.push("今日已签到");
+      if (result.reward != null) {
+        const usd = moneyLabel(result.reward, perUnit);
+        if (usd) parts.push(`奖励 ${usd}`);
+      }
+      if (result.balance != null) {
+        const usd = formatUsdAmount(result.balance) || moneyLabel(result.balance, perUnit, true);
+        if (usd) parts.push(`余额 ${usd}`);
+      }
+      if (result.currentStreak != null) parts.push(`连续 ${result.currentStreak} 天`);
+      if (result.totalCheckInDays != null) parts.push(`累计 ${result.totalCheckInDays} 天`);
+      if (result.totalReward != null) {
+        const usd = moneyLabel(result.totalReward, perUnit);
+        if (usd) parts.push(`累计奖励 ${usd}`);
+      }
+
+      if (status.checkedInToday != null) {
+        parts.push(status.checkedInToday ? "今日已签到" : "今日未签到");
+      }
+      if (status.currentStreak != null) parts.push(`连续 ${status.currentStreak} 天`);
+      if (status.todayReward != null) {
+        const usd = moneyLabel(status.todayReward, perUnit);
+        if (usd) parts.push(`今日奖励 ${usd}`);
+      }
+      if (status.totalReward != null) {
+        const usd = moneyLabel(status.totalReward, perUnit);
+        if (usd) parts.push(`累计奖励 ${usd}`);
+      }
+      if (status.balance != null) {
+        const usd = formatUsdAmount(status.balance) || moneyLabel(status.balance, perUnit, true);
+        if (usd) parts.push(`余额 ${usd}`);
+      }
+      if (status.checkinCount != null) parts.push(`本月签到 ${status.checkinCount} 次`);
+      if (status.totalQuota != null) {
+        const usd = moneyLabel(status.totalQuota, perUnit);
+        if (usd) parts.push(`本月获得 ${usd}`);
+      }
+
+      if (user.balance != null) {
+        const usd = formatUsdAmount(user.balance) || moneyLabel(user.balance, perUnit, true);
+        if (usd) parts.push(`余额 ${usd}`);
+      }
+      {
+        const displayQuota = numOrNull(
+          user.quota ?? user.giftQuota ?? user.totalQuota ?? raw.gift_quota ?? raw.total_quota
+        );
+        if (displayQuota != null) {
+          const usd = moneyLabel(displayQuota, perUnit);
+          if (usd) parts.push(`余额 ${usd}`);
+        }
+      }
+      if (user.usedQuota != null) {
+        const usd = moneyLabel(user.usedQuota, perUnit);
+        if (usd) parts.push(`已用 ${usd}`);
+      }
+
+      // 去重并压缩
+      const seen = new Set();
+      const uniq = [];
+      for (const p of parts) {
+        const key = String(p);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        uniq.push(key);
+      }
+
+      if (!uniq.length) {
+        if (data.ok) return `${actionLabel(action)}成功`;
+        return `${actionLabel(action)}失败`;
+      }
+      return uniq.join(" · ");
+    }
+
+    function getVisibleChannels() {
+      const visible = channels.filter((ch) => !filterType || ch.type === filterType);
+      const byName = (a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
+      const byType = (a, b) => String(a.type || "").localeCompare(String(b.type || ""), "zh-CN") || byName(a, b);
+      const byRecent = (a, b) => (b.lastResult?.at || 0) - (a.lastResult?.at || 0) || byName(a, b);
+      const byStatus = (a, b) => Number(!!b.lastResult?.ok) - Number(!!a.lastResult?.ok) || byRecent(a, b);
+      if (sortBy === "name") return visible.sort(byName);
+      if (sortBy === "type") return visible.sort(byType);
+      if (sortBy === "status") return visible.sort(byStatus);
+      if (sortBy === "recent") return visible.sort(byRecent);
+      return visible;
+    }
+
+    function renderList() {
+      const visible = getVisibleChannels();
+      $("countBadge").textContent = `${visible.length} / ${channels.length}`;
+      $("listHint").textContent = filterType
+        ? `当前显示 ${visible.length} 个 ${adapterOf(filterType)?.name || filterType} 渠道。`
+        : `当前显示全部 ${channels.length} 个渠道。`;
+      const list = $("channelList");
+      if (!channels.length) {
+        list.innerHTML = `<div class="empty">还没有渠道，点击「新增渠道」。</div>`;
+        return;
+      }
+      if (!visible.length) {
+        list.innerHTML = `<div class="empty">没有符合筛选条件的渠道。</div>`;
+        return;
+      }
+      list.innerHTML = visible.map((ch) => {
+        const a = adapterOf(ch.type);
+        const last = ch.lastResult;
+        const quotaText = formatQuotaLine(ch.type, ch.quotaInfo);
+        let tag = `<span class="tag">未运行</span>`;
+        if (last) {
+          const short = last.short || last.summary || (last.ok ? "成功" : "失败");
+          if (last.ok) tag = `<span class="tag ok">${escapeHtml(actionLabel(last.action || "") + (last.action ? " · " : "") + short)}</span>`;
+          else tag = `<span class="tag err">${escapeHtml(actionLabel(last.action || "") + (last.action ? " · " : "") + short)}</span>`;
+        }
+        if (quotaText) {
+          tag += `<span class="tag quota">${escapeHtml(quotaText)}</span>`;
+        }
+        const detail = last?.summary
+          ? `<div class="result-detail">${escapeHtml(last.summary)}</div>`
+          : "";
+        const quotaBlock = quotaText
+          ? `<div class="quota">${escapeHtml(quotaText)}</div>`
+          : "";
+        const siteUrl = String(ch.baseUrl || "").trim();
+        const nameHtml = siteUrl
+          ? `<a href="${escapeHtml(siteUrl)}" target="_blank" rel="noopener noreferrer" title="打开 ${escapeHtml(siteUrl)}">${escapeHtml(ch.name)}</a>`
+          : escapeHtml(ch.name);
+        return `
+          <div class="channel" data-id="${ch.id}">
+            <div class="top">
+              <div>
+                <div class="name">${nameHtml}</div>
+                <div class="meta">${escapeHtml(a?.name || ch.type)} · ${escapeHtml(ch.baseUrl)}</div>
+                ${quotaBlock}
+                <div class="tags">${tag}</div>
+                ${detail}
+              </div>
+            </div>
+            <div class="actions">
+              <button data-act="checkin" class="success">签到</button>
+              <button data-act="status" class="secondary">状态</button>
+              <button data-act="me" class="secondary">用户</button>
+              <button data-act="login" class="secondary">登录/校验</button>
+              <button data-act="log" class="secondary">Log</button>
+              <button data-act="edit" class="secondary">编辑</button>
+              <button data-act="delete" class="danger">删除</button>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function api(action, channel) {
+      const res = await fetch("/api/checkin", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        credentials: "same-origin",
+        body: JSON.stringify({ action, channel }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401 || data.authRequired) {
+        authState.authenticated = false;
+        setSessionToken("");
+        showGate(true, data.error || "会话已失效，请重新输入访问密码");
+        const err = new Error(data.error || "需要访问密码");
+        err.data = data;
+        throw err;
+      }
+      // 业务失败（如 422）也返回结构化结果，便于展示 message/result/user
+      if (typeof data.ok === "boolean") return data;
+      if (!res.ok) {
+        const err = new Error(data.error || data.message || `HTTP ${res.status}`);
+        err.data = data;
+        throw err;
+      }
+      return data;
+    }
+
+    function mergeTokens(ch, tokens) {
+      if (!tokens) return ch;
+      const next = { ...ch, auth: { ...(ch.auth || {}) } };
+      if (tokens.accessToken) next.auth.accessToken = tokens.accessToken;
+      if (tokens.refreshToken) next.auth.refreshToken = tokens.refreshToken;
+      if (tokens.cookie) next.auth.cookie = tokens.cookie;
+      if (tokens.userId) next.auth.userId = String(tokens.userId);
+      return next;
+    }
+
+    async function maybeRefreshUser(ch, data, action) {
+      if (!data?.ok) return data;
+      if (!["checkin", "login", "status"].includes(action)) return data;
+      const hasQuota =
+        data.user?.quota != null ||
+        data.user?.balance != null ||
+        data.user?.usedQuota != null ||
+        data.status?.balance != null ||
+        data.result?.balance != null;
+      if (hasQuota && action !== "checkin") return data;
+      // 签到后尽量再拉一次用户，刷新额度/余额
+      if (action === "checkin" || !hasQuota) {
+        try {
+          const me = await api("me", ch);
+          if (me.tokens) Object.assign(ch, mergeTokens(ch, me.tokens));
+          if (me.ok && me.user) {
+            return {
+              ...data,
+              user: me.user,
+              tokens: me.tokens || data.tokens,
+            };
+          }
+        } catch {
+          /* ignore secondary me failure */
+        }
+      }
+      return data;
+    }
+
+    async function runChannel(id, action) {
+      const idx = channels.findIndex((c) => c.id === id);
+      if (idx < 0) return;
+      let ch = channels[idx];
+      log(`${ch.name} → ${actionLabel(action)} ...`, "info");
+      showToast(`${ch.name}：${actionLabel(action)}中`, "完整过程可点 Log 查看", "info", 2200);
+      try {
+        let data = await api(action, ch);
+        if (data.tokens) {
+          ch = mergeTokens(ch, data.tokens);
+        }
+        data = await maybeRefreshUser(ch, data, action);
+        if (data.tokens) {
+          ch = mergeTokens(ch, data.tokens);
+        }
+
+        const summary = buildSummary(action, data);
+        const short = (() => {
+          const r = data.result || {};
+          const perUnit = pickQuotaPerUnit(data.user?.raw || data.raw?.data || data.raw);
+          if (r.alreadyCheckedIn) return "今日已签到";
+          if (r.reward != null) {
+            const usd = moneyLabel(r.reward, perUnit);
+            return usd ? `+${usd}` : "成功";
+          }
+          const displayQuota = numOrNull(
+            data.user?.quota ?? data.user?.giftQuota ?? data.user?.totalQuota
+          );
+          if ((action === "me" || action === "status") && displayQuota != null) {
+            return moneyLabel(displayQuota, perUnit) || "成功";
+          }
+          const msg = String(data.message || "").trim();
+          if (msg && !/^(ok|success|failed)$/i.test(msg) && !/\d{5,}/.test(msg)) {
+            return msg.slice(0, 40);
+          }
+          return data.ok ? "成功" : "失败";
+        })();
+
+        ch.quotaInfo = extractQuotaInfo(ch.type, data, ch.quotaInfo);
+        ch.lastResult = {
+          ok: !!data.ok,
+          action,
+          short,
+          summary: `${actionLabel(action)}：${summary}`,
+          at: Date.now(),
+          data,
+        };
+        channels[idx] = ch;
+        saveChannels();
+        log(`${ch.name} ${actionLabel(action)} → ${summary}`, data.ok ? "ok" : "err");
+        showToast(
+          `${ch.name}：${actionLabel(action)}${data.ok ? "完成" : "失败"}`,
+          summary,
+          data.ok ? "ok" : "err"
+        );
+        if (data.raw || data.user || data.result || data.status) {
+          log(JSON.stringify({
+            message: data.message,
+            result: data.result,
+            status: data.status,
+            user: data.user && {
+              id: data.user.id,
+              username: data.user.username || data.user.displayName || data.user.email,
+              balance: data.user.balance,
+              quota: data.user.quota,
+              usedQuota: data.user.usedQuota,
+            },
+          }, null, 2), data.ok ? "info" : "err");
+        }
+        console.log(ch.name, action, data);
+        return data;
+      } catch (e) {
+        const detail = e.data ? buildSummary(action, e.data) : (e.message || String(e));
+        const msg = detail || e.message || String(e);
+        channels[idx].lastResult = {
+          ok: false,
+          action,
+          short: (e.message || "失败").slice(0, 40),
+          summary: `${actionLabel(action)}：${msg}`,
+          at: Date.now(),
+          data: e.data || null,
+        };
+        saveChannels();
+        log(`${ch.name} ${actionLabel(action)} 失败: ${msg}`, "err");
+        showToast(`${ch.name}：${actionLabel(action)}失败`, msg, "err", 5200);
+        throw e;
+      }
+    }
+
+    $("type").addEventListener("change", renderFields);
+    $("filterType").addEventListener("change", (ev) => {
+      filterType = ev.target.value;
+      renderList();
+    });
+    $("sortBy").addEventListener("change", (ev) => {
+      sortBy = ev.target.value;
+      renderList();
+    });
+    $("btnAddChannel").addEventListener("click", () => openChannelModal());
+    $("btnCloseModal").addEventListener("click", closeChannelModal);
+    $("btnCancelModal").addEventListener("click", closeChannelModal);
+    $("modalBackdrop").addEventListener("click", closeChannelModal);
+    $("btnOpenLog").addEventListener("click", openLogDrawer);
+    $("btnCloseLog").addEventListener("click", closeLogDrawer);
+    $("logBackdrop").addEventListener("click", closeLogDrawer);
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        closeChannelModal();
+        closeLogDrawer();
+      }
+    });
+    $("btnReset").addEventListener("click", resetForm);
+    $("btnClearLog").addEventListener("click", () => {
+      logEl.innerHTML = "";
+      showToast("日志已清空", "", "info");
+    });
+    $("btnTestForm").addEventListener("click", async () => {
+      const ch = readForm();
+      if (!ch.baseUrl) return showToast("请填写站点 Base URL", "", "warn");
+      if (!/^https?:\/\//i.test(ch.baseUrl)) return showToast("Base URL 格式不正确", "需要以 http(s):// 开头", "warn");
+      if (ch.type === "newapi" || ch.type === "agentrouter") {
+        if (!ch.auth?.cookie && !ch.auth?.password && !ch.auth?.token) {
+          return showToast("请先填写凭证", "粘贴 Cookie，或填写账密/Token", "warn");
+        }
+        if (ch.auth?.cookie && !/session\s*=/i.test(ch.auth.cookie) && !ch.auth?.token) {
+          if (!confirm("Cookie 里似乎没有 session=，可能复制不完整。仍要继续测试吗？")) return;
+        }
+      }
+      // 临时跑当前表单，不强制写入列表
+      const tempId = ch.id || uid();
+      ch.id = tempId;
+      const prevIdx = channels.findIndex((c) => c.id === tempId);
+      if (prevIdx >= 0) channels[prevIdx] = { ...channels[prevIdx], ...ch, auth: { ...(channels[prevIdx].auth || {}), ...(ch.auth || {}) } };
+      else channels.unshift(ch);
+      saveChannels();
+      $("btnTestForm").disabled = true;
+      try {
+        log(`测试表单渠道：${ch.name} (${ch.baseUrl})`, "info");
+        await runChannel(tempId, "me");
+      } catch (e) {
+        /* runChannel already logged */
+      } finally {
+        $("btnTestForm").disabled = false;
+      }
+    });
+
+    $("btnSave").addEventListener("click", () => {
+      const ch = readForm();
+      if (!ch.baseUrl) return showToast("请填写站点 Base URL", "", "warn");
+      if (!/^https?:\/\//i.test(ch.baseUrl)) return showToast("Base URL 格式不正确", "需要以 http(s):// 开头", "warn");
+      const idx = channels.findIndex((c) => c.id === ch.id);
+      if (idx >= 0) {
+        const prev = channels[idx];
+        const nameChanged = (prev.name || "").trim() !== (ch.name || "").trim();
+        // 编辑时若改了显示名称，视为基于当前表单新增渠道，不覆盖原渠道
+        if (nameChanged) {
+          const created = {
+            ...ch,
+            id: uid(),
+            auth: { ...(prev.auth || {}), ...(ch.auth || {}) },
+            options: { ...(prev.options || {}), ...(ch.options || {}) },
+          };
+          delete created.lastResult;
+          channels.unshift(created);
+          log(`显示名称已变更，已添加为新渠道：${created.name}（保留原渠道：${prev.name}）`, "ok");
+          showToast("已添加为新渠道", created.name, "ok");
+        } else {
+          // 同名则更新，并保留 lastResult / 表单未填的凭证字段
+          channels[idx] = {
+            ...prev,
+            ...ch,
+            auth: { ...(prev.auth || {}), ...(ch.auth || {}) },
+            options: { ...(prev.options || {}), ...(ch.options || {}) },
+          };
+          log(`已更新渠道：${ch.name}`, "ok");
+          showToast("已更新渠道", ch.name, "ok");
+        }
+      } else {
+        channels.unshift(ch);
+        log(`已添加渠道：${ch.name}`, "ok");
+        showToast("已添加渠道", ch.name, "ok");
+      }
+      saveChannels();
+      resetForm();
+      closeChannelModal();
+    });
+
+    $("channelList").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      const card = btn.closest(".channel");
+      const id = card?.dataset.id;
+      const act = btn.dataset.act;
+      if (!id) return;
+      if (act === "edit") {
+        const ch = channels.find((c) => c.id === id);
+        if (ch) openChannelModal(ch);
+        return;
+      }
+      if (act === "delete") {
+        if (!confirm("确定删除该渠道？")) return;
+        const ch = channels.find((c) => c.id === id);
+        channels = channels.filter((c) => c.id !== id);
+        saveChannels();
+        log(`已删除渠道：${ch?.name || id}`, "info");
+        showToast("已删除渠道", ch?.name || "", "info");
+        return;
+      }
+      if (act === "log") {
+        const ch = channels.find((c) => c.id === id);
+        if (ch?.lastResult?.data) {
+          log(`${ch.name} 最近结果：\n${JSON.stringify(ch.lastResult.data, null, 2)}`, ch.lastResult.ok ? "info" : "err");
+        } else if (ch) {
+          log(`${ch.name} 暂无运行结果`, "info");
+        }
+        openLogDrawer();
+        return;
+      }
+      btn.disabled = true;
+      try { await runChannel(id, act); }
+      finally { btn.disabled = false; }
+    });
+
+    $("btnRunAll").addEventListener("click", async () => {
+      if (!channels.length) return showToast("没有渠道", "请先新增渠道", "warn");
+      $("btnRunAll").disabled = true;
+      const targets = [...channels];
+      showToast("开始全部签到", `并发执行 ${targets.length} 个渠道`, "info");
+      log(`全部签到开始（并发）：${targets.length} 个渠道`, "info");
+      try {
+        const results = await Promise.allSettled(
+          targets.map((ch) => runChannel(ch.id, "checkin"))
+        );
+        const ok = results.filter((r) => r.status === "fulfilled" && r.value?.ok !== false).length;
+        const fail = results.length - ok;
+        log(`全部签到完成（并发）：成功 ${ok} · 失败 ${fail}`, fail ? "err" : "ok");
+        showToast(
+          "全部签到完成",
+          `并发 ${targets.length} 个 · 成功 ${ok} · 失败 ${fail}`,
+          fail ? "warn" : "ok"
+        );
+      } finally {
+        $("btnRunAll").disabled = false;
+      }
+    });
+
+    $("btnExport").addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(channels, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `checkin-hub-channels-${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showToast("已导出 JSON", `${channels.length} 个渠道`, "ok");
+    });
+
+    $("btnImport").addEventListener("click", async () => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "application/json,.json";
+      input.onchange = async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const arr = JSON.parse(text);
+          if (!Array.isArray(arr)) throw new Error("JSON 需为数组");
+          channels = arr;
+          saveChannels();
+          log(`已导入 ${arr.length} 个渠道`, "ok");
+          showToast("导入成功", `${arr.length} 个渠道`, "ok");
+        } catch (e) {
+          showToast("导入失败", e.message, "err", 5200);
+        }
+      };
+      input.click();
+    });
+
+    $("btnAuthLogin").addEventListener("click", async () => {
+      const pwd = $("accessPassword").value;
+      if (!pwd) {
+        showGate(true, "请输入访问密码");
+        return;
+      }
+      $("btnAuthLogin").disabled = true;
+      try {
+        await doLogin(pwd);
+        $("accessPassword").value = "";
+        showGate(false);
+        log("访问密码验证成功", "ok");
+        showToast("访问密码验证成功", "", "ok");
+        await loadApp();
+      } catch (e) {
+        showGate(true, e.message || "密码错误");
+      } finally {
+        $("btnAuthLogin").disabled = false;
+      }
+    });
+    $("accessPassword").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") $("btnAuthLogin").click();
+    });
+    $("btnLogout").addEventListener("click", async () => {
+      await doLogout();
+    });
+
+    async function loadApp() {
+      try {
+        const res = await fetch("/api/adapters", {
+          headers: authHeaders(),
+          credentials: "same-origin",
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401 || data.authRequired) {
+          authState.authenticated = false;
+          setSessionToken("");
+          showGate(true, data.error || "需要访问密码");
+          $("adapterBadge").textContent = "需要登录";
+          return;
+        }
+        adapters = data.adapters || [];
+        $("adapterBadge").textContent = `适配器 ${adapters.length} 个`;
+        renderTypeOptions();
+        renderList();
+        log("界面就绪", "ok");
+      } catch (e) {
+        $("adapterBadge").textContent = "适配器加载失败";
+        log("加载适配器失败: " + e.message, "err");
+        showToast("适配器加载失败", e.message, "err", 5200);
+      }
+    }
+
+    async function boot() {
+      try {
+        await fetchAuthStatus();
+        if (authState.authRequired && !authState.authenticated) {
+          showGate(true);
+          $("adapterBadge").textContent = "需要登录";
+          // still render empty list shell
+          renderList();
+          return;
+        }
+        showGate(false);
+        await loadApp();
+      } catch (e) {
+        // if status endpoint fails, try load anyway
+        log("鉴权状态检查失败: " + e.message, "err");
+        await loadApp();
+      }
+    }
+    boot();
+  </script>
+</body>
+</html>
