@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# local secrets
+.dev.vars
+.env
+.env.*
+!.env.example
+!.dev.vars.example
+
+# wrangler / cloudflare
+.wrangler/
+.wrangler-dist/
+dist/
+.dev.vars.local
+
+# logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# exports that may contain credentials
+checkin-hub-channels-*.json
+*.har

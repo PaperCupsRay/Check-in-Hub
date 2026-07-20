@@ -1,0 +1,5 @@
+# Copy to .dev.vars for local `wrangler dev` (do not commit real secrets)
+ACCESS_PASSWORD=change-me
+SESSION_SECRET=change-me-too
+# SESSION_TTL_SECONDS=604800
+# CRON_SECRET=
