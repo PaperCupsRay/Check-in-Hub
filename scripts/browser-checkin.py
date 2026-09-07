@@ -181,6 +181,24 @@ async def checkin_one(channel) -> dict:
                 token,
             )
 
+        # 先探测页面自带的 Turnstile sitekey（站点自己会渲染 widget 或在源码里带 key）
+        probe = await page.evaluate(
+            """async () => {
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/0x[A-Za-z0-9_-]{20,}/g) || [];
+                let existing = null;
+                document.querySelectorAll('.cf-turnstile').forEach(el => {
+                    existing = existing || el.getAttribute('data-sitekey');
+                });
+                return { keys: [...new Set(m)].slice(0, 5), existing };
+            }"""
+        )
+        log(f"  🔑 {name}: sitekey 探测 {json.dumps(probe, ensure_ascii=False)[:250]}")
+        if probe.get("existing"):
+            sitekey = probe["existing"]
+        elif probe.get("keys") and sitekey == DEFAULT_SITEKEY:
+            sitekey = probe["keys"][0]
+
         # 页面内挂载 Turnstile 并等待 token
         got = await page.evaluate(
             """async (sitekey) => {
