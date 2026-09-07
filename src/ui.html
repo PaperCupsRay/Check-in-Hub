@@ -1289,12 +1289,10 @@
             </div>
             <div class="actions">
               <button data-act="checkin" class="success">签到</button>
-              <button data-act="status" class="secondary">状态</button>
-              <button data-act="me" class="secondary">用户</button>
-              <button data-act="login" class="secondary">登录/校验</button>
-              <button data-act="log" class="secondary">Log</button>
-              <button data-act="edit" class="secondary">编辑</button>
-              <button data-act="delete" class="danger">删除</button>
+              <button data-act="me" class="secondary">余额</button>
+              <button data-act="log" class="secondary" title="查看该渠道最近一次结果与日志">日志</button>
+              <button data-act="edit" class="secondary" title="编辑 / 状态 / 登录校验">编辑</button>
+              <button data-act="delete" class="danger" title="删除渠道">删除</button>
             </div>
           </div>
         `;
@@ -1367,9 +1365,10 @@
     }
 
     /** gha_api / gha_browser 通道：触发 GitHub Actions 并轮询回传结果 */
-    async function runViaGha(ch, runner) {
-      log(`${ch.name} → 触发 GitHub Actions（${runner}）签到 ...`, "info");
-      showToast(`${ch.name}：Actions 签到已触发`, "结果约 1-2 分钟后回传", "info", 4000);
+    async function runViaGha(ch, runner, action = "checkin") {
+      const verb = action === "me" ? "余额查询" : "签到";
+      log(`${ch.name} → 触发 GitHub Actions（${runner}）${verb} ...`, "info");
+      showToast(`${ch.name}：Actions ${verb}已触发`, "结果约 1-2 分钟后回传", "info", 4000);
       try {
         const res = await fetch("/api/gh/dispatch", {
           method: "POST",
@@ -1386,9 +1385,9 @@
         log(`${ch.name}：Actions 已触发。${data.message || ""}`, "ok");
         ch.lastResult = {
           ok: true,
-          action: "checkin",
+          action,
           short: "GHA 已触发",
-          summary: `签到（${runner}）：已在 GitHub Actions 排队，结果回传后自动更新。${data.message || ""}`,
+          summary: `${verb}（${runner}）：已在 GitHub Actions 排队，结果回传后自动更新。${data.message || ""}`,
           at: Date.now(),
         };
         saveChannels();
@@ -1403,13 +1402,13 @@
       const idx = channels.findIndex((c) => c.id === id);
       if (idx < 0) return;
       let ch = channels[idx];
-      // 签到通道分流：gha_api / gha_browser 的「签到」走 GitHub Actions，
-      // 其余动作（状态/用户/登录）仍走 Worker 直连（只读查询不涉及封禁问题）
+      // 签到通道分流：gha_api / gha_browser 渠道「签到」和「余额」都走 GitHub Actions
+      //（这类站通常连只读接口也会被 CF/源站拦截，Worker 直连没有意义）
       const runner = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner)
         ? ch.options.runner
         : "worker";
-      if (action === "checkin" && runner !== "worker") {
-        return runViaGha(ch, runner);
+      if ((action === "checkin" || action === "me") && runner !== "worker") {
+        return runViaGha(ch, runner, action);
       }
       log(`${ch.name} → ${actionLabel(action)} ...`, "info");
       showToast(`${ch.name}：${actionLabel(action)}中`, "完整过程可点 Log 查看", "info", 2200);
