@@ -156,6 +156,21 @@ async def checkin_one(channel) -> dict:
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768}, user_agent=UA
         )
+        page = await context.new_page()
+        log(f"  🌐 {name}: 打开 {base}/login（真实 sitekey 所在页）")
+        await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(4000)
+        # 登录页探测：站点自带的 turnstile widget / 源码里的 sitekey
+        login_probe = await page.evaluate(
+            """() => {
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/0x[A-Za-z0-9_\-]{20,}/g) || [];
+                const keys = [...new Set(m)].slice(0, 5);
+                const widgets = document.querySelectorAll('.cf-turnstile, [class*=turnstile]').length;
+                return { keys, widgets };
+            }"""
+        )
+        log(f"  🔑 {name}: /login 探测 {json.dumps(login_probe, ensure_ascii=False)[:300]}")
         pairs = parse_cookie_pairs(cookie_raw)
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]
