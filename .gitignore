@@ -30,3 +30,6 @@ desktop.ini
 # exports that may contain credentials
 checkin-hub-channels-*.json
 *.har
+
+# local credential notes
+.password_note.txt
