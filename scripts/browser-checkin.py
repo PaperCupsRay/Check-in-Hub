@@ -241,7 +241,19 @@ async def checkin_one(channel) -> dict:
                         pass
         if not ts_token:
             err = await page.evaluate("() => window._tsError")
-            return {"name": name, "ok": False, "message": f"Turnstile 超时（{err or '无回调'}）"}
+            diag2 = await page.evaluate(
+                """() => ({
+                    t: document.title,
+                    ts: !!window.turnstile,
+                    w: document.querySelectorAll('[id*=turnstile],[class*=turnstile],.cf-turnstile,iframe[src*=challenges]').length,
+                    iframes: [...document.querySelectorAll('iframe')].map(f => f.src.slice(0, 60)).slice(0, 3),
+                })"""
+            )
+            return {
+                "name": name,
+                "ok": False,
+                "message": f"Turnstile 超时 err={err} diag={json.dumps(diag2, ensure_ascii=False)[:200]}",
+            }
 
         log(f"  🎉 {name}: 拿到 token（长度 {len(ts_token)}），页面内签到...")
         headers_js = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
