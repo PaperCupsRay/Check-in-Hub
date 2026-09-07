@@ -202,22 +202,30 @@ async def checkin_one(channel) -> dict:
         # 页面内挂载 Turnstile 并等待 token
         got = await page.evaluate(
             """async (sitekey) => {
-                window._tsToken = null; window._tsError = null;
+                window._tsToken = null; window._tsError = null; window._tsRendered = false;
                 if (!document.getElementById('cf-ts-box')) {
                     const d = document.createElement('div');
                     d.id = 'cf-ts-box'; document.body.appendChild(d);
                 }
-                const render = () => window.turnstile.render('#cf-ts-box', {
-                    sitekey,
-                    callback: (t) => { window._tsToken = t; },
-                    'error-callback': (e) => { window._tsError = String(e); },
-                    'expired-callback': () => { window._tsToken = null; },
-                });
+                const render = () => {
+                    try {
+                        window.turnstile.render('#cf-ts-box', {
+                            sitekey,
+                            callback: (t) => { window._tsToken = t; },
+                            'error-callback': (e) => { window._tsError = String(e); },
+                            'expired-callback': () => { window._tsToken = null; },
+                        });
+                        window._tsRendered = true;
+                    } catch (e) {
+                        window._tsError = 'render-throw: ' + (e && e.message || e);
+                    }
+                };
                 if (window.turnstile) { render(); }
                 else {
                     const s = document.createElement('script');
                     s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
                     s.onload = () => render();
+                    s.onerror = () => { window._tsError = 'api.js load failed'; };
                     document.head.appendChild(s);
                 }
                 return true;
@@ -226,6 +234,11 @@ async def checkin_one(channel) -> dict:
         )
         if not got:
             return {"name": name, "ok": False, "message": "Turnstile 挂载失败"}
+        await page.wait_for_timeout(1500)
+        render_state = await page.evaluate(
+            "() => ({ rendered: !!window._tsRendered, err: window._tsError })"
+        )
+        log(f"  🧩 {name}: render 状态 {json.dumps(render_state, ensure_ascii=False)}")
 
         diag = await page.evaluate(
             """() => ({
