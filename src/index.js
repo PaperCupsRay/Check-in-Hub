@@ -123,7 +123,7 @@ function publicResult(action, result) {
   };
 }
 
-async function handleCheckin(request) {
+async function handleCheckin(request, env) {
   let body;
   try {
     body = await request.json();
@@ -147,6 +147,15 @@ async function handleCheckin(request) {
   try {
     getAdapter(channel.type);
     const result = await runAction(channel.type, action, channel);
+    // 单渠道签到也推送 TG（余额/状态查询不打扰；GHA 渠道的结果由 /api/gh/result 推送，此处跳过避免重复）
+    if (action === "checkin" && env && (channel.options?.runner || "worker") === "worker") {
+      await sendTelegram(
+        env,
+        formatCheckinReport("📌 单渠道签到", [
+          { name: channel.name, ok: !!result?.ok, message: result?.message || (result?.ok ? "ok" : "failed") },
+        ])
+      );
+    }
     return json(publicResult(action, result), result?.ok ? 200 : 422);
   } catch (err) {
     const status = err.status || 500;
@@ -161,7 +170,7 @@ async function handleCheckin(request) {
   }
 }
 
-async function handleBatch(request) {
+async function handleBatch(request, env) {
   let body;
   try {
     body = await request.json();
@@ -196,6 +205,16 @@ async function handleBatch(request) {
         message: err.message || String(err),
       });
     }
+  }
+  // 签到动作推送 TG 报告（余额/状态查询不打扰）
+  if (action === "checkin" && env) {
+    await sendTelegram(
+      env,
+      formatCheckinReport(
+        "📋 全部签到报告",
+        results.map(({ name, ok, message }) => ({ name, ok, message }))
+      )
+    );
   }
   return json({
     ok: results.every((r) => r.ok),
@@ -824,11 +843,11 @@ export default {
     }
 
     if (request.method === "POST" && pathname === "/api/checkin") {
-      return handleCheckin(request);
+      return handleCheckin(request, env);
     }
 
     if (request.method === "POST" && pathname === "/api/batch") {
-      return handleBatch(request);
+      return handleBatch(request, env);
     }
 
     if (pathname === "/api/kv/status" && request.method === "GET") {
