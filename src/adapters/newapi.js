@@ -561,6 +561,37 @@ export const newapiAdapter = {
     const ensured = await this.ensureSession(channel);
     if (!ensured.ok) return ensured;
     const month = currentMonth(channel.options?.timezone || "Asia/Shanghai");
+    // sota 变体（sotamodel.net 等）：无标准 checkin 端点，走 sota-agent-checkin
+    const sota = channel.options?.sotaCheckin === true;
+    if (sota) {
+      const res = await this.request(channel, "/api/user/sota-agent-checkin", {
+        cookie: ensured.cookie,
+      });
+      const data = res.data || {};
+      if (res.status < 400 && data.success !== false) {
+        const d = data.data || {};
+        return {
+          ok: true,
+          httpStatus: res.status,
+          status: {
+            enabled: true,
+            checkedInToday: !!d.checked_in_today,
+            rewardCredits: d.reward_credits ?? null,
+            rewardQuota: d.reward_quota ?? null,
+          },
+          message: d.checked_in_today ? "今日已签到" : "今日未签到",
+          raw: data,
+          tokens: ensured.tokens,
+        };
+      }
+      return {
+        ok: false,
+        httpStatus: res.status,
+        message: httpErrorMessage("获取签到状态", res),
+        raw: data,
+        tokens: ensured.tokens,
+      };
+    }
     const res = await this.request(channel, `/api/user/checkin?month=${encodeURIComponent(month)}`, {
       cookie: ensured.cookie,
     });
@@ -616,6 +647,54 @@ export const newapiAdapter = {
     const auth = pickAuth(channel);
     let cookie = ensured.cookie;
     let tokens = ensured.tokens;
+
+    // sota 变体（sotamodel.net 等）：专用端点，先 GET 查今日状态再 POST 签到
+    if (channel.options?.sotaCheckin === true) {
+      const ep = "/api/user/sota-agent-checkin";
+      const stRes = await this.request(channel, ep, { cookie });
+      if (stRes.setCookies?.length) {
+        cookie = mergeCookie(cookie, stRes.setCookies);
+        tokens = { ...(tokens || {}), cookie };
+      }
+      const stData = stRes.data || {};
+      const st = stData.data || {};
+      if (stRes.status < 400 && st.checked_in_today) {
+        return {
+          ok: true,
+          httpStatus: stRes.status,
+          result: {
+            success: true,
+            alreadyCheckedIn: true,
+            message: "今日已签到",
+            reward: st.reward_quota ?? null,
+          },
+          message: "今日已签到",
+          raw: stRes.data,
+          tokens,
+        };
+      }
+      const res = await this.request(channel, ep, { method: "POST", body: {}, cookie });
+      const data = res.data || {};
+      const d = data.data || {};
+      const ok = res.status < 400 && data.success === true;
+      const reward = d.quota_awarded ?? null;
+      return {
+        ok,
+        httpStatus: res.status,
+        result: {
+          success: ok,
+          message: data.message || (ok ? "签到成功" : "签到失败"),
+          reward,
+          checkInDate: d.checkin_date || null,
+          alreadyCheckedIn: false,
+        },
+        message: ok
+          ? `签到成功${d.reward_credits != null ? `，奖励 ${d.reward_credits} 积分` : ""}`
+          : data.message || `签到失败 HTTP ${res.status}`,
+        raw: data,
+        tokens,
+      };
+    }
 
     // 1) Prefer GET status first — many CF sites allow GET but block POST from non-browser IPs
     let preStatus = null;
