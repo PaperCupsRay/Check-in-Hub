@@ -412,8 +412,12 @@
           <select id="runnerSel">
             <option value="worker">Worker 直连（默认；大多数站点）</option>
             <option value="gha_api">GitHub Actions · 纯 HTTP（被封 CDN-IP 的站）</option>
-            <option value="gha_browser">GitHub Actions · 浏览器过 WAF（CF 挑战站）</option>
+            <option value="gha_browser">GitHub Actions · 浏览器过盾（Turnstile/CF 挑战站）</option>
           </select>
+        </div>
+        <div>
+          <label>Turnstile SiteKey（仅浏览器通道；留空用 gorouter 默认）</label>
+          <input id="tsSiteKey" placeholder="0x4AAAAAAELziOpg1Y2gFtAt" />
         </div>
       </div>
 
@@ -937,6 +941,9 @@
       const runner = $("runnerSel")?.value;
       if (runner && runner !== "worker") channel.options.runner = runner;
       else delete channel.options.runner;
+      const tsk = ($("tsSiteKey")?.value || "").trim();
+      if (tsk) channel.options.turnstileSiteKey = tsk;
+      else delete channel.options.turnstileSiteKey;
       return channel;
     }
 
@@ -948,6 +955,8 @@
       $("baseUrl").value = ch.baseUrl || "";
       const rs = $("runnerSel");
       if (rs) rs.value = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner) ? ch.options.runner : "worker";
+      const tsk = $("tsSiteKey");
+      if (tsk) tsk.value = ch.options?.turnstileSiteKey || "";
       if ($("channelEnabled")) $("channelEnabled").checked = isChannelEnabled(ch);
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");
@@ -962,6 +971,8 @@
       $("baseUrl").value = "";
       const rs = $("runnerSel");
       if (rs) rs.value = "worker";
+      const tsk = $("tsSiteKey");
+      if (tsk) tsk.value = "";
       if ($("channelEnabled")) $("channelEnabled").checked = true;
       renderFields();
       document.querySelectorAll("[data-field]").forEach((el) => { el.value = ""; });

@@ -92,6 +92,9 @@ function normalizeChannel(input = {}) {
   if (input.timezone && !channel.options.timezone) {
     channel.options.timezone = input.timezone;
   }
+  if (input.turnstileSiteKey && !channel.options.turnstileSiteKey) {
+    channel.options.turnstileSiteKey = input.turnstileSiteKey;
+  }
   if (input.lastResult != null) channel.lastResult = input.lastResult;
   return channel;
 }

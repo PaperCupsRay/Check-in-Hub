@@ -72,25 +72,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      # 浏览器先解 WAF 拿 cookie（Python），再交 Node runner 用该 cookie 签到。
-      # cookie 通过环境变量传递给子进程方案：见 scripts/waf-cookies.py
-      - name: Solve WAF & check-in
+      # 浏览器内完成 Turnstile 解证 + 页面内 fetch 签到（参照 kppq66 流程）。
+      # 请求从真实浏览器发出，TLS/IP/cookie 一致，绕开 TLS 指纹拦截。
+      - name: Turnstile check-in (in-browser)
         env:
           HUB_BASE_URL: ${{ secrets.HUB_BASE_URL }}
           HUB_SECRET: ${{ secrets.HUB_SECRET }}
           HUB_ACCESS_PASSWORD: ${{ secrets.HUB_ACCESS_PASSWORD }}
           CHECKIN_HEADLESS: "false" # xvfb 有头模式，CF 信任度更高
-          RUNNERS: ${{ github.event_name == 'repository_dispatch' && join(github.event.client_payload.runners, ',') || inputs.runners }}
         run: |
           set -e
-          # 1) Python：拉渠道→对 browser 通道渠道逐个开浏览器解 WAF→写 waf_cookies.json
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" python scripts/waf-cookies.py
-          # 2) Node：读 waf_cookies.json 合并 cookie 后执行签到并回传
-          node scripts/gha-checkin.mjs
+          xvfb-run -a --server-args="-screen 0 1366x768x24" python scripts/browser-checkin.py
 
       - name: Upload results
         if: always()
@@ -99,5 +91,4 @@ jobs:
           name: checkin-results-browser
           path: |
             gha-results.json
-            waf-debug-*.png
           retention-days: 7
