@@ -718,6 +718,36 @@ export default {
       return json(result, result.ok ? 200 : 500);
     }
 
+    // GHA 运行日志（诊断用，需登录）：GET /api/gh/runs -> 最近 runs；GET /api/gh/jobs/:id -> jobs 与结论
+    if (pathname === "/api/gh/runs" && request.method === "GET") {
+      const r = await fetch(
+        `https://api.github.com/repos/${env.GH_REPO}/actions/runs?per_page=3`,
+        { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${env.GH_TOKEN}`, "User-Agent": "checkin-hub" } }
+      );
+      const d = await r.json().catch(() => ({}));
+      return json({ ok: r.ok, runs: (d.workflow_runs || []).map((w) => ({ id: w.id, status: w.status, conclusion: w.conclusion, at: w.created_at })), status: r.status });
+    }
+    if (pathname.startsWith("/api/gh/jobs/") && request.method === "GET") {
+      const runId = pathname.split("/").pop();
+      const r = await fetch(
+        `https://api.github.com/repos/${env.GH_REPO}/actions/runs/${runId}/jobs?per_page=5`,
+        { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${env.GH_TOKEN}`, "User-Agent": "checkin-hub" } }
+      );
+      const d = await r.json().catch(() => ({}));
+      return json({ ok: r.ok, jobs: (d.jobs || []).map((j) => ({ id: j.id, name: j.name, status: j.status, conclusion: j.conclusion, steps: (j.steps || []).map((st) => ({ name: st.name, conclusion: st.conclusion })) })), status: r.status });
+    }
+
+    // GHA job 日志内容（诊断用，需登录）：/api/gh/joblog/:jobId
+    if (pathname.startsWith("/api/gh/joblog/") && request.method === "GET") {
+      const jobId = pathname.split("/").pop();
+      const r = await fetch(
+        `https://api.github.com/repos/${env.GH_REPO}/actions/jobs/${jobId}/logs`,
+        { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${env.GH_TOKEN}`, "User-Agent": "checkin-hub" }, redirect: "follow" }
+      );
+      const text = r.text().catch(() => "");
+      return new Response(await text, { status: r.status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }
+
     // 仓库 Secrets 管理：GET 列名称 / PUT 写入（需登录）
     if (pathname === "/api/gh/repo-secrets") {
       return handleGhSecrets(request, env);
