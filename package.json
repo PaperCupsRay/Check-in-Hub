@@ -10,5 +10,10 @@
   },
   "devDependencies": {
     "wrangler": "^4.20.0"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
   }
 }

@@ -16,6 +16,11 @@ import {
 } from "./kv.js";
 import uiHtml from "./ui.html";
 import { sendTelegram, formatCheckinReport } from "./tg.js";
+import _nacl from "tweetnacl";
+import _naclUtil from "tweetnacl-util";
+const { box } = _nacl;
+const util = _naclUtil;
+import { blake2b } from "@noble/hashes/blake2.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -574,6 +579,103 @@ async function handleGhResult(request, env) {
   return json({ ok: true, merged, count: results.length });
 }
 
+/**
+ * 仓库 Secrets 管理：通过 GitHub API 写入 Actions Secrets。
+ * GitHub 要求 secret 值用仓库公钥加密（libsodium sealed box）。
+ * 需要面板登录；GH_TOKEN 需 repo 权限。GET 读取现有名称，PUT 写入。
+ */
+async function ghRepoPublicKey(env) {
+  const res = await fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/secrets/public-key`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      "User-Agent": "checkin-hub",
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`获取仓库公钥失败: ${res.status} ${data.message || ""}`);
+  return { key: data.key, keyId: data.key_id };
+}
+
+async function handleGhSecrets(request, env) {
+  if (!env.GH_TOKEN || !env.GH_REPO) {
+    return json({ ok: false, error: "未配置 GH_TOKEN / GH_REPO" }, 400);
+  }
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${env.GH_TOKEN}`,
+    "User-Agent": "checkin-hub",
+    "Content-Type": "application/json",
+  };
+
+  if (request.method === "GET") {
+    const res = await fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/secrets`, { headers });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return json({ ok: false, error: `GitHub API ${res.status}`, body: data }, res.status);
+    return json({ ok: true, secrets: (data.secrets || []).map((s) => s.name) });
+  }
+
+  if (request.method === "PUT") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: "Invalid JSON body" }, 400);
+    }
+    const { name, value } = body || {};
+    if (!/^[A-Z_][A-Z0-9_]*$/i.test(String(name || "")) || !String(value || "")) {
+      return json({ ok: false, error: "需要 name（字母数字下划线）和 value" }, 400);
+    }
+    let pk;
+    try {
+      pk = await ghRepoPublicKey(env);
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 502);
+    }
+    // libsodium sealed box：Worker 无 sodium 依赖，用纯 JS 实现（tweetnacl 方式）
+    // 这里选择交给 GitHub 的 secret 加密需要 sodium；为避免引依赖，改用
+    // @noble/secrets 不行——GitHub 只接受 sealed box。因此内置一个最小 sealed box。
+    let sealed;
+    try {
+      sealed = sealBox(pk.key, String(value));
+    } catch (e) {
+      return json({ ok: false, error: `sealBox 加密失败: ${e.message || e}` }, 500);
+    }
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GH_REPO}/actions/secrets/${encodeURIComponent(name)}`,
+      { method: "PUT", headers, body: JSON.stringify({ encrypted_value: sealed, key_id: pk.keyId }) }
+    );
+    if (res.status === 201 || res.status === 204) {
+      return json({ ok: true, message: `已写入仓库 Secret ${name}` });
+    }
+    const t = await res.text().catch(() => "");
+    return json({ ok: false, error: `GitHub API ${res.status}`, body: t.slice(0, 300) }, res.status);
+  }
+
+  return json({ ok: false, error: "method not allowed" }, 405);
+}
+
+/**
+ * libsodium crypto_box_seal（GitHub Actions Secrets 要求的加密格式）。
+ * sealed = epk(32B) || crypto_box(m, nonce, rpk, esk)；
+ * nonce = crypto_generichash_blake2b(epk||rpk, 24)，与 libsodium 一致。
+ * 依赖（esm.sh，纯 JS）：tweetnacl + @noble/hashes 的 blake2b。
+ */
+
+function sealBox(publicKeyB64, message) {
+  const rpk = util.decodeBase64(publicKeyB64);
+  const eph = box.keyPair();
+  const nonceIn = new Uint8Array(eph.publicKey.length + rpk.length);
+  nonceIn.set(eph.publicKey, 0);
+  nonceIn.set(rpk, eph.publicKey.length);
+  const nonce = blake2b(nonceIn, { dkLen: 24 });
+  const sealed = box(util.decodeUTF8(message), nonce, rpk, eph.secretKey);
+  const out = new Uint8Array(32 + sealed.length);
+  out.set(eph.publicKey, 0);
+  out.set(sealed, 32);
+  return util.encodeBase64(out);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -611,6 +713,11 @@ export default {
       }
       const result = await runScheduled(env);
       return json(result, result.ok ? 200 : 500);
+    }
+
+    // 仓库 Secrets 管理：GET 列名称 / PUT 写入（需登录）
+    if (pathname === "/api/gh/repo-secrets") {
+      return handleGhSecrets(request, env);
     }
 
     // 触发 GitHub Actions 执行签到（需登录）
