@@ -64,8 +64,9 @@ jobs:
 
       - name: Install CloakBrowser
         run: |
-          pip install "cloakbrowser>=0.3.0"
-          python -m cloakbrowser install
+          # 0.5.10 在 ubuntu-latest 上 `python -m cloakbrowser install` 段错误（exit 139），锁 0.4.x
+          pip install "cloakbrowser>=0.4.0,<0.5"
+          python -m cloakbrowser install || echo "⚠️ install 崩溃，尝试继续（浏览器可能已可用）"
 
       - name: Install xvfb & fonts
         run: |
