@@ -601,9 +601,9 @@ export const agentrouterAdapter = {
       message: [
         after.ok ? "自动签到完成" : after.message || "签到失败",
         reward != null && reward !== 0
-          ? `变化 ${reward > 0 ? "+" : "-"}${formatUsd(Math.abs(reward)) || "?"}`
+          ? `今日奖励 +${formatUsd(Math.abs(reward)) || "?"}`
           : reward === 0
-            ? "无变化（可能今日已签到）"
+            ? "今日奖励已入账（本站签到为被动式：查询用户信息即触发，当日首次查询时发放）"
             : null,
         buildQuotaMessage(after.user || before.user),
       ]

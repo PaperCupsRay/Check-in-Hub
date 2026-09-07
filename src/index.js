@@ -743,7 +743,7 @@ export default {
           server: r.headers.get("server"),
           isBlockPage: /sorry, you have been blocked|attention required/i.test(text),
           isChallenge: /just a moment|cf-browser-verification|cdn-cgi\//i.test(text),
-          bodyHead: text.slice(0, 300),
+          bodyHead: text.slice(0, Number(body.maxLen) || 300),
         });
       } catch (e) {
         return json({ ok: false, error: e.message }, 502);
