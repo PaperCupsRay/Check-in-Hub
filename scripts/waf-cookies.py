@@ -22,13 +22,24 @@ HEADLESS = (os.environ.get("CHECKIN_HEADLESS") or "true") != "false"
 WAF_COOKIE_RE = re.compile(r"acw_tc|acw_sc__v2|cdn_sec_tc|cf_clearance|cf_chl", re.I)
 
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+
 def hub_api(path, data=None, headers=None):
-    req = urllib.request.Request(HUB + path, headers={"Accept": "application/json", **(headers or {})})
+    """带浏览器 UA 请求面板。Cloudflare 会按 UA 拦截 Python-urllib 默认值（403）。"""
+    req = urllib.request.Request(
+        HUB + path,
+        headers={"Accept": "application/json", "User-Agent": UA, **(headers or {})},
+    )
     if data is not None:
         req.data = json.dumps(data).encode()
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:200]
+        raise RuntimeError(f"面板请求 {path} 失败: HTTP {e.code} {detail}") from e
 
 
 def fetch_channels():
@@ -37,15 +48,19 @@ def fetch_channels():
         req = urllib.request.Request(
             HUB + "/api/auth/login",
             data=json.dumps({"password": PASSWORD}).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": UA},
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = json.loads(r.read().decode())
-            if not body.get("ok"):
-                raise RuntimeError(f"面板登录失败: {body}")
-            token = body.get("token")
-            setc = r.headers.get("Set-Cookie", "")
-            cookie = setc.split(";")[0] if setc else None
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = json.loads(r.read().decode())
+                setc = r.headers.get("Set-Cookie", "")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:200]
+            raise RuntimeError(f"面板登录失败: HTTP {e.code} {detail}") from e
+        if not body.get("ok"):
+            raise RuntimeError(f"面板登录失败: {body}")
+        token = body.get("token")
+        cookie = setc.split(";")[0] if setc else None
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"

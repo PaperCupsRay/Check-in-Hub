@@ -26,6 +26,9 @@ const HUB = (process.env.HUB_BASE_URL || "").replace(/\/+$/, "");
 const SECRET = process.env.HUB_SECRET || "";
 const PASSWORD = process.env.HUB_ACCESS_PASSWORD || "";
 const HEADLESS = (process.env.CHECKIN_HEADLESS || "true") !== "false";
+// Cloudflare 会按 UA 拦默认的 node fetch（undici），与浏览器保持一致
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 function payloadRunners() {
   // repository_dispatch payload 通过 GITHUB_EVENT_PATH 传入
@@ -47,7 +50,7 @@ async function hubLogin() {
   if (!PASSWORD) return null;
   const res = await fetch(`${HUB}/api/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
     body: JSON.stringify({ password: PASSWORD }),
   });
   const data = await res.json().catch(() => ({}));
@@ -58,7 +61,7 @@ async function hubLogin() {
 
 async function fetchChannels() {
   const auth = await hubLogin();
-  const headers = { Accept: "application/json" };
+  const headers = { Accept: "application/json", "User-Agent": UA };
   if (auth?.token) headers.Authorization = `Bearer ${auth.token}`;
   if (auth?.cookie) headers.Cookie = auth.cookie;
   const res = await fetch(`${HUB}/api/kv/channels`, { headers });
@@ -126,7 +129,7 @@ async function report(results) {
   }
   const res = await fetch(`${HUB}/api/gh/result`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
     body: JSON.stringify({ secret: SECRET, results }),
   });
   const data = await res.json().catch(() => ({}));

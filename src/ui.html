@@ -1381,7 +1381,7 @@
           at: Date.now(),
         };
         saveChannels();
-        renderChannels();
+        renderList();
       } catch (e) {
         log(`${ch.name}：触发 Actions 失败 → ${e.message}`, "err");
         showToast(`${ch.name}：触发失败`, e.message, "err", 5200);
