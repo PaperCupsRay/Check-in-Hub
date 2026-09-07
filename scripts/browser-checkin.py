@@ -286,19 +286,25 @@ async def checkin_one(channel) -> dict:
                     except Exception:  # noqa: BLE001
                         pass
         if not ts_token:
-            err = await page.evaluate("() => window._tsError")
-            diag2 = await page.evaluate(
-                """() => ({
-                    t: document.title,
-                    ts: !!window.turnstile,
-                    w: document.querySelectorAll('[id*=turnstile],[class*=turnstile],.cf-turnstile,iframe[src*=challenges]').length,
-                    iframes: [...document.querySelectorAll('iframe')].map(f => f.src.slice(0, 60)).slice(0, 3),
-                })"""
+            # 兜底：不带 turnstile 直接页面内 fetch 签到（探测服务端是否真强制）
+            hdrs = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+            direct = await page.evaluate(
+                """async (h) => {
+                    const res = await fetch('/api/user/checkin', {
+                        method: 'POST', credentials: 'include', headers: JSON.parse(h),
+                    });
+                    let b = null; try { b = await res.json(); } catch (e) {}
+                    return { status: res.status, body: b };
+                }""",
+                hdrs,
             )
+            db = direct.get("body") or {}
+            dmsg = str(db.get("message") or "")[:120]
+            dok = direct.get("status") == 200 and (db.get("success") or "已签到" in dmsg)
             return {
                 "name": name,
-                "ok": False,
-                "message": f"Turnstile 超时 err={err} diag={json.dumps(diag2, ensure_ascii=False)[:200]}",
+                "ok": dok,
+                "message": f"无token直签 HTTP {direct.get('status')}: {dmsg or str(db)[:100]}",
             }
 
         log(f"  🎉 {name}: 拿到 token（长度 {len(ts_token)}），页面内签到...")
