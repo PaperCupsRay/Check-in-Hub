@@ -718,6 +718,38 @@ export default {
       return json(result, result.ok ? 200 : 500);
     }
 
+    // 出站探测（诊断用，需登录）：POST /api/probe {url, headers} -> 状态/类型
+    if (request.method === "POST" && pathname === "/api/probe") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body" }, 400);
+      }
+      const target = String(body.url || "");
+      if (!/^https:\/\//.test(target)) return json({ ok: false, error: "url required" }, 400);
+      try {
+        const r = await fetch(target, {
+          method: body.method || "GET",
+          headers: body.headers || { Accept: "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/150.0.0.0 Safari/537.36" },
+          body: body.body || undefined,
+          redirect: "manual",
+        });
+        const text = await r.text();
+        return json({
+          ok: true,
+          status: r.status,
+          cfMitigated: r.headers.get("cf-mitigated"),
+          server: r.headers.get("server"),
+          isBlockPage: /sorry, you have been blocked|attention required/i.test(text),
+          isChallenge: /just a moment|cf-browser-verification|cdn-cgi\//i.test(text),
+          bodyHead: text.slice(0, 300),
+        });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 502);
+      }
+    }
+
     // GHA 运行日志（诊断用，需登录）：GET /api/gh/runs -> 最近 runs；GET /api/gh/jobs/:id -> jobs 与结论
     if (pathname === "/api/gh/runs" && request.method === "GET") {
       const r = await fetch(
