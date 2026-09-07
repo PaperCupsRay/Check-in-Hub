@@ -209,6 +209,17 @@ async def checkin_one(channel) -> dict:
         if not got:
             return {"name": name, "ok": False, "message": "Turnstile 挂载失败"}
 
+        diag = await page.evaluate(
+            """() => ({
+                title: document.title,
+                url: location.href,
+                hasTurnstile: !!window.turnstile,
+                widgetCount: document.querySelectorAll('[id*=turnstile],[class*=turnstile],.cf-turnstile').length,
+                bodyHead: document.body ? document.body.innerText.slice(0, 200) : '',
+            })"""
+        )
+        log(f"  🔍 {name}: 诊断 {json.dumps(diag, ensure_ascii=False)[:320]}")
+
         log(f"  ⏳ {name}: 等待 Turnstile token（拟人点击，最长 45s）...")
         ts_token = None
         for _ in range(45):
