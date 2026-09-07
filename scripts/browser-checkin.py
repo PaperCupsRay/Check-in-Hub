@@ -209,10 +209,31 @@ async def checkin_one(channel) -> dict:
             }"""
         )
         log(f"  🔑 {name}: sitekey 探测 {json.dumps(probe, ensure_ascii=False)[:250]}")
+        # NewAPI 前端的 sitekey 从 /api/status 下发（turnstile_site_key），页面里没有静态 key
+        try:
+            st = await page.evaluate(
+                """async () => {
+                    try {
+                        const cached = JSON.parse(localStorage.getItem('status') || 'null');
+                        if (cached && cached.data && cached.data.turnstile_site_key)
+                            return { key: cached.data.turnstile_site_key, src: 'localStorage' };
+                    } catch (e) {}
+                    const r = await fetch('/api/status', { credentials: 'include' });
+                    const j = await r.json().catch(() => null);
+                    const k = j && j.data && j.data.turnstile_site_key;
+                    return k ? { key: k, src: 'api' } : { key: null, src: 'none' };
+                }"""
+            )
+            log(f"  🔑 {name}: /api/status sitekey {json.dumps(st, ensure_ascii=False)}")
+            if st.get("key"):
+                sitekey = st["key"]
+        except Exception as e:  # noqa: BLE001
+            log(f"  ⚠️ {name}: sitekey 获取失败 {e}")
         if probe.get("existing"):
             sitekey = probe["existing"]
         elif probe.get("keys") and sitekey == DEFAULT_SITEKEY:
             sitekey = probe["keys"][0]
+        log(f"  🔑 {name}: 最终 sitekey = {str(sitekey)[:24]}...")
 
         # 页面内挂载 Turnstile 并等待 token
         got = await page.evaluate(
