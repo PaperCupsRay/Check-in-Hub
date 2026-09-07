@@ -511,6 +511,56 @@ export const agentrouterAdapter = {
    * Optionally also try POST /api/user/sign_in and /api/user/checkin for forks.
    */
   async checkin(channel) {
+    const auth = pickAuth(channel);
+    // 本站签到机制：奖励在【登录时】发放（login/OAuth 回调里的 checked_in 字段），
+    // 没有独立签到 API；访问令牌/旧会话调 self 不触发。
+    // 因此有账密时，每日首次 checkin 直接走完整 logout→login 流程来触发签到。
+    if (auth.username && auth.password) {
+      const loginRes = await this.login(channel);
+      if (!loginRes.ok) {
+        return {
+          ok: false,
+          httpStatus: loginRes.httpStatus,
+          message: `登录签到失败：${loginRes.message}`,
+          raw: loginRes.raw,
+        };
+      }
+      const after = await this.me(channel);
+      const checkedIn = loginRes.raw?.data?.checked_in === true;
+      return {
+        ok: true,
+        httpStatus: 200,
+        user: after.user || loginRes.user,
+        result: {
+          success: true,
+          message: checkedIn
+            ? "签到成功（登录触发），新增额度已到账"
+            : "登录成功（今日已通过登录触发过签到）",
+          reward: null,
+          alreadyCheckedIn: !checkedIn,
+          via: "/api/user/login",
+        },
+        message: [
+          checkedIn ? "✅ 签到成功（登录触发）" : "今日已签到（登录时已触发）",
+          buildQuotaMessage(after.user || loginRes.user),
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        raw: { login: loginRes.raw, after: after.raw },
+        tokens: loginRes.tokens,
+      };
+    }
+
+    // 无账密：无法触发登录签到，如实告知
+    return {
+      ok: false,
+      message:
+        "本站签到只能通过登录触发（无独立签到 API），访问令牌不触发。" +
+        "请在渠道中填写邮箱+密码以启用自动签到，或每日手动登录一次站点。",
+    };
+  },
+
+  async checkinLegacy(channel) {
     const before = await this.me(channel);
     if (!before.ok) return before;
 
