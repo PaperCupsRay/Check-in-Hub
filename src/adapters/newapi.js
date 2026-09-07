@@ -3,16 +3,26 @@
  * Observed from:
  *  - https://free.lyclaude.site
  *  - https://api.gemai.cc (哈基米)
- *  - https://api.pie-xian.com (OAuth-only + Cloudflare, no password login)
+ *  - https://api.pie-xian.com (v1.0.1, OAuth-only, no password login)
  *
- * Auth: session Cookie (browser UI). Official web also sends `new-api-user: <id>`.
- * HAR exports often strip cookies — prefer pasting Cookie from Application panel.
- * Some sites only support GitHub/LinuxDo OAuth (`has_password: false`) → password login 404.
+ * Auth differs by upstream version, and this is the usual cause of failures:
+ *  - v0.9.x and earlier: session Cookie, with `New-Api-User: <id>` required
+ *    alongside it. `Authorization` was only a fallback when no session existed.
+ *  - v1.0.x: the session branch was removed from middleware/auth.go. Dashboard
+ *    requests are authenticated *only* via the `Authorization` header, so a
+ *    pasted Cookie can never authenticate. Users generate the value at
+ *    个人设置 → 生成访问令牌 (server route GET /api/user/token).
+ *
+ * The two v1.0 rejection messages distinguish the failure precisely:
+ *   "未提供 access token" → no credential was read at all (a Cookie lands here)
+ *   "access token 无效"   → Authorization was read but did not validate
+ * Both arrive as application JSON, not as a Cloudflare challenge page.
  *
  * Login (optional): POST /api/user/login { username, password }
  * Self: GET /api/user/self
  * Status: GET /api/user/checkin?month=YYYY-MM
- * Check-in: POST /api/user/checkin  (optional ?turnstile=)
+ * Check-in: POST /api/user/checkin  (?turnstile= only when the site enables it;
+ *           check /api/status → turnstile_checkin before assuming it is needed)
  */
 
 function joinUrl(base, path) {
@@ -157,11 +167,9 @@ function authHeaders(channel, cookie, { method = "GET" } = {}) {
     headers["Content-Type"] = "application/json";
   }
   if (cookie || auth.cookie) headers.Cookie = cookie || auth.cookie;
-  // pie-xian / 新前端使用小写 new-api-user；旧站用 New-Api-User，两头都带
-  if (auth.userId) {
-    headers["New-Api-User"] = String(auth.userId);
-    headers["new-api-user"] = String(auth.userId);
-  }
+  // HTTP 头名不区分大小写：写两次会被 fetch 合并成 "1750, 1750"，
+  // 服务端 strconv.Atoi 解析失败并返回「New-Api-User 格式错误」。只能写一次。
+  if (auth.userId) headers["New-Api-User"] = String(auth.userId);
   // Some deployments accept Authorization for personal tokens
   if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
   const origin = String(channel.baseUrl || "").replace(/\/+$/, "");
@@ -195,6 +203,25 @@ function looksLikeHtmlChallenge(data, status) {
   return false;
 }
 
+/**
+ * 「未登录且未提供 access token」不代表服务端不读 Cookie。
+ * 服务端先解 session，解不出才回退看 Authorization，两者都拿不到时报这一句。
+ * 站点自身前端就是靠 Cookie(withCredentials) + New-Api-User 完成签到的，
+ * 所以这句话只说明「当前带的凭证无效」，Cookie 和访问令牌都可能是解法。
+ */
+function needsAccessTokenHint(data) {
+  const raw = responseTextHint(data);
+  if (!/access\s*token/i.test(raw)) return false;
+  // HTML 挑战页里也可能出现该词，仅在 JSON 业务响应里判定
+  return !/<!doctype html|<html[\s>]/i.test(raw);
+}
+
+const CREDENTIAL_GUIDE =
+  "凭证无效或已过期。两种方式任选其一：" +
+  "①（与浏览器一致）在已登录的站点按 F12 → Application → Cookies 复制含 session=... 的 Cookie，" +
+  "并从任意请求头复制 new-api-user 的数字 ID 填入「New-Api-User」；" +
+  "②在站点「个人设置 → 生成访问令牌」生成令牌，填入「访问令牌」字段。";
+
 function httpErrorMessage(action, res) {
   const data = res?.data || {};
   const status = res?.status;
@@ -203,10 +230,20 @@ function httpErrorMessage(action, res) {
     if (action === "login") {
       return (
         "登录接口 404：该站可能只支持 GitHub/LinuxDo OAuth，不提供账密登录。" +
-        "请在浏览器登录后，从 Application → Cookies 复制完整 Cookie，并填写 New-Api-User（用户 ID）。"
+        `请改用 Cookie 或访问令牌：${CREDENTIAL_GUIDE}`
       );
     }
     return `${action} 接口不存在 (HTTP 404)${serverMsg ? `：${serverMsg}` : ""}。请确认 Base URL 是否为 API 根地址（如 https://api.pie-xian.com）。`;
+  }
+  // 先判鉴权：应用层返回的 JSON 401 是凭证问题，跟 Cloudflare 无关，
+  // 否则会被下面的 CF 分支误报成「出口 IP 不匹配」。
+  if (needsAccessTokenHint(data)) {
+    // 「invalid access token」= 只有 Authorization 被识别且校验失败；
+    // 「not logged in and no access token」= session 与令牌都没拿到。
+    if (/无效|invalid/i.test(serverMsg)) {
+      return `${serverMsg} · 访问令牌无效或已失效；也可改用浏览器 Cookie + New-Api-User。`;
+    }
+    return `${serverMsg ? `${serverMsg} · ` : ""}${CREDENTIAL_GUIDE}`;
   }
   if (looksLikeHtmlChallenge(data, status) || status === 403) {
     return (
@@ -322,23 +359,28 @@ export const newapiAdapter = {
       placeholder: "https://api.pie-xian.com",
       required: true,
     },
-    { key: "auth.username", label: "用户名（账密站）", placeholder: "username" },
-    { key: "auth.password", label: "密码（账密站）", type: "password" },
     {
       key: "auth.cookie",
-      label: "Cookie（OAuth 站必填；至少含 session=...，可附带 cf_clearance）",
+      label: "Cookie（推荐，与浏览器一致；F12 → Application → Cookies，需含 session=...）",
       type: "textarea",
-      placeholder: "session=...; cf_clearance=...",
+      placeholder: "session=...",
     },
     {
       key: "auth.userId",
-      label: "New-Api-User（用户 ID，推荐）",
+      label: "New-Api-User（用户数字 ID；Cookie 模式建议填，旧版为必填）",
       placeholder: "1750",
     },
-    { key: "auth.token", label: "Bearer Token（可选）", type: "password" },
+    {
+      key: "auth.token",
+      label: "访问令牌（可选替代方案；站点「个人设置 → 生成访问令牌」）",
+      type: "password",
+      placeholder: "粘贴访问令牌，无需自己加 Bearer 前缀",
+    },
+    { key: "auth.username", label: "用户名（账密站）", placeholder: "username" },
+    { key: "auth.password", label: "密码（账密站）", type: "password" },
     {
       key: "auth.turnstileToken",
-      label: "Turnstile Token（签到开启验证时可选）",
+      label: "Turnstile Token（仅当站点 /api/status 的 turnstile_checkin 为 true 时需要）",
       type: "password",
     },
     { key: "options.timezone", label: "时区（用于月份）", placeholder: "Asia/Shanghai" },
@@ -439,19 +481,22 @@ export const newapiAdapter = {
 
   async ensureSession(channel) {
     const auth = pickAuth(channel);
-    if (auth.cookie || auth.token) {
+    // Cookie 与访问令牌都是有效凭证：站点前端本身就靠 Cookie 签到，
+    // 服务端解不出 session 时才回退看 Authorization。任一存在即视为有会话。
+    if (auth.token || auth.cookie) {
+      const tokens = {};
+      if (auth.userId) tokens.userId = auth.userId;
+      if (auth.cookie) tokens.cookie = auth.cookie;
       return {
         ok: true,
         cookie: auth.cookie || "",
-        tokens: auth.userId ? { userId: auth.userId, cookie: auth.cookie || "" } : null,
+        tokens: Object.keys(tokens).length ? tokens : null,
       };
     }
     if (!auth.username || !auth.password) {
       return {
         ok: false,
-        message:
-          "缺少会话：请填写 Cookie（OAuth 站）或用户名密码。" +
-          "pie-xian 等站无账密接口，账密登录会 404。",
+        message: `缺少凭证。${CREDENTIAL_GUIDE}`,
       };
     }
     const login = await this.login(channel);
@@ -471,16 +516,21 @@ export const newapiAdapter = {
       return {
         ok: false,
         message:
-          "未带上 Cookie。请确认已点「保存渠道」，且 Cookie 字段含 session=...（不要只填 sessionStorage 的 _cfPre_tabId）",
+          "未带上任何凭证。请确认已点「保存渠道」，且填写了含 session=... 的 Cookie（与浏览器一致）或访问令牌。",
       };
     }
     const res = await this.request(channel, "/api/user/self", { cookie: ensured.cookie });
     const data = res.data || {};
     if (res.status >= 400 || data.success === false) {
       let message = httpErrorMessage("获取用户", res);
-      if (res.status === 401 || /未登录|login|unauthorized|token/i.test(String(data.message || ""))) {
-        message =
-          "会话无效/已过期。请重新在浏览器登录 api.pie-xian.com 后复制最新 session Cookie，并填写 New-Api-User。";
+      const serverMsg = String(data.message || "");
+      if (res.status === 401 || /未登录|login|unauthorized|token/i.test(serverMsg)) {
+        // 服务端已明确指出缺少/无效 access token 时，httpErrorMessage 的提示更准确，不要覆盖
+        if (!/access\s*token/i.test(serverMsg)) {
+          message = pickAuth(channel).token
+            ? "访问令牌无效或已失效。请到站点「个人设置 → 生成访问令牌」重新生成后更新本渠道。"
+            : `会话无效或已过期。${CREDENTIAL_GUIDE}`;
+        }
       }
       return {
         ok: false,

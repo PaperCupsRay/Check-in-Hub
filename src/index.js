@@ -15,6 +15,7 @@ import {
   putLastRun,
 } from "./kv.js";
 import uiHtml from "./ui.html";
+import { sendTelegram, formatCheckinReport } from "./tg.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -366,7 +367,13 @@ async function runScheduled(env) {
   }
   const lastRun = { at: new Date().toISOString(), results, skipped };
   await putLastRun(env, lastRun);
-  return { ok: true, results, skipped, lastRun };
+  // TG 通知（未配置 secrets 时静默跳过）
+  const tg = await sendTelegram(
+    env,
+    formatCheckinReport("📋 定时签到报告", results.map(({ name, ok, message }) => ({ name, ok, message })))
+  );
+  if (!tg.ok && !tg.skipped) console.log("TG 通知失败:", tg.error || tg.status);
+  return { ok: true, results, skipped, lastRun, tg };
 }
 
 function cookieSecureFlag(request) {
@@ -432,7 +439,139 @@ function isPublicPath(pathname, method) {
   if (pathname === "/api/auth/logout" && method === "POST") return true;
   if (pathname === "/api/health" && method === "GET") return true;
   if (pathname === "/api/cron/run" && method === "POST") return true;
+  if (pathname === "/api/gh/result" && method === "POST") return true;
   return false;
+}
+
+/**
+ * 签到通道：每渠道可独立选择
+ *   worker      — Worker 出口直连（默认，多数站可用）
+ *   gha_api     — GitHub Actions 纯 HTTP（Azure 出口，过「封 CDN IP」站）
+ *   gha_browser — GitHub Actions + CloakBrowser 反检测浏览器（过 WAF/CF 挑战站）
+ */
+const RUNNERS = new Set(["worker", "gha_api", "gha_browser"]);
+
+function runnerOf(channel) {
+  return RUNNERS.has(channel?.options?.runner) ? channel.options.runner : "worker";
+}
+
+/**
+ * GitHub Actions 执行端：签到不再从 Worker 出口直连目标站（部分站点封禁
+ * Cloudflare CDN IP），改为 Worker 通过 repository_dispatch 触发 GitHub
+ * Actions（Azure 出口 IP），Actions 执行完成后把结果回传到 /api/gh/result。
+ * payload.runners 指定本次要跑的通道（如 ["gha_api"] 或 ["gha_api","gha_browser"]），
+ * 下发渠道名单，Actions 端据此过滤执行。
+ */
+async function handleGhDispatch(request, env) {
+  if (!env.GH_TOKEN || !env.GH_REPO) {
+    return json(
+      {
+        ok: false,
+        error:
+          "未配置 GitHub 集成。请设置 secrets: GH_TOKEN（需 repo scope 的 PAT）、GH_REPO（owner/repo 格式）",
+      },
+      400
+    );
+  }
+  // 允许 body 指定本次通道；缺省 = 所有非 worker 通道的启用渠道
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+  const requested = Array.isArray(body.runners) ? body.runners.filter((r) => RUNNERS.has(r)) : null;
+
+  let channels = [];
+  try {
+    channels = await getChannels(env);
+  } catch (err) {
+    return json({ ok: false, error: `读取 KV 失败: ${err.message}` }, 500);
+  }
+  const names = channels
+    .filter((c) => c.enabled !== false)
+    .filter((c) => (requested ? requested.includes(runnerOf(c)) : runnerOf(c) !== "worker"))
+    .map((c) => c.name);
+  if (!names.length) {
+    return json({ ok: false, error: "没有属于所选通道的启用渠道" }, 422);
+  }
+
+  const resp = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      "User-Agent": "checkin-hub",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: "checkin-run",
+      client_payload: {
+        runners: requested || ["gha_api", "gha_browser"],
+        names,
+        callbackSecret: crypto.randomUUID(),
+        requestedAt: new Date().toISOString(),
+      },
+    }),
+  });
+  if (resp.status === 204) {
+    return json({
+      ok: true,
+      message: `已触发 GitHub Actions（${(requested || ["gha_api", "gha_browser"]).join(" + ")}），渠道 ${names.length} 个：${names.join("、")}`,
+    });
+  }
+  const gBody = await resp.text().catch(() => "");
+  return json(
+    { ok: false, error: `GitHub API 返回 ${resp.status}`, body: gBody.slice(0, 400) },
+    resp.status
+  );
+}
+
+async function handleGhResult(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+  if (!env.CRON_SECRET || body.secret !== env.CRON_SECRET) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (!results.length) {
+    return json({ ok: false, error: "results[] is required" }, 400);
+  }
+  // 将 Actions 回传的结果合并进 KV 渠道的 lastResult
+  let channels = [];
+  try {
+    channels = await getChannels(env);
+  } catch (err) {
+    return json({ ok: false, error: `读取 KV 失败: ${err.message}` }, 500);
+  }
+  const byName = new Map(channels.map((c) => [c.name, c]));
+  let merged = 0;
+  for (const r of results) {
+    const ch = byName.get(r.name);
+    if (!ch) continue;
+    ch.lastResult = {
+      ok: !!r.ok,
+      action: "checkin",
+      summary: `gha: ${r.message || (r.ok ? "ok" : "failed")}`,
+      at: Date.now(),
+    };
+    if (r.quotaInfo) ch.quotaInfo = { ...(ch.quotaInfo || {}), ...r.quotaInfo };
+    merged++;
+  }
+  if (merged) await putChannels(env, channels);
+  const flat = results.map((r) => ({ name: r.name, ok: !!r.ok, message: r.message }));
+  await putLastRun(env, {
+    at: new Date().toISOString(),
+    runner: "github-actions",
+    results: flat,
+  });
+  // TG 通知 GitHub Actions 回传的签到结果
+  await sendTelegram(env, formatCheckinReport("🤖 GitHub Actions 签到报告", flat));
+  return json({ ok: true, merged, count: results.length });
 }
 
 export default {
@@ -474,6 +613,16 @@ export default {
       return json(result, result.ok ? 200 : 500);
     }
 
+    // 触发 GitHub Actions 执行签到（需登录）
+    if (request.method === "POST" && pathname === "/api/gh/dispatch") {
+      return handleGhDispatch(request, env);
+    }
+
+    // GitHub Actions 回传签到结果（用 CRON_SECRET 鉴权，公开路径但需口令）
+    if (request.method === "POST" && pathname === "/api/gh/result") {
+      return handleGhResult(request, env);
+    }
+
     if (authRequired(env) && !isPublicPath(pathname, request.method)) {
       const ok = await isAuthenticated(request, env);
       if (!ok) {
@@ -488,8 +637,18 @@ export default {
       return html(uiHtml);
     }
 
+
     if (request.method === "GET" && pathname === "/api/adapters") {
       return json({ ok: true, adapters: listAdapters() });
+    }
+
+    // TG 通知连通性测试（需登录；发送一条测试消息）
+    if (request.method === "POST" && pathname === "/api/tg/test") {
+      const r = await sendTelegram(env, "✅ <b>Check-in Hub</b> TG 通知配置成功");
+      return json(
+        { ok: r.ok, skipped: !!r.skipped, detail: r.reason || r.error || r.status || null },
+        r.ok ? 200 : 400
+      );
     }
 
     if (request.method === "POST" && pathname === "/api/checkin") {

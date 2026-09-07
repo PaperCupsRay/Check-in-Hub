@@ -1,0 +1,103 @@
+name: Check-in Runner
+
+# 面板（Cloudflare Worker）通过 repository_dispatch 触发；
+# 也可每天定时跑一次，或手动触发（可勾选通道）。
+on:
+  repository_dispatch:
+    types: [checkin-run]
+  schedule:
+    - cron: "30 0 * * *" # UTC 00:30 = 北京时间 08:30
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "要执行的通道（逗号分隔：gha_api,gha_browser）"
+        required: false
+        default: "gha_api"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checkin
+  cancel-in-progress: false
+
+jobs:
+  # ---------- 通道一：纯 HTTP（Azure 出口 IP，过「封 CDN-IP」站） ----------
+  api:
+    if: ${{ github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_api') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run check-ins (http)
+        env:
+          HUB_BASE_URL: ${{ secrets.HUB_BASE_URL }}
+          HUB_SECRET: ${{ secrets.HUB_SECRET }}
+          HUB_ACCESS_PASSWORD: ${{ secrets.HUB_ACCESS_PASSWORD }}
+          RUNNERS: ${{ github.event_name == 'repository_dispatch' && join(github.event.client_payload.runners, ',') || inputs.runners }}
+        run: node scripts/gha-checkin.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-results-api
+          path: gha-results.json
+          retention-days: 7
+
+  # ---------- 通道二：CloakBrowser 过 WAF（gorouter / SeekAi 等 CF 挑战站） ----------
+  browser:
+    if: ${{ github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_browser') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CloakBrowser
+        run: |
+          pip install "cloakbrowser>=0.3.0"
+          python -m cloakbrowser install
+
+      - name: Install xvfb & fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 浏览器先解 WAF 拿 cookie（Python），再交 Node runner 用该 cookie 签到。
+      # cookie 通过环境变量传递给子进程方案：见 scripts/waf-cookies.py
+      - name: Solve WAF & check-in
+        env:
+          HUB_BASE_URL: ${{ secrets.HUB_BASE_URL }}
+          HUB_SECRET: ${{ secrets.HUB_SECRET }}
+          HUB_ACCESS_PASSWORD: ${{ secrets.HUB_ACCESS_PASSWORD }}
+          CHECKIN_HEADLESS: "false" # xvfb 有头模式，CF 信任度更高
+          RUNNERS: ${{ github.event_name == 'repository_dispatch' && join(github.event.client_payload.runners, ',') || inputs.runners }}
+        run: |
+          set -e
+          # 1) Python：拉渠道→对 browser 通道渠道逐个开浏览器解 WAF→写 waf_cookies.json
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python scripts/waf-cookies.py
+          # 2) Node：读 waf_cookies.json 合并 cookie 后执行签到并回传
+          node scripts/gha-checkin.mjs
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-results-browser
+          path: |
+            gha-results.json
+            waf-debug-*.png
+          retention-days: 7

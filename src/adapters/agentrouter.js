@@ -118,9 +118,10 @@ function authHeaders(channel, cookie) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
   };
   if (cookie || auth.cookie) headers.Cookie = cookie || auth.cookie;
+  // HTTP 头名不区分大小写：同时写 New-Api-User 和 new-api-user 会被 fetch
+  // 合并成 "1750, 1750"，服务端 strconv.Atoi 解析失败并报「格式错误」。只能写一次。
   if (auth.userId) {
     headers["New-Api-User"] = String(auth.userId);
-    headers["new-api-user"] = String(auth.userId);
   }
   if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
   const origin = String(channel.baseUrl || "").replace(/\/+$/, "");

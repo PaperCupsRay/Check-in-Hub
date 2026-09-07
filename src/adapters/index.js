@@ -1,11 +1,13 @@
 import { sub2apiAdapter } from "./sub2api.js";
 import { newapiAdapter } from "./newapi.js";
 import { agentrouterAdapter } from "./agentrouter.js";
+import { anyrouterAdapter } from "./anyrouter.js";
 
 export const adapters = {
   sub2api: sub2apiAdapter,
   newapi: newapiAdapter,
   agentrouter: agentrouterAdapter,
+  anyrouter: anyrouterAdapter,
 };
 
 export function listAdapters() {

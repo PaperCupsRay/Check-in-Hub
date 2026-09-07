@@ -406,6 +406,17 @@
 
       <div id="dynamicFields"></div>
 
+      <div class="row">
+        <div>
+          <label>签到通道</label>
+          <select id="runnerSel">
+            <option value="worker">Worker 直连（默认；大多数站点）</option>
+            <option value="gha_api">GitHub Actions · 纯 HTTP（被封 CDN-IP 的站）</option>
+            <option value="gha_browser">GitHub Actions · 浏览器过 WAF（CF 挑战站）</option>
+          </select>
+        </div>
+      </div>
+
       <div class="check-row">
         <input type="checkbox" id="channelEnabled" checked />
         <label for="channelEnabled">启用（参与全部签到 / 定时任务）</label>
@@ -791,6 +802,32 @@
       cur[parts[parts.length - 1]] = value;
     }
 
+    function deleteByPath(obj, path) {
+      const parts = path.split(".");
+      let cur = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const p = parts[i];
+        if (cur[p] == null || typeof cur[p] !== "object") return;
+        cur = cur[p];
+      }
+      delete cur[parts[parts.length - 1]];
+    }
+
+    /**
+     * 编辑保存时的合并：先用旧值补齐表单未渲染的字段（如切换类型后隐藏的字段），
+     * 再把用户主动清空的字段真正删除，否则旧值会被 spread 重新补回来。
+     */
+    function mergeChannelEdit(prev, ch) {
+      const merged = {
+        ...prev,
+        ...ch,
+        auth: { ...(prev.auth || {}), ...(ch.auth || {}) },
+        options: { ...(prev.options || {}), ...(ch.options || {}) },
+      };
+      for (const key of ch._clearedKeys || []) deleteByPath(merged, key);
+      return merged;
+    }
+
     function getByPath(obj, path) {
       return path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
     }
@@ -878,6 +915,9 @@
         auth: {},
         options: {},
       };
+      // 记录被清空的字段：这些 key 在界面上存在但用户留空，
+      // 表示「要删掉」，与「该类型没有这个字段」必须区分开。
+      const clearedKeys = [];
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");
         let val = el.value;
@@ -887,7 +927,16 @@
           val = String(val || "").trim();
         }
         if (val !== "") setByPath(channel, key, val);
+        else clearedKeys.push(key);
       });
+      Object.defineProperty(channel, "_clearedKeys", {
+        value: clearedKeys,
+        enumerable: false,
+      });
+      // 签到通道（worker / gha_api / gha_browser）
+      const runner = $("runnerSel")?.value;
+      if (runner && runner !== "worker") channel.options.runner = runner;
+      else delete channel.options.runner;
       return channel;
     }
 
@@ -897,6 +946,8 @@
       $("type").value = ch.type;
       renderFields();
       $("baseUrl").value = ch.baseUrl || "";
+      const rs = $("runnerSel");
+      if (rs) rs.value = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner) ? ch.options.runner : "worker";
       if ($("channelEnabled")) $("channelEnabled").checked = isChannelEnabled(ch);
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");
@@ -909,6 +960,8 @@
       $("editId").value = "";
       $("name").value = "";
       $("baseUrl").value = "";
+      const rs = $("runnerSel");
+      if (rs) rs.value = "worker";
       if ($("channelEnabled")) $("channelEnabled").checked = true;
       renderFields();
       document.querySelectorAll("[data-field]").forEach((el) => { el.value = ""; });
@@ -927,9 +980,13 @@
       return x.toLocaleString("zh-CN", { maximumFractionDigits: digits });
     }
 
-    function pickQuotaPerUnit(raw) {
+    function pickQuotaPerUnit(raw, user) {
       const u = raw || {};
-      return numOrNull(u.quota_per_unit ?? u.QuotaPerUnit ?? u.quotaPerUnit) || 500000;
+      return (
+        numOrNull(user?.quotaPerUnit) ||
+        numOrNull(u.quota_per_unit ?? u.QuotaPerUnit ?? u.quotaPerUnit) ||
+        500000
+      );
     }
 
     function formatUsdAmount(value, digits = 2) {
@@ -986,8 +1043,14 @@
       if (totalQuota != null) info.totalQuota = totalQuota;
       if (walletQuota != null) info.walletQuota = walletQuota;
 
-      const perUnit = pickQuotaPerUnit(raw);
-      if (type === "newapi" || type === "agentrouter" || quota != null || usedQuota != null) {
+      const perUnit = pickQuotaPerUnit(raw, user);
+      if (
+        type === "newapi" ||
+        type === "agentrouter" ||
+        type === "anyrouter" ||
+        quota != null ||
+        usedQuota != null
+      ) {
         info.quotaPerUnit = perUnit;
       }
 
@@ -1009,7 +1072,7 @@
       if (!q) return "";
       const parts = [];
       const perUnit = q.quotaPerUnit || 500000;
-      if (type === "newapi" || type === "agentrouter" || q.quota != null || q.usedQuota != null) {
+      if (type === "newapi" || type === "agentrouter" || type === "anyrouter" || q.quota != null || q.usedQuota != null) {
         if (q.quota != null) {
           const usd = moneyLabel(q.quota, perUnit);
           if (usd) parts.push(`余额 ${usd}`);
@@ -1178,6 +1241,14 @@
         if (quotaText) {
           tag += `<span class="tag quota">${escapeHtml(quotaText)}</span>`;
         }
+        // 签到通道标签
+        const runnerOf = (c) =>
+          ["worker", "gha_api", "gha_browser"].includes(c.options?.runner) ? c.options.runner : "worker";
+        const RUNNER_LABEL = { worker: "Worker", gha_api: "GHA·API", gha_browser: "GHA·浏览器" };
+        const runner = runnerOf(ch);
+        if (runner !== "worker") {
+          tag += `<span class="tag" title="签到通过 GitHub Actions 执行">${RUNNER_LABEL[runner]}</span>`;
+        }
         const detail = last?.summary
           ? `<div class="result-detail">${escapeHtml(last.summary)}</div>`
           : "";
@@ -1284,10 +1355,51 @@
       return data;
     }
 
+    /** gha_api / gha_browser 通道：触发 GitHub Actions 并轮询回传结果 */
+    async function runViaGha(ch, runner) {
+      log(`${ch.name} → 触发 GitHub Actions（${runner}）签到 ...`, "info");
+      showToast(`${ch.name}：Actions 签到已触发`, "结果约 1-2 分钟后回传", "info", 4000);
+      try {
+        const res = await fetch("/api/gh/dispatch", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          credentials: "same-origin",
+          body: JSON.stringify({ runners: [runner], names: [ch.name] }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401 || data.authRequired) {
+          showGate(true, data.error || "会话已失效，请重新输入访问密码");
+          throw new Error(data.error || "需要访问密码");
+        }
+        if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        log(`${ch.name}：Actions 已触发。${data.message || ""}`, "ok");
+        ch.lastResult = {
+          ok: true,
+          action: "checkin",
+          short: "GHA 已触发",
+          summary: `签到（${runner}）：已在 GitHub Actions 排队，结果回传后自动更新。${data.message || ""}`,
+          at: Date.now(),
+        };
+        saveChannels();
+        renderChannels();
+      } catch (e) {
+        log(`${ch.name}：触发 Actions 失败 → ${e.message}`, "err");
+        showToast(`${ch.name}：触发失败`, e.message, "err", 5200);
+      }
+    }
+
     async function runChannel(id, action) {
       const idx = channels.findIndex((c) => c.id === id);
       if (idx < 0) return;
       let ch = channels[idx];
+      // 签到通道分流：gha_api / gha_browser 的「签到」走 GitHub Actions，
+      // 其余动作（状态/用户/登录）仍走 Worker 直连（只读查询不涉及封禁问题）
+      const runner = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner)
+        ? ch.options.runner
+        : "worker";
+      if (action === "checkin" && runner !== "worker") {
+        return runViaGha(ch, runner);
+      }
       log(`${ch.name} → ${actionLabel(action)} ...`, "info");
       showToast(`${ch.name}：${actionLabel(action)}中`, "完整过程可点 Log 查看", "info", 2200);
       try {
@@ -1404,19 +1516,22 @@
       const ch = readForm();
       if (!ch.baseUrl) return showToast("请填写站点 Base URL", "", "warn");
       if (!/^https?:\/\//i.test(ch.baseUrl)) return showToast("Base URL 格式不正确", "需要以 http(s):// 开头", "warn");
-      if (ch.type === "newapi" || ch.type === "agentrouter") {
+      if (ch.type === "newapi" || ch.type === "agentrouter" || ch.type === "anyrouter") {
         if (!ch.auth?.cookie && !ch.auth?.password && !ch.auth?.token) {
-          return showToast("请先填写凭证", "粘贴 Cookie，或填写账密/Token", "warn");
+          return showToast("请先填写凭证", "Cookie + New-Api-User（与浏览器一致），或访问令牌 / 账密", "warn");
         }
         if (ch.auth?.cookie && !/session\s*=/i.test(ch.auth.cookie) && !ch.auth?.token) {
           if (!confirm("Cookie 里似乎没有 session=，可能复制不完整。仍要继续测试吗？")) return;
+        }
+        if (ch.type === "anyrouter" && ch.auth?.cookie && !ch.auth?.userId && !ch.auth?.token) {
+          if (!confirm("AnyRouter 强烈建议填写 New-Api-User（用户 ID）。未填时余额/签到可能失败，仍要继续？")) return;
         }
       }
       // 临时跑当前表单，不强制写入列表
       const tempId = ch.id || uid();
       ch.id = tempId;
       const prevIdx = channels.findIndex((c) => c.id === tempId);
-      if (prevIdx >= 0) channels[prevIdx] = { ...channels[prevIdx], ...ch, auth: { ...(channels[prevIdx].auth || {}), ...(ch.auth || {}) } };
+      if (prevIdx >= 0) channels[prevIdx] = mergeChannelEdit(channels[prevIdx], ch);
       else channels.unshift(ch);
       saveChannels();
       $("btnTestForm").disabled = true;
@@ -1440,24 +1555,14 @@
         const nameChanged = (prev.name || "").trim() !== (ch.name || "").trim();
         // 编辑时若改了显示名称，视为基于当前表单新增渠道，不覆盖原渠道
         if (nameChanged) {
-          const created = {
-            ...ch,
-            id: uid(),
-            auth: { ...(prev.auth || {}), ...(ch.auth || {}) },
-            options: { ...(prev.options || {}), ...(ch.options || {}) },
-          };
+          const created = { ...mergeChannelEdit(prev, ch), id: uid() };
           delete created.lastResult;
           channels.unshift(created);
           log(`显示名称已变更，已添加为新渠道：${created.name}（保留原渠道：${prev.name}）`, "ok");
           showToast("已添加为新渠道", created.name, "ok");
         } else {
-          // 同名则更新，并保留 lastResult / 表单未填的凭证字段
-          channels[idx] = {
-            ...prev,
-            ...ch,
-            auth: { ...(prev.auth || {}), ...(ch.auth || {}) },
-            options: { ...(prev.options || {}), ...(ch.options || {}) },
-          };
+          // 同名则更新，并保留 lastResult / 表单未渲染的字段
+          channels[idx] = mergeChannelEdit(prev, ch);
           log(`已更新渠道：${ch.name}`, "ok");
           showToast("已更新渠道", ch.name, "ok");
         }
