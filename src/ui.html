@@ -938,12 +938,20 @@
         enumerable: false,
       });
       // 签到通道（worker / gha_api / gha_browser）
+      // 选回 worker 时必须记进 _clearedKeys，否则 mergeChannelEdit 的展开合并
+      // 会把旧的 options.runner 盖回来，导致通道改不回 Worker 直连。
       const runner = $("runnerSel")?.value;
       if (runner && runner !== "worker") channel.options.runner = runner;
-      else delete channel.options.runner;
+      else {
+        delete channel.options.runner;
+        clearedKeys.push("options.runner");
+      }
       const tsk = ($("tsSiteKey")?.value || "").trim();
       if (tsk) channel.options.turnstileSiteKey = tsk;
-      else delete channel.options.turnstileSiteKey;
+      else {
+        delete channel.options.turnstileSiteKey;
+        clearedKeys.push("options.turnstileSiteKey");
+      }
       return channel;
     }
 
