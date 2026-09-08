@@ -194,6 +194,10 @@ async function handleBatch(request, env) {
         baseUrl: channel.baseUrl,
         ...publicResult(action, result),
       });
+      // 适配器降级刷新出的新 token 写回请求体，供调用方（UI/KV 同步）持久化
+      if (result.tokens) {
+        results[results.length - 1].tokens = result.tokens;
+      }
     } catch (err) {
       results.push({
         id: channel.id,
