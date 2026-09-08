@@ -225,11 +225,49 @@ async def sub2api_login_checkin(channel) -> dict:
             }"""
         )
         if not tokens.get("access"):
-            # 登录失败可能在页面上有错误提示，抓一下
-            err = await page.evaluate(
-                "() => document.body.innerText.match(/(?:验证|失败|错误|invalid|failed)[^\\n]{0,80}/i)?.[0] || ''"
+            # 诊断：URL 变化（登录成功会跳转）、widget 存在性、页面错误提示、网络响应
+            diag = await page.evaluate(
+                """() => {
+                    const widget = document.querySelector('.cf-turnstile, [class*=turnstile]');
+                    const hidden = document.querySelector('[name=cf-turnstile-response]');
+                    return {
+                        url: location.href,
+                        widgetPresent: !!widget,
+                        hiddenVal: hidden ? (hidden.value ? 'has-token' : 'empty') : 'absent',
+                        iframes: [...document.querySelectorAll('iframe')].map(f => (f.src||'').slice(0,60)).slice(0,3),
+                        errText: (document.body.innerText.match(/[^\\n]{0,60}(?:失败|错误|无效|不正确|expired|invalid|failed|turnstile)[^\\n]{0,60}/i) || [''])[0],
+                    };
+                }"""
             )
-            return {"name": name, "ok": False, "message": f"登录后未取到 token（页面提示: {err[:80]}）"}
+            # 也监听一次 login 接口的响应（重试提交并等待）
+            resp_info = None
+            async with page.expect_response(
+                lambda r: "/api/v1/auth/login" in r.url, timeout=20000
+            ) as ri:
+                await page.evaluate(
+                    "() => { const b=[...document.querySelectorAll('button')].find(b=>/登录|login/i.test(b.innerText||'')); if(b) b.click(); }"
+                )
+            lr = await ri.value
+            try:
+                lb = await lr.json()
+            except Exception:  # noqa: BLE001
+                lb = {}
+            resp_info = {"status": lr.status, "body": str(lb)[:200]}
+            log(f"  🔍 {name}: login 接口 {json.dumps(resp_info, ensure_ascii=False)}")
+            if lr.status == 200 and (lb.get("data", {}) or {}).get("access_token"):
+                d = lb["data"]
+                log(f"  🎉 {name}: 从 login 响应直接取到 token")
+                return {
+                    "name": name,
+                    "ok": True,
+                    "message": "登录成功，已刷新 token",
+                    "newTokens": {"accessToken": d["access_token"], "refreshToken": d.get("refresh_token", "")},
+                }
+            return {
+                "name": name,
+                "ok": False,
+                "message": f"登录失败 diag={json.dumps(diag, ensure_ascii=False)[:180]} api={json.dumps(resp_info, ensure_ascii=False)[:150]}",
+            }
 
         log(f"  🎉 {name}: 登录成功，取到新 token（access len {len(tokens['access'])}）")
         return {
