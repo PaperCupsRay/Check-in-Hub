@@ -379,68 +379,91 @@ async def checkin_one(channel) -> dict:
                 token,
             )
 
-        # 关键：尽早挂载 Turnstile——gr2 对照脚本验证过的朴素形态：
-        # 建 box → 若 turnstile API 未就绪则注入 api.js → onload render。
-        # 页面打开 20s+ 后才挂载会被 CF 静默判废（render 成功但 challenge 不运行）。
-        sitekey = (channel.get("options") or {}).get("turnstileSiteKey") or DEFAULT_SITEKEY
+        # 顺序很重要：先取权威 sitekey，再挂载一次。
+        # （旧写法先用 gorouter 默认 key 挂载、事后 reset —— 但 reset 引用的 box id
+        #  与实际创建的不一致、widgetId 也没存，异常被吞掉，于是 SeekAi 这类站
+        #  始终在用错的 key 挂载，表现为 err=300010 或静默无 token。）
+        sitekey = (channel.get("options") or {}).get("turnstileSiteKey") or ""
+        if not sitekey:
+            try:
+                st = await page.evaluate(
+                    """async () => {
+                        try {
+                            const cached = JSON.parse(localStorage.getItem('status') || 'null');
+                            if (cached && cached.data && cached.data.turnstile_site_key)
+                                return { key: cached.data.turnstile_site_key, src: 'localStorage' };
+                        } catch (e) {}
+                        const r = await fetch('/api/status', { credentials: 'include' });
+                        const j = await r.json().catch(() => null);
+                        const k = j && j.data && j.data.turnstile_site_key;
+                        return k ? { key: k, src: 'api' } : { key: null, src: 'none' };
+                    }"""
+                )
+                log(f"  🔑 {name}: /api/status sitekey {json.dumps(st, ensure_ascii=False)}")
+                if st.get("key"):
+                    sitekey = st["key"]
+            except Exception as e:  # noqa: BLE001
+                log(f"  ⚠️ {name}: sitekey 获取失败 {e}")
+        if not sitekey:
+            sitekey = DEFAULT_SITEKEY
+        log(f"  🔑 {name}: 最终 sitekey = {str(sitekey)[:24]}")
+
+        # 挂载一次（api.js 在 GHA 上可能要几秒才就绪，注入后必须等 onload 触发 render，
+        # 否则往下走时 window.turnstile 还不存在 —— 之前 gorouter 的 hasTurnstile:false）
         await page.evaluate(
             """(sitekey) => {
                 window._tsToken = null; window._tsError = null;
+                window._tsRendered = false; window._tsWidgetId = null;
                 if (!document.getElementById('cf-turnstile-box')) {
                     const d = document.createElement('div');
                     d.id = 'cf-turnstile-box'; document.body.appendChild(d);
                 }
-                const render = () => window.turnstile.render('#cf-turnstile-box', {
-                    sitekey,
-                    callback: (t) => { window._tsToken = t; },
-                    'error-callback': (e) => { window._tsError = String(e); },
-                });
-                if (window.turnstile) { render(); }
-                else {
+                const render = () => {
+                    try {
+                        window._tsWidgetId = window.turnstile.render('#cf-turnstile-box', {
+                            sitekey,
+                            callback: (t) => { window._tsToken = t; },
+                            'error-callback': (e) => { window._tsError = String(e); },
+                            'expired-callback': () => { window._tsToken = null; },
+                        });
+                        window._tsRendered = true;
+                    } catch (e) {
+                        window._tsError = 'render-throw: ' + (e && e.message || e);
+                    }
+                };
+                if (window.turnstile) { render(); return; }
+                const existing = document.querySelector('script[src*="challenges.cloudflare.com"]');
+                if (!existing) {
                     const s = document.createElement('script');
                     s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
                     s.onload = () => render();
+                    s.onerror = () => { window._tsError = 'api.js load failed'; };
                     document.head.appendChild(s);
+                } else {
+                    // 页面自己在加载 api.js：等它就绪
+                    const timer = setInterval(() => {
+                        if (window.turnstile) { clearInterval(timer); render(); }
+                    }, 200);
+                    setTimeout(() => clearInterval(timer), 20000);
                 }
             }""",
             sitekey,
         )
-        log(f"  🧩 {name}: 已挂载 Turnstile（初始 sitekey={str(sitekey)[:20]}...）")
-
-        # 并行做 sitekey 校验（/api/status 下发的才是权威值）
-        try:
-            st = await page.evaluate(
-                """async () => {
-                    try {
-                        const cached = JSON.parse(localStorage.getItem('status') || 'null');
-                        if (cached && cached.data && cached.data.turnstile_site_key)
-                            return { key: cached.data.turnstile_site_key, src: 'localStorage' };
-                    } catch (e) {}
-                    const r = await fetch('/api/status', { credentials: 'include' });
-                    const j = await r.json().catch(() => null);
-                    const k = j && j.data && j.data.turnstile_site_key;
-                    return k ? { key: k, src: 'api' } : { key: null, src: 'none' };
-                }"""
+        # 等 render 真正执行（最多 20s），而不是固定 sleep 后盲目往下走
+        for _ in range(40):
+            mount = await page.evaluate(
+                "() => ({ api: !!window.turnstile, rendered: !!window._tsRendered, err: window._tsError })"
             )
-            log(f"  🔑 {name}: /api/status sitekey {json.dumps(st, ensure_ascii=False)}")
-            if st.get("key") and st["key"] != sitekey:
-                sitekey = st["key"]
-                await page.evaluate(
-                    """(sitekey) => { try {
-                        window._tsToken = null; window._tsRendered = false;
-                        window.turnstile.reset(window._tsWidgetId);
-                        window._tsWidgetId = window.turnstile.render('#cf-ts-box', {
-                            sitekey,
-                            callback: (t) => { window._tsToken = t; },
-                            'error-callback': (e) => { window._tsError = String(e); },
-                        });
-                        window._tsRendered = true;
-                    } catch (e) { window._tsError = 'reset-throw: ' + (e && e.message || e); } }""",
-                    sitekey,
-                )
-                log(f"  🔁 {name}: sitekey 与默认不同，已 reset 为 {str(sitekey)[:20]}...")
-        except Exception as e:  # noqa: BLE001
-            log(f"  ⚠️ {name}: sitekey 获取失败 {e}")
+            if mount.get("rendered") or mount.get("err"):
+                break
+            await page.wait_for_timeout(500)
+        log(f"  🧩 {name}: 挂载状态 {json.dumps(mount, ensure_ascii=False)}")
+        if not mount.get("rendered"):
+            return {
+                "name": name,
+                "ok": False,
+                "message": f"Turnstile 挂载失败: {mount.get('err') or 'api.js 未就绪'}",
+            }
 
         diag = await page.evaluate(
             """() => ({
