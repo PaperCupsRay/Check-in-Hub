@@ -131,10 +131,14 @@ def parse_cookie_pairs(raw):
 
 
 async def sub2api_login_checkin(channel) -> dict:
-    """sub2api 站（百倍等）：账密 + 站点自带 Turnstile 的完整登录流程。
+    """sub2api 站（百倍等）：账密登录。签到奖励在登录时发放。
 
-    登录成功响应里带新 accessToken/refreshToken，直接回传给 Worker 写回 KV，
-    下次签到优先用新 token（有效期 ~24h，之后又走登录刷新）。
+    流程（与 gorouter 的页面内 fetch 同构）：
+      1. CloakBrowser 打开 /login，从内嵌配置读 turnstile_site_key
+      2. 页面内用该 sitekey 主动挂 Turnstile，拟人点击等 token
+      3. 拿到 token 后页面内 fetch /api/v1/auth/login（带 turnstile_token），
+         绕开前端表单校验
+      4. 新 accessToken/refreshToken 回传 Worker 写回 KV
     """
     from cloakbrowser import launch_async
 
@@ -161,120 +165,110 @@ async def sub2api_login_checkin(channel) -> dict:
         await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(4000)
 
-        # 找账号/密码输入框（sub2api 前端是 Vue + 各种输入组件，按 type/name/placeholder 兜底）
-        filled = await page.evaluate(
-            """async ([email, password]) => {
-                const setVal = (el, v) => {
-                    const proto = Object.getPrototypeOf(el);
-                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                    desc.set.call(el, v);
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                };
-                const emailEl =
-                    document.querySelector('input[type=email]') ||
-                    document.querySelector('input[name=email]') ||
-                    document.querySelector('input[name=username]') ||
-                    document.querySelector('input[placeholder*=邮箱 i]');
-                const pwdEl = document.querySelector('input[type=password]');
-                if (!emailEl || !pwdEl) return { ok: false, hasEmail: !!emailEl, hasPwd: !!pwdEl };
-                setVal(emailEl, email);
-                setVal(pwdEl, password);
-                // 等站点自带的 Turnstile widget 渲染并出 token（最长 40s，含拟人点击）
-                let tsToken = null;
-                for (let i = 0; i < 40; i++) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    const hidden = document.querySelector('[name=cf-turnstile-response]');
-                    if (hidden && hidden.value) { tsToken = hidden.value; break; }
-                }
-                return { ok: true, tsToken };
-            }""",
-            [email, password],
-        )
-        log(f"  🔎 {name}: 表单填写 {json.dumps(filled, ensure_ascii=False)[:160]}")
-        if not filled.get("ok"):
-            return {"name": name, "ok": False,
-                    "message": f"登录页表单未找到（email={filled.get('hasEmail')} pwd={filled.get('hasPwd')}）"}
-
-        # 提交登录
-        click_res = await page.evaluate(
+        # 1) 从页面内嵌配置读 sitekey（sub2api 把 site 配置 JSON 打进 HTML）
+        cfg = await page.evaluate(
             """() => {
-                const btn = [...document.querySelectorAll('button')].find(b =>
-                    /登录|login|sign in/i.test(b.innerText || ''));
-                if (!btn) return false;
-                btn.click();
-                return true;
+                const html = document.documentElement.innerHTML;
+                const en = html.match(/"turnstile_enabled"\s*:\s*(true|false)/);
+                const sk = html.match(/"turnstile_site_key"\s*:\s*"([^"]+)"/);
+                return { enabled: en ? en[1] === "true" : null, key: sk ? sk[1] : null };
             }"""
         )
-        if not click_res:
-            return {"name": name, "ok": False, "message": "未找到登录按钮"}
-        log(f"  📤 {name}: 已提交登录，等待响应 ...")
-        await page.wait_for_timeout(8000)
+        log(f"  🔑 {name}: 页面配置 {json.dumps(cfg, ensure_ascii=False)}")
+        if cfg.get("enabled") is False:
+            # 未开 Turnstile：直接页面内 fetch 登录
+            sitekey = None
+        elif cfg.get("key"):
+            sitekey = cfg["key"]
+        else:
+            return {"name": name, "ok": False, "message": "登录页未找到 turnstile 配置"}
 
-        # 从 localStorage / sessionStorage 抓 token
-        tokens = await page.evaluate(
-            """() => {
-                const out = {};
-                try {
-                    const t = localStorage.getItem('access_token') || localStorage.getItem('token');
-                    if (t) out.access = t;
-                    const r = localStorage.getItem('refresh_token');
-                    if (r) out.refresh = r;
-                } catch (e) {}
-                return out;
-            }"""
-        )
-        if not tokens.get("access"):
-            # 诊断：URL 变化（登录成功会跳转）、widget 存在性、页面错误提示、网络响应
-            diag = await page.evaluate(
-                """() => {
-                    const widget = document.querySelector('.cf-turnstile, [class*=turnstile]');
-                    const hidden = document.querySelector('[name=cf-turnstile-response]');
-                    return {
-                        url: location.href,
-                        widgetPresent: !!widget,
-                        hiddenVal: hidden ? (hidden.value ? 'has-token' : 'empty') : 'absent',
-                        iframes: [...document.querySelectorAll('iframe')].map(f => (f.src||'').slice(0,60)).slice(0,3),
-                        errText: (document.body.innerText.match(/[^\\n]{0,60}(?:失败|错误|无效|不正确|expired|invalid|failed|turnstile)[^\\n]{0,60}/i) || [''])[0],
+        # 2) 挂 Turnstile 拿 token（若启用）
+        ts_token = None
+        if sitekey:
+            await page.evaluate(
+                """(sitekey) => {
+                    window._tsToken = null; window._tsError = null;
+                    if (!document.getElementById('hub-ts-box')) {
+                        const d = document.createElement('div');
+                        d.id = 'hub-ts-box'; document.body.appendChild(d);
+                    }
+                    const render = () => {
+                        try {
+                            window.turnstile.render('#hub-ts-box', {
+                                sitekey,
+                                callback: (t) => { window._tsToken = t; },
+                                'error-callback': (e) => { window._tsError = String(e); },
+                            });
+                        } catch (e) { window._tsError = 'render-throw: ' + (e && e.message || e); }
                     };
-                }"""
+                    if (window.turnstile) { render(); }
+                    else {
+                        const s = document.createElement('script');
+                        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                        s.onload = () => render();
+                        document.head.appendChild(s);
+                    }
+                }""",
+                sitekey,
             )
-            # 也监听一次 login 接口的响应（重试提交并等待）
-            resp_info = None
-            async with page.expect_response(
-                lambda r: "/api/v1/auth/login" in r.url, timeout=20000
-            ) as ri:
-                await page.evaluate(
-                    "() => { const b=[...document.querySelectorAll('button')].find(b=>/登录|login/i.test(b.innerText||'')); if(b) b.click(); }"
-                )
-            lr = await ri.value
-            try:
-                lb = await lr.json()
-            except Exception:  # noqa: BLE001
-                lb = {}
-            resp_info = {"status": lr.status, "body": str(lb)[:200]}
-            log(f"  🔍 {name}: login 接口 {json.dumps(resp_info, ensure_ascii=False)}")
-            if lr.status == 200 and (lb.get("data", {}) or {}).get("access_token"):
-                d = lb["data"]
-                log(f"  🎉 {name}: 从 login 响应直接取到 token")
-                return {
-                    "name": name,
-                    "ok": True,
-                    "message": "登录成功，已刷新 token",
-                    "newTokens": {"accessToken": d["access_token"], "refreshToken": d.get("refresh_token", "")},
-                }
+            log(f"  ⏳ {name}: 等 Turnstile token（拟人点击，最长 45s）...")
+            for _ in range(45):
+                await page.wait_for_timeout(1000)
+                ts_token = await page.evaluate("() => window._tsToken")
+                if ts_token:
+                    break
+                for f in page.frames:
+                    if "challenges.cloudflare.com" in (f.url or ""):
+                        try:
+                            el = await f.frame_element()
+                            box = await el.bounding_box()
+                            if box and box["width"] > 0:
+                                x, y = box["x"] + 35, box["y"] + box["height"] / 2
+                                await page.mouse.move(x, y, steps=5)
+                                await page.mouse.click(x, y)
+                        except Exception:  # noqa: BLE001
+                            pass
+            if not ts_token:
+                err = await page.evaluate("() => window._tsError")
+                return {"name": name, "ok": False, "message": f"Turnstile 超时 err={err}"}
+            log(f"  🎉 {name}: 拿到 turnstile token（len {len(ts_token)}）")
+
+        # 3) 页面内 fetch 登录
+        creds = json.dumps({"email": email, "password": password})
+        res = await page.evaluate(
+            """async ([creds, ts]) => {
+                const body = { ...JSON.parse(creds) };
+                if (ts) body.turnstile_token = ts;
+                const r = await fetch('/api/v1/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                let b = null; try { b = await r.json(); } catch (e) {}
+                return { status: r.status, body: b };
+            }""",
+            [creds, ts_token],
+        )
+        body = res.get("body") or {}
+        if res.get("status") != 200 or body.get("code") not in (0, None) and not body.get("data"):
             return {
                 "name": name,
                 "ok": False,
-                "message": f"登录失败 diag={json.dumps(diag, ensure_ascii=False)[:180]} api={json.dumps(resp_info, ensure_ascii=False)[:150]}",
+                "message": f"登录 API HTTP {res.get('status')}: {str(body.get('message') or body)[:100]}",
             }
+        d = body.get("data") or {}
+        access = d.get("access_token") or d.get("accessToken")
+        refresh = d.get("refresh_token") or d.get("refreshToken") or ""
+        if not access:
+            return {"name": name, "ok": False, "message": f"登录响应无 token: {str(body)[:120]}"}
 
-        log(f"  🎉 {name}: 登录成功，取到新 token（access len {len(tokens['access'])}）")
+        log(f"  🎉 {name}: 登录成功，新 token（access len {len(access)}）")
         return {
             "name": name,
             "ok": True,
             "message": "登录成功，已刷新 token",
-            "newTokens": { "accessToken": tokens["access"], "refreshToken": tokens.get("refresh", "") },
+            "newTokens": {"accessToken": access, "refreshToken": refresh},
         }
     except Exception as e:  # noqa: BLE001
         return {"name": name, "ok": False, "message": f"异常: {str(e)[:120]}"}
@@ -283,7 +277,6 @@ async def sub2api_login_checkin(channel) -> dict:
             await browser.close()
         except Exception:  # noqa: BLE001
             pass
-
 
 async def checkin_one(channel) -> dict:
     """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。"""
