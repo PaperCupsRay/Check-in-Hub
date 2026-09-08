@@ -587,6 +587,12 @@ async function handleGhResult(request, env) {
       at: Date.now(),
     };
     if (r.quotaInfo) ch.quotaInfo = { ...(ch.quotaInfo || {}), ...r.quotaInfo };
+    // 浏览器登录流程产生的新 token 写回 KV（sub2api 账密登录刷新）
+    if (r.newTokens) {
+      ch.auth = { ...(ch.auth || {}) };
+      if (r.newTokens.accessToken) ch.auth.accessToken = r.newTokens.accessToken;
+      if (r.newTokens.refreshToken) ch.auth.refreshToken = r.newTokens.refreshToken;
+    }
     merged++;
   }
   if (merged) await putChannels(env, channels);

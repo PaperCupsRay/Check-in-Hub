@@ -130,6 +130,123 @@ def parse_cookie_pairs(raw):
     return out
 
 
+async def sub2api_login_checkin(channel) -> dict:
+    """sub2api 站（百倍等）：账密 + 站点自带 Turnstile 的完整登录流程。
+
+    登录成功响应里带新 accessToken/refreshToken，直接回传给 Worker 写回 KV，
+    下次签到优先用新 token（有效期 ~24h，之后又走登录刷新）。
+    """
+    from cloakbrowser import launch_async
+
+    name = channel.get("name", "unnamed")
+    base = channel["baseUrl"].rstrip("/")
+    auth = channel.get("auth") or {}
+    email = auth.get("email") or auth.get("username") or ""
+    password = auth.get("password") or ""
+    if not (email and password):
+        return {"name": name, "ok": False, "message": "缺少邮箱/密码，无法走登录流程"}
+
+    browser = await launch_async(
+        headless=HEADLESS,
+        humanize=True,
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled", "--window-size=1366,768"],
+    )
+    try:
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768}, user_agent=UA
+        )
+        page = await context.new_page()
+        log(f"  🌐 {name}: 打开登录页 {base}/login")
+        await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(4000)
+
+        # 找账号/密码输入框（sub2api 前端是 Vue + 各种输入组件，按 type/name/placeholder 兜底）
+        filled = await page.evaluate(
+            """async ([email, password]) => {
+                const setVal = (el, v) => {
+                    const proto = Object.getPrototypeOf(el);
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    desc.set.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const emailEl =
+                    document.querySelector('input[type=email]') ||
+                    document.querySelector('input[name=email]') ||
+                    document.querySelector('input[name=username]') ||
+                    document.querySelector('input[placeholder*=邮箱 i]');
+                const pwdEl = document.querySelector('input[type=password]');
+                if (!emailEl || !pwdEl) return { ok: false, hasEmail: !!emailEl, hasPwd: !!pwdEl };
+                setVal(emailEl, email);
+                setVal(pwdEl, password);
+                // 等站点自带的 Turnstile widget 渲染并出 token（最长 40s，含拟人点击）
+                let tsToken = null;
+                for (let i = 0; i < 40; i++) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    const hidden = document.querySelector('[name=cf-turnstile-response]');
+                    if (hidden && hidden.value) { tsToken = hidden.value; break; }
+                }
+                return { ok: true, tsToken };
+            }""",
+            [email, password],
+        )
+        log(f"  🔎 {name}: 表单填写 {json.dumps(filled, ensure_ascii=False)[:160]}")
+        if not filled.get("ok"):
+            return {"name": name, "ok": False,
+                    "message": f"登录页表单未找到（email={filled.get('hasEmail')} pwd={filled.get('hasPwd')}）"}
+
+        # 提交登录
+        click_res = await page.evaluate(
+            """() => {
+                const btn = [...document.querySelectorAll('button')].find(b =>
+                    /登录|login|sign in/i.test(b.innerText || ''));
+                if (!btn) return false;
+                btn.click();
+                return true;
+            }"""
+        )
+        if not click_res:
+            return {"name": name, "ok": False, "message": "未找到登录按钮"}
+        log(f"  📤 {name}: 已提交登录，等待响应 ...")
+        await page.wait_for_timeout(8000)
+
+        # 从 localStorage / sessionStorage 抓 token
+        tokens = await page.evaluate(
+            """() => {
+                const out = {};
+                try {
+                    const t = localStorage.getItem('access_token') || localStorage.getItem('token');
+                    if (t) out.access = t;
+                    const r = localStorage.getItem('refresh_token');
+                    if (r) out.refresh = r;
+                } catch (e) {}
+                return out;
+            }"""
+        )
+        if not tokens.get("access"):
+            # 登录失败可能在页面上有错误提示，抓一下
+            err = await page.evaluate(
+                "() => document.body.innerText.match(/(?:验证|失败|错误|invalid|failed)[^\\n]{0,80}/i)?.[0] || ''"
+            )
+            return {"name": name, "ok": False, "message": f"登录后未取到 token（页面提示: {err[:80]}）"}
+
+        log(f"  🎉 {name}: 登录成功，取到新 token（access len {len(tokens['access'])}）")
+        return {
+            "name": name,
+            "ok": True,
+            "message": "登录成功，已刷新 token",
+            "newTokens": { "accessToken": tokens["access"], "refreshToken": tokens.get("refresh", "") },
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "ok": False, "message": f"异常: {str(e)[:120]}"}
+    finally:
+        try:
+            await browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def checkin_one(channel) -> dict:
     """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。"""
     from cloakbrowser import launch_async
@@ -388,7 +505,10 @@ async def main():
     results = []
     for ch in channels:
         try:
-            r = await checkin_one(ch)
+            if ch.get("type") == "sub2api":
+                r = await sub2api_login_checkin(ch)
+            else:
+                r = await checkin_one(ch)
         except Exception as e:  # noqa: BLE001
             r = {"name": ch.get("name", "?"), "ok": False, "message": str(e)[:150]}
         log(f"  {'✅' if r['ok'] else '❌'} {r['name']}: {r['message']}")
