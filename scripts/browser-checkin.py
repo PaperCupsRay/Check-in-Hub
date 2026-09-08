@@ -163,29 +163,78 @@ async def sub2api_login_checkin(channel) -> dict:
         page = await context.new_page()
         log(f"  🌐 {name}: 打开登录页 {base}/login")
         await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
 
-        # 1) 从页面内嵌配置读 sitekey（sub2api 把 site 配置 JSON 打进 HTML）
+        # 1) 先填表（关键：widget 只在表单交互后才渲染，填表必须先于等 token）
+        filled = await page.evaluate(
+            """([email, password]) => {
+                const setVal = (el, v) => {
+                    const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+                    desc.set.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const emailEl =
+                    document.querySelector('input[type=email]') ||
+                    document.querySelector('input[name=email]') ||
+                    document.querySelector('input[name=username]') ||
+                    document.querySelector('input[placeholder*=邮箱 i]');
+                const pwdEl = document.querySelector('input[type=password]');
+                if (!emailEl || !pwdEl) return { ok: false, hasEmail: !!emailEl, hasPwd: !!pwdEl };
+                setVal(emailEl, email);
+                setVal(pwdEl, password);
+                return { ok: true };
+            }""",
+            [email, password],
+        )
+        log(f"  🔎 {name}: 表单填写 {json.dumps(filled, ensure_ascii=False)[:120]}")
+        if not filled.get("ok"):
+            return {"name": name, "ok": False,
+                    "message": f"登录页表单未找到（email={filled.get('hasEmail')} pwd={filled.get('hasPwd')}）"}
+
+        # 2) 从页面内嵌配置读 sitekey
         cfg = await page.evaluate(
             """() => {
                 const html = document.documentElement.innerHTML;
-                const en = html.match(/"turnstile_enabled"\s*:\s*(true|false)/);
-                const sk = html.match(/"turnstile_site_key"\s*:\s*"([^"]+)"/);
+                const en = html.match(/"turnstile_enabled"\\s*:\\s*(true|false)/);
+                const sk = html.match(/"turnstile_site_key"\\s*:\\s*"([^"]+)"/);
                 return { enabled: en ? en[1] === "true" : null, key: sk ? sk[1] : null };
             }"""
         )
         log(f"  🔑 {name}: 页面配置 {json.dumps(cfg, ensure_ascii=False)}")
+        sitekey = None
         if cfg.get("enabled") is False:
-            # 未开 Turnstile：直接页面内 fetch 登录
-            sitekey = None
+            sitekey = None  # 未开 Turnstile：直接页面内 fetch 登录
         elif cfg.get("key"):
             sitekey = cfg["key"]
         else:
             return {"name": name, "ok": False, "message": "登录页未找到 turnstile 配置"}
 
-        # 2) 挂 Turnstile 拿 token（若启用）
+        # 3) 等原生 widget 的 token（填表后站点自动渲染，4s 内出）；
+        #    40s 还没有才自己挂一个。等待期间拟人点击 challenge iframe。
         ts_token = None
-        if sitekey:
+        for i in range(20):
+            await page.wait_for_timeout(2000)
+            ts_token = await page.evaluate(
+                "() => { const h = document.querySelector('[name=cf-turnstile-response]'); return h && h.value ? h.value : null; }"
+            )
+            if ts_token:
+                log(f"  🎉 {name}: 原生 widget 第 {i*2+5}s 出 token（len {len(ts_token)}）")
+                break
+            for f in page.frames:
+                if "challenges.cloudflare.com" in (f.url or ""):
+                    try:
+                        el = await f.frame_element()
+                        box = await el.bounding_box()
+                        if box and box["width"] > 0:
+                            x, y = box["x"] + 30, box["y"] + box["height"] / 2
+                            await page.mouse.move(x, y, steps=5)
+                            await page.mouse.click(x, y)
+                    except Exception:  # noqa: BLE001
+                        pass
+        if sitekey and not ts_token:
+            # 原生 widget 40s 未出：自己挂一个（渲染在独立容器，不与表单冲突）
+            log(f"  ⏳ {name}: 原生 widget 未出 token，自行挂载 ...")
             await page.evaluate(
                 """(sitekey) => {
                     window._tsToken = null; window._tsError = null;
