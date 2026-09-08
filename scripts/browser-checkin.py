@@ -31,8 +31,8 @@ HEADLESS = (os.environ.get("CHECKIN_HEADLESS") or "true") != "false"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 # gorouter 全站默认 sitekey（kppq66 内置值）；其他站用渠道 options.turnstileSiteKey 覆盖
 DEFAULT_SITEKEY = "0x4AAAAAAELziOpg1Y2gFtAt"
-
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+# UA 必须与 CloakBrowser 内核版本一致（chromium-146）：报更高版本号（如 150）会造成
+# UA 与真实指纹不匹配，Cloudflare 静默不签发 challenge（render 成功但永不出 token）。
 
 
 def log(msg):
@@ -354,20 +354,10 @@ async def checkin_one(channel) -> dict:
             viewport={"width": 1366, "height": 768}, user_agent=UA
         )
         page = await context.new_page()
-        log(f"  🌐 {name}: 打开 {base}/login（真实 sitekey 所在页）")
-        await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(4000)
-        # 登录页探测：站点自带的 turnstile widget / 源码里的 sitekey
-        login_probe = await page.evaluate(
-            """() => {
-                const html = document.documentElement.innerHTML;
-                const m = html.match(/0x[A-Za-z0-9_\-]{20,}/g) || [];
-                const keys = [...new Set(m)].slice(0, 5);
-                const widgets = document.querySelectorAll('.cf-turnstile, [class*=turnstile]').length;
-                return { keys, widgets };
-            }"""
-        )
-        log(f"  🔑 {name}: /login 探测 {json.dumps(login_probe, ensure_ascii=False)[:300]}")
+        # 直接开首页（kppq66 成功行为；绕道 /login 会触发登录页自己的 Turnstile 干扰挂载）
+        log(f"  🌐 {name}: 打开 {base}")
+        await page.goto(base + "/", wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2000)
         pairs = parse_cookie_pairs(cookie_raw)
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]
@@ -378,12 +368,8 @@ async def checkin_one(channel) -> dict:
                     for n, v in pairs
                 ]
             )
-        page = await context.new_page()
-        log(f"  🌐 {name}: 打开 {base}")
-        await page.goto(base + "/", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(2000)
 
-        # localStorage token 鉴权（有 system access token 的站）
+        # localStorage token 鉴权（有 system access token 的站，登录态影响签到请求）
         if token:
             await page.evaluate(
                 """(t) => { try {
@@ -393,20 +379,35 @@ async def checkin_one(channel) -> dict:
                 token,
             )
 
-        # 先探测页面自带的 Turnstile sitekey（站点自己会渲染 widget 或在源码里带 key）
-        probe = await page.evaluate(
-            """async () => {
-                const html = document.documentElement.innerHTML;
-                const m = html.match(/0x[A-Za-z0-9_-]{20,}/g) || [];
-                let existing = null;
-                document.querySelectorAll('.cf-turnstile').forEach(el => {
-                    existing = existing || el.getAttribute('data-sitekey');
+        # 关键：尽早挂载 Turnstile——gr2 对照脚本验证过的朴素形态：
+        # 建 box → 若 turnstile API 未就绪则注入 api.js → onload render。
+        # 页面打开 20s+ 后才挂载会被 CF 静默判废（render 成功但 challenge 不运行）。
+        sitekey = (channel.get("options") or {}).get("turnstileSiteKey") or DEFAULT_SITEKEY
+        await page.evaluate(
+            """(sitekey) => {
+                window._tsToken = null; window._tsError = null;
+                if (!document.getElementById('cf-turnstile-box')) {
+                    const d = document.createElement('div');
+                    d.id = 'cf-turnstile-box'; document.body.appendChild(d);
+                }
+                const render = () => window.turnstile.render('#cf-turnstile-box', {
+                    sitekey,
+                    callback: (t) => { window._tsToken = t; },
+                    'error-callback': (e) => { window._tsError = String(e); },
                 });
-                return { keys: [...new Set(m)].slice(0, 5), existing };
-            }"""
+                if (window.turnstile) { render(); }
+                else {
+                    const s = document.createElement('script');
+                    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                    s.onload = () => render();
+                    document.head.appendChild(s);
+                }
+            }""",
+            sitekey,
         )
-        log(f"  🔑 {name}: sitekey 探测 {json.dumps(probe, ensure_ascii=False)[:250]}")
-        # NewAPI 前端的 sitekey 从 /api/status 下发（turnstile_site_key），页面里没有静态 key
+        log(f"  🧩 {name}: 已挂载 Turnstile（初始 sitekey={str(sitekey)[:20]}...）")
+
+        # 并行做 sitekey 校验（/api/status 下发的才是权威值）
         try:
             st = await page.evaluate(
                 """async () => {
@@ -422,56 +423,24 @@ async def checkin_one(channel) -> dict:
                 }"""
             )
             log(f"  🔑 {name}: /api/status sitekey {json.dumps(st, ensure_ascii=False)}")
-            if st.get("key"):
+            if st.get("key") and st["key"] != sitekey:
                 sitekey = st["key"]
-        except Exception as e:  # noqa: BLE001
-            log(f"  ⚠️ {name}: sitekey 获取失败 {e}")
-        if probe.get("existing"):
-            sitekey = probe["existing"]
-        elif probe.get("keys") and sitekey == DEFAULT_SITEKEY:
-            sitekey = probe["keys"][0]
-        log(f"  🔑 {name}: 最终 sitekey = {str(sitekey)[:24]}...")
-
-        # 页面内挂载 Turnstile 并等待 token
-        got = await page.evaluate(
-            """async (sitekey) => {
-                window._tsToken = null; window._tsError = null; window._tsRendered = false;
-                if (!document.getElementById('cf-ts-box')) {
-                    const d = document.createElement('div');
-                    d.id = 'cf-ts-box'; document.body.appendChild(d);
-                }
-                const render = () => {
-                    try {
-                        window.turnstile.render('#cf-ts-box', {
+                await page.evaluate(
+                    """(sitekey) => { try {
+                        window._tsToken = null; window._tsRendered = false;
+                        window.turnstile.reset(window._tsWidgetId);
+                        window._tsWidgetId = window.turnstile.render('#cf-ts-box', {
                             sitekey,
                             callback: (t) => { window._tsToken = t; },
                             'error-callback': (e) => { window._tsError = String(e); },
-                            'expired-callback': () => { window._tsToken = null; },
                         });
                         window._tsRendered = true;
-                    } catch (e) {
-                        window._tsError = 'render-throw: ' + (e && e.message || e);
-                    }
-                };
-                if (window.turnstile) { render(); }
-                else {
-                    const s = document.createElement('script');
-                    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-                    s.onload = () => render();
-                    s.onerror = () => { window._tsError = 'api.js load failed'; };
-                    document.head.appendChild(s);
-                }
-                return true;
-            }""",
-            sitekey,
-        )
-        if not got:
-            return {"name": name, "ok": False, "message": "Turnstile 挂载失败"}
-        await page.wait_for_timeout(1500)
-        render_state = await page.evaluate(
-            "() => ({ rendered: !!window._tsRendered, err: window._tsError })"
-        )
-        log(f"  🧩 {name}: render 状态 {json.dumps(render_state, ensure_ascii=False)}")
+                    } catch (e) { window._tsError = 'reset-throw: ' + (e && e.message || e); } }""",
+                    sitekey,
+                )
+                log(f"  🔁 {name}: sitekey 与默认不同，已 reset 为 {str(sitekey)[:20]}...")
+        except Exception as e:  # noqa: BLE001
+            log(f"  ⚠️ {name}: sitekey 获取失败 {e}")
 
         diag = await page.evaluate(
             """() => ({
