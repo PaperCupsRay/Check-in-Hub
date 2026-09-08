@@ -166,27 +166,34 @@ async def sub2api_login_checkin(channel) -> dict:
         await page.wait_for_timeout(5000)
 
         # 1) 先填表（关键：widget 只在表单交互后才渲染，填表必须先于等 token）
-        filled = await page.evaluate(
-            """([email, password]) => {
-                const setVal = (el, v) => {
-                    const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
-                    desc.set.call(el, v);
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                };
-                const emailEl =
-                    document.querySelector('input[type=email]') ||
-                    document.querySelector('input[name=email]') ||
-                    document.querySelector('input[name=username]') ||
-                    document.querySelector('input[placeholder*=邮箱 i]');
-                const pwdEl = document.querySelector('input[type=password]');
-                if (!emailEl || !pwdEl) return { ok: false, hasEmail: !!emailEl, hasPwd: !!pwdEl };
-                setVal(emailEl, email);
-                setVal(pwdEl, password);
-                return { ok: true };
-            }""",
-            [email, password],
-        )
+        #    SPA 冷启动时脚本加载慢，表单可能 5s 后才出现 —— 在页面内轮询等待输入框
+        filled = None
+        for _ in range(15):  # 最多 30s
+            filled = await page.evaluate(
+                """([email, password]) => {
+                    const setVal = (el, v) => {
+                        const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+                        desc.set.call(el, v);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    };
+                    const emailEl =
+                        document.querySelector('input[type=email]') ||
+                        document.querySelector('input[name=email]') ||
+                        document.querySelector('input[name=username]') ||
+                        document.querySelector('input[placeholder*=邮箱 i]') ||
+                        document.querySelector('input[placeholder*=账号 i]');
+                    const pwdEl = document.querySelector('input[type=password]');
+                    if (!emailEl || !pwdEl) return { ok: false, hasEmail: !!emailEl, hasPwd: !!pwdEl };
+                    setVal(emailEl, email);
+                    setVal(pwdEl, password);
+                    return { ok: true };
+                }""",
+                [email, password],
+            )
+            if filled.get("ok"):
+                break
+            await page.wait_for_timeout(2000)
         log(f"  🔎 {name}: 表单填写 {json.dumps(filled, ensure_ascii=False)[:120]}")
         if not filled.get("ok"):
             return {"name": name, "ok": False,
