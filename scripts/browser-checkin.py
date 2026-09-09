@@ -95,6 +95,15 @@ def fetch_browser_channels():
     ]
 
 
+def fetch_all_channels():
+    """全量启用渠道（不过滤 runner），供 gha_api 降级渠道合并。"""
+    auth = hub_session_headers()
+    data = hub_api("/api/kv/channels", headers=auth)
+    if not data.get("ok"):
+        raise RuntimeError(f"拉取渠道失败: {data}")
+    return [c for c in data.get("channels", []) if c.get("enabled", True) and c.get("baseUrl")]
+
+
 def report_results(results):
     if not (HUB and os.environ.get("HUB_SECRET")):
         log("未配置 HUB_SECRET，跳过回传")
@@ -131,14 +140,18 @@ def parse_cookie_pairs(raw):
 
 
 async def sub2api_login_checkin(channel) -> dict:
-    """sub2api 站（百倍等）：账密登录。签到奖励在登录时发放。
+    """sub2api 站（百倍等）：账密登录 + 页面内真实签到。
+
+    注意：登录本身不发奖励，必须再调 POST /api/v1/check-in（2026-09-09 修复：
+    旧版只登录刷新 token 就报成功，导致百倍连续多天实际未签到）。
 
     流程（与 gorouter 的页面内 fetch 同构）：
       1. CloakBrowser 打开 /login，从内嵌配置读 turnstile_site_key
       2. 页面内用该 sitekey 主动挂 Turnstile，拟人点击等 token
       3. 拿到 token 后页面内 fetch /api/v1/auth/login（带 turnstile_token），
          绕开前端表单校验
-      4. 新 accessToken/refreshToken 回传 Worker 写回 KV
+      4. 带 Bearer 在页面内 fetch /api/v1/check-in 真实签到
+      5. 新 accessToken/refreshToken 回传 Worker 写回 KV
     """
     from cloakbrowser import launch_async
 
@@ -320,10 +333,49 @@ async def sub2api_login_checkin(channel) -> dict:
             return {"name": name, "ok": False, "message": f"登录响应无 token: {str(body)[:120]}"}
 
         log(f"  🎉 {name}: 登录成功，新 token（access len {len(access)}）")
+
+        # 4) 页面内真实签到（登录不发奖励；带 Bearer 调 /api/v1/check-in）
+        checkin = await page.evaluate(
+            """async (access) => {
+                const r = await fetch('/api/v1/check-in', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + access,
+                    },
+                    body: JSON.stringify({ timezone: 'Asia/Shanghai' }),
+                });
+                let b = null; try { b = await r.json(); } catch (e) {}
+                return { status: r.status, body: b };
+            }""",
+            access,
+        )
+        cb = checkin.get("body") or {}
+        cd = cb.get("data") or {}
+        cmsg = str(cb.get("message") or "")
+        already = ("已签到" in cmsg) or (cd.get("already_checked_in") is True)
+        cok = checkin.get("status") == 200 and (
+            cb.get("code") == 0 or already or cd.get("checked_in_today") is True
+        )
+        if not cok:
+            return {
+                "name": name,
+                "ok": False,
+                "message": f"登录成功但签到失败 HTTP {checkin.get('status')}: {cmsg or str(cb)[:100]}",
+                "newTokens": {"accessToken": access, "refreshToken": refresh},
+            }
+        reward = cd.get("reward_amount")
+        bal = cd.get("balance_after")
+        rmsg = "今日已签到" if already else "签到成功"
+        if reward is not None:
+            rmsg += f"，奖励 ${reward}"
+        if bal is not None:
+            rmsg += f"，余额 ${bal}"
+        log(f"  ✅ {name}: {rmsg}")
         return {
             "name": name,
             "ok": True,
-            "message": "登录成功，已刷新 token",
+            "message": f"登录+签到：{rmsg}",
             "newTokens": {"accessToken": access, "refreshToken": refresh},
         }
     except Exception as e:  # noqa: BLE001
@@ -576,11 +628,34 @@ async def checkin_one(channel) -> dict:
             pass
 
 
+def load_api_fallback_names():
+    """gha_api job 的失败渠道清单（降级链最后一级的重试对象）。"""
+    path = os.environ.get("API_FALLBACK_LIST") or "api-artifact/gha-fallback.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            names = json.load(f)
+        return [str(n) for n in names if n]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def main():
     if not HUB:
         raise SystemExit("缺少 HUB_BASE_URL")
     channels = fetch_browser_channels()
     log(f"browser 通道渠道 {len(channels)} 个: {[c['name'] for c in channels]}")
+
+    # 降级：gha_api 失败的渠道并入本 job 重试（去重；sub2api 走浏览器登录+签到，
+    # newapi 走 Turnstile/cookie 路径），回传结果统一经 /api/gh/result 写 KV。
+    fallback_names = load_api_fallback_names()
+    if fallback_names:
+        log(f"gha_api 降级渠道 {len(fallback_names)} 个: {fallback_names}")
+    existing = {c["name"] for c in channels}
+    for ch in fetch_all_channels():
+        if ch["name"] in fallback_names and ch["name"] not in existing:
+            channels.append(ch)
+            existing.add(ch["name"])
+
     results = []
     for ch in channels:
         try:

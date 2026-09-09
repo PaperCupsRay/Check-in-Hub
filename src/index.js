@@ -123,6 +123,90 @@ function publicResult(action, result) {
   };
 }
 
+/**
+ * 签到降级链：worker 直连（同时验证 token/凭证可用性）→ GitHub Actions API 出口
+ * → GitHub Actions CloakBrowser 模拟登录。每一级失败（IP 被封 / CF 挑战 / 凭证
+ * 失效）才降到下一级；降级是异步 fire-and-forget：dispatch 返回后 GHA 结果经
+ * /api/gh/result 回传写 KV + TG 通知，本次调用先返回「已降级分发」状态。
+ */
+async function ghDispatchChannels(env, runners, names) {
+  const resp = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+      "User-Agent": "checkin-hub",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: "checkin-run",
+      client_payload: {
+        runners,
+        names,
+        callbackSecret: crypto.randomUUID(),
+        requestedAt: new Date().toISOString(),
+      },
+    }),
+  });
+  if (resp.status !== 204) {
+    const gBody = await resp.text().catch(() => "");
+    throw new Error(`GitHub API 返回 ${resp.status}: ${gBody.slice(0, 200)}`);
+  }
+}
+
+/** 降级分发是否可用（未配 GitHub 集成时只能停在 worker 级） */
+function ghFallbackAvailable(env) {
+  return !!(env.GH_TOKEN && env.GH_REPO);
+}
+
+/**
+ * 对单渠道执行签到，按 worker → gha_api → gha_browser 降级。
+ * 每次签到都先从 Worker 出口用当前凭证真实请求一次（同时完成「token 是否可用」
+ * 的验证）；失败（IP 被封 / CF 挑战 / 401）才逐级降级。gha_api 在 GHA 内再失败
+ * 时由 gha-checkin.mjs 把失败渠道转给同次运行的 browser job（CloakBrowser 登录）。
+ *
+ * 返回 { result, via }：via = "worker" 时 result 为适配器真实结果；
+ * via = "gha_api" / "gha_browser" 时 result 是占位（真实结果由 GHA 经
+ * /api/gh/result 回传覆盖 KV lastResult + TG 通知）。占位里保留 worker 尝试
+ * 刷新出的 tokens，调用方可持久化，保证降级链下一级拿到的是新凭证。
+ */
+async function checkinWithFallback(channel, env) {
+  let result;
+  try {
+    result = await runAction(channel.type, "checkin", channel);
+  } catch (err) {
+    result = { ok: false, message: err.message || String(err) };
+  }
+
+  if (result.ok || !env || !ghFallbackAvailable(env)) {
+    return { result, via: "worker" };
+  }
+
+  const msg = String(result.message || "");
+  // 永久性失败（凭证缺失 / 接口不存在 / 站点未开签到）换出口也不会成功，不浪费 Actions 运行
+  if (/缺少|需要|未配置|不存在|404/.test(msg)) {
+    return { result, via: "worker" };
+  }
+
+  const reason = msg || "worker 直连失败";
+  const workerTokens = result.tokens || null;
+  try {
+    await ghDispatchChannels(env, ["gha_api"], [channel.name]);
+  } catch {
+    // dispatch 失败（GitHub API 不可用等）：保留 worker 的真实失败结果
+    return { result, via: "worker" };
+  }
+  return {
+    result: {
+      ok: true,
+      message: `worker 失败（${reason.slice(0, 80)}），已降级到 GitHub Actions（gha_api 失败自动转浏览器），结果回传后更新`,
+      degraded: true,
+      tokens: workerTokens,
+    },
+    via: "gha_api",
+  };
+}
+
 async function handleCheckin(request, env) {
   let body;
   try {
@@ -146,9 +230,15 @@ async function handleCheckin(request, env) {
 
   try {
     getAdapter(channel.type);
-    const result = await runAction(channel.type, action, channel);
-    // 单渠道签到也推送 TG（余额/状态查询不打扰；GHA 渠道的结果由 /api/gh/result 推送，此处跳过避免重复）
-    if (action === "checkin" && env && (channel.options?.runner || "worker") === "worker") {
+    let result, via = "worker";
+    if (action === "checkin") {
+      ({ result, via } = await checkinWithFallback(channel, env));
+    } else {
+      result = await runAction(channel.type, action, channel);
+    }
+    // 签到推送 TG（余额/状态查询不打扰）。降级分发（via=gfa_*）的真实结果
+    // 由 GHA 回传时推送，此处只在 worker 直连出结果时推送，避免重复。
+    if (action === "checkin" && env && via === "worker" && (channel.options?.runner || "worker") === "worker") {
       await sendTelegram(
         env,
         formatCheckinReport("📌 单渠道签到", [
@@ -156,7 +246,9 @@ async function handleCheckin(request, env) {
         ])
       );
     }
-    return json(publicResult(action, result), result?.ok ? 200 : 422);
+    const payload = publicResult(action, result);
+    payload.via = via;
+    return json(payload, result?.ok ? 200 : 422);
   } catch (err) {
     const status = err.status || 500;
     return json(
@@ -186,14 +278,18 @@ async function handleBatch(request, env) {
     const channel = normalizeChannel(item);
     try {
       getAdapter(channel.type);
-      const result = await runAction(channel.type, action, channel);
-      results.push({
+      const { result, via } = action === "checkin"
+        ? await checkinWithFallback(channel, env)
+        : { result: await runAction(channel.type, action, channel), via: "worker" };
+      const pushed = {
         id: channel.id,
         name: channel.name,
         type: channel.type,
         baseUrl: channel.baseUrl,
         ...publicResult(action, result),
-      });
+        via,
+      };
+      results.push(pushed);
       // 适配器降级刷新出的新 token 写回请求体，供调用方（UI/KV 同步）持久化
       if (result.tokens) {
         results[results.length - 1].tokens = result.tokens;
@@ -358,15 +454,24 @@ async function runScheduled(env) {
     }
     const channel = normalizeChannel(item);
     try {
-      const result = await runAction(channel.type, "checkin", channel);
-      if (result.tokens) {
-        item.auth = { ...(item.auth || {}), ...result.tokens };
+      const { result, via } = await checkinWithFallback(channel, env);
+      if (via === "worker") {
+        if (result.tokens) {
+          item.auth = { ...(item.auth || {}), ...result.tokens };
+        }
+        item.lastResult = {
+          ok: !!result.ok,
+          summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`,
+          at: Date.now(),
+        };
+      } else {
+        // 降级分发已受理；真实结果等 GHA 回传（/api/gh/result 覆盖 lastResult）
+        item.lastResult = {
+          ok: true,
+          summary: `checkin: ${result.message}`,
+          at: Date.now(),
+        };
       }
-      item.lastResult = {
-        ok: !!result.ok,
-        summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`,
-        at: Date.now(),
-      };
       results.push({
         name: channel.name,
         type: channel.type,
@@ -707,6 +812,9 @@ function sealBox(publicKeyB64, message) {
   out.set(sealed, 32);
   return util.encodeBase64(out);
 }
+
+// 命名导出仅供本地单测/脚本复用；Worker 入口仍是 default export
+export { handleCheckin, handleBatch, runScheduled, checkinWithFallback };
 
 export default {
   async fetch(request, env) {

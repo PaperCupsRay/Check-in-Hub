@@ -47,16 +47,30 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: checkin-results-api
-          path: gha-results.json
+          path: |
+            gha-results.json
+            gha-fallback.json
           retention-days: 7
 
   # ---------- 通道二：CloakBrowser 过 WAF（gorouter / SeekAi 等 CF 挑战站） ----------
+  # 同时承接降级链的最后一级：gha_api 失败的渠道由本 job 用浏览器模拟登录重试。
   browser:
-    if: ${{ github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_browser') }}
+    if: ${{ always() && (github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_browser')) }}
+    needs: api
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      # api job 产出的失败渠道清单（gha_api → gha_browser 降级源）。
+      # api job 被跳过时该 artifact 不存在，continue-on-error 静默放行。
+      - name: Download api fallback list
+        if: ${{ github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_api') }}
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: checkin-results-api
+          path: api-artifact
 
       - uses: actions/setup-python@v5
         with:
@@ -84,6 +98,8 @@ jobs:
           HUB_ACCESS_PASSWORD: ${{ secrets.HUB_ACCESS_PASSWORD }}
           CHECKIN_HEADLESS: "false" # xvfb 有头模式，CF 信任度更高
           CLOAKBROWSER_SUPPRESS_FONT_WARNING: "1"
+          # gha_api 失败渠道清单（api job 的 artifact），供 browser job 降级重试
+          API_FALLBACK_LIST: "api-artifact/gha-fallback.json"
         run: |
           set -e
           xvfb-run -a --server-args="-screen 0 1366x768x24" python scripts/browser-checkin.py

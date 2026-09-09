@@ -165,6 +165,15 @@ async function main() {
     }
   }
 
+  // 降级：gha_api 失败的渠道交给同次运行的 browser job（CloakBrowser 模拟登录签到）。
+  // 永久性失败（缺凭证 / 接口不存在）不转——换出口也不会成功。
+  const PERMANENT = /缺少|未配置|不存在|404|无可用/;
+  const retryable = [...new Set(results.filter((r) => !r.ok && !PERMANENT.test(r.message || "")).map((r) => r.name))];
+  fs.writeFileSync("gha-fallback.json", JSON.stringify(retryable, null, 2));
+  if (retryable.length) {
+    console.log(`降级到 browser 通道: ${retryable.join("、")}`);
+  }
+
   await report(results);
   fs.writeFileSync("gha-results.json", JSON.stringify(results, null, 2));
 }
