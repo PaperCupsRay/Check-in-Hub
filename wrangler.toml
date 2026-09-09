@@ -14,9 +14,10 @@ binding = "CHECKIN_KV"
 id = "896e2bab41be4b0aa48b33306f2b6312"
 preview_id = "ca025ec4d00b4e8c9ebac57730f97dbf"
 
-# Optional cron (UTC). Uncomment after setting CRON_SECRET.
-# [triggers]
-# crons = ["0 1 * * *"]
+# Daily cron (UTC 00:30 = 北京时间 08:30)。scheduled() 不需要 CRON_SECRET
+# （那只保护手动 HTTP 端点 /api/cron/run）。失败渠道自动降级 worker→gha_api→gha_browser。
+[triggers]
+crons = ["30 0 * * *"]
 
 [vars]
 # APP_TITLE = "Check-in Hub"

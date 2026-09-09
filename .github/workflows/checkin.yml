@@ -1,12 +1,12 @@
 name: Check-in Runner
 
 # 面板（Cloudflare Worker）通过 repository_dispatch 触发；
-# 也可每天定时跑一次，或手动触发（可勾选通道）。
+# 每日定时由 Worker cron（UTC 00:30）统一调度（全渠道+降级链），GHA 不再单独
+# schedule —— 旧 schedule 只跑 gha_api 通道、覆盖不全，且会和 Worker cron 双跑。
+# 手动触发保留（可勾选通道）。
 on:
   repository_dispatch:
     types: [checkin-run]
-  schedule:
-    - cron: "30 0 * * *" # UTC 00:30 = 北京时间 08:30
   workflow_dispatch:
     inputs:
       runners:
