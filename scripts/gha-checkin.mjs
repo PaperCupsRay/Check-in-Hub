@@ -136,21 +136,39 @@ async function report(results) {
   console.log(`回传结果: HTTP ${res.status} merged=${data.merged ?? "?"}`);
 }
 
+function payloadNames() {
+  // 本次精确要跑的渠道名（Worker 降级链分发时指定）；空 = 不过滤，按通道跑全部
+  try {
+    const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+    const n = ev?.client_payload?.names;
+    if (Array.isArray(n) && n.length) return n.map(String);
+  } catch {}
+  return null;
+}
+
 async function main() {
   if (!HUB) {
     console.error("缺少 HUB_BASE_URL");
     process.exit(1);
   }
   const runners = payloadRunners();
-  console.log(`本次通道: ${runners.join(", ")}`);
+  const names = payloadNames();
+  console.log(`本次通道: ${runners.join(", ")}${names ? ` | 指定渠道: ${names.join("、")}` : " | 全部"}`);
 
   const channels = await fetchChannels();
-  const targets = channels.filter((c) => runners.includes(c.options?.runner || "worker"));
+  // 精确分发（降级链）按 names 选渠道，并把其执行通道视为请求的主通道——
+  // 渠道配置的 runner 是「常规调度」的归属，降级请求本身已决定用哪条通道。
+  // 常规触发（无 names）仍按渠道配置的 runner 过滤。
+  const nameSet = names ? new Set(names) : null;
+  const targets = channels.filter((c) => {
+    if (nameSet) return nameSet.has(c.name);
+    return runners.includes(c.options?.runner || "worker");
+  });
   console.log(`匹配渠道 ${targets.length}/${channels.length} 个: ${targets.map((c) => c.name).join("、") || "(无)"}`);
 
   const results = [];
   for (const ch of targets) {
-    const runner = ch.options?.runner || "worker";
+    const runner = nameSet ? runners[0] : ch.options?.runner || "worker";
     process.stdout.write(`→ [${runner}] ${ch.name} (${ch.type}) ... `);
     const r = await runOne(ch, runner);
     console.log(r.ok ? "OK" : "FAIL", "-", (r.message || "").slice(0, 120));

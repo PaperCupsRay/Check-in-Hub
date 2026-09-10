@@ -159,52 +159,104 @@ function ghFallbackAvailable(env) {
   return !!(env.GH_TOKEN && env.GH_REPO);
 }
 
-/**
- * 对单渠道执行签到，按 worker → gha_api → gha_browser 降级。
- * 每次签到都先从 Worker 出口用当前凭证真实请求一次（同时完成「token 是否可用」
- * 的验证）；失败（IP 被封 / CF 挑战 / 401）才逐级降级。gha_api 在 GHA 内再失败
- * 时由 gha-checkin.mjs 把失败渠道转给同次运行的 browser job（CloakBrowser 登录）。
- *
- * 返回 { result, via }：via = "worker" 时 result 为适配器真实结果；
- * via = "gha_api" / "gha_browser" 时 result 是占位（真实结果由 GHA 经
- * /api/gh/result 回传覆盖 KV lastResult + TG 通知）。占位里保留 worker 尝试
- * 刷新出的 tokens，调用方可持久化，保证降级链下一级拿到的是新凭证。
- */
-async function checkinWithFallback(channel, env) {
-  let result;
+// 换出口也不会成功的失败（凭证缺失/接口不存在/类型配错）不降级，避免浪费 Actions 运行
+const PERMANENT_FAIL_RE = /缺少|需要|未配置|不存在|404|无可用|未知渠道|不支持/;
+
+async function tryWorkerCheckin(channel) {
   try {
-    result = await runAction(channel.type, "checkin", channel);
+    return await runAction(channel.type, "checkin", channel);
   } catch (err) {
-    result = { ok: false, message: err.message || String(err) };
+    return { ok: false, message: err.message || String(err) };
+  }
+}
+
+/**
+ * 批量签到降级核心（runScheduled / handleBatch / 单渠道共用）。
+ *
+ * 每个渠道按 worker → gha_api → gha_browser 降级：
+ * - options.runner = gha_api / gha_browser 的渠道：站点已知封 CF IP 或需浏览器，
+ *   跳过注定失败的 worker 直连，直接按配置通道分发；
+ * - worker 渠道：Worker 出口真实请求一次（这本身就是 token 有效性验证），
+ *   失败且非永久性错误 → 降级 gha_api；
+ * - 全部收集完再按通道各发一次 dispatch（一次 workflow run 承载整组渠道，
+ *   避免逐渠道分发造成 N 次运行 N 份报告）；gha_api 内失败的渠道由
+ *   gha-checkin.mjs 写 fallback 清单转交同次运行的 browser job。
+ *
+ * 返回 [{ item, result, via }]：via = "worker" 为真实结果；via = "gha_api" /
+ * "gha_browser" 是占位（ok=true），真实结果由 GHA 经 /api/gh/result 回传覆盖
+ * KV lastResult + TG 通知。占位保留 worker 尝试刷新出的 tokens 供持久化。
+ */
+async function batchCheckinCore(items, env) {
+  const out = [];
+  const canFallback = !!(env && ghFallbackAvailable(env));
+  const groups = new Map(); // runner -> [{ item, reason, tokens }]
+
+  for (const item of items) {
+    const channel = normalizeChannel(item);
+    const runner = runnerOf(channel);
+    if (runner !== "worker") {
+      if (canFallback) {
+        if (!groups.has(runner)) groups.set(runner, []);
+        groups.get(runner).push({ item, reason: null, tokens: null });
+        out.push({
+          item,
+          via: runner,
+          result: { ok: true, degraded: true, message: `已按配置通道 ${runner} 分发（结果回传后更新）` },
+        });
+      } else {
+        // 未配 GitHub 集成：退回 worker 直连尽力而为
+        out.push({ item, via: "worker", result: await tryWorkerCheckin(channel) });
+      }
+      continue;
+    }
+
+    const result = await tryWorkerCheckin(channel);
+    if (!result.ok && canFallback && !PERMANENT_FAIL_RE.test(String(result.message || ""))) {
+      if (!groups.has("gha_api")) groups.set("gha_api", []);
+      const reason = String(result.message || "").slice(0, 80) || "worker 直连失败";
+      groups.get("gha_api").push({ item, reason, tokens: result.tokens || null });
+      out.push({
+        item,
+        via: "gha_api",
+        result: {
+          ok: true,
+          degraded: true,
+          tokens: result.tokens || null,
+          message: `worker 失败（${reason}），已降级 GitHub Actions（结果回传后更新）`,
+        },
+      });
+      continue;
+    }
+    out.push({ item, via: "worker", result });
   }
 
-  if (result.ok || !env || !ghFallbackAvailable(env)) {
-    return { result, via: "worker" };
+  for (const [runner, entries] of groups) {
+    const names = [...new Set(entries.map((e) => e.item.name))];
+    try {
+      await ghDispatchChannels(env, [runner], names);
+    } catch (err) {
+      // dispatch 整组失败（GitHub API 不可用等）：占位回退为真实失败说明
+      for (const o of out) {
+        if (o.via !== runner || !o.result?.degraded) continue;
+        const entry = entries.find((e) => e.item === o.item);
+        o.via = "worker";
+        o.result = {
+          ok: false,
+          ...(entry?.tokens ? { tokens: entry.tokens } : {}),
+          message: entry?.reason
+            ? `worker 失败（${entry.reason}），且 GHA 分发失败：${err.message || err}`
+            : `GHA 分发失败：${err.message || err}`,
+        };
+      }
+    }
   }
+  return out;
+}
 
-  const msg = String(result.message || "");
-  // 永久性失败（凭证缺失 / 接口不存在 / 站点未开签到）换出口也不会成功，不浪费 Actions 运行
-  if (/缺少|需要|未配置|不存在|404/.test(msg)) {
-    return { result, via: "worker" };
-  }
-
-  const reason = msg || "worker 直连失败";
-  const workerTokens = result.tokens || null;
-  try {
-    await ghDispatchChannels(env, ["gha_api"], [channel.name]);
-  } catch {
-    // dispatch 失败（GitHub API 不可用等）：保留 worker 的真实失败结果
-    return { result, via: "worker" };
-  }
-  return {
-    result: {
-      ok: true,
-      message: `worker 失败（${reason.slice(0, 80)}），已降级到 GitHub Actions（gha_api 失败自动转浏览器），结果回传后更新`,
-      degraded: true,
-      tokens: workerTokens,
-    },
-    via: "gha_api",
-  };
+/** 单渠道便捷封装（保持既有导出签名） */
+async function checkinWithFallback(channel, env) {
+  const [out] = await batchCheckinCore([channel], env);
+  return { result: out.result, via: out.via };
 }
 
 async function handleCheckin(request, env) {
@@ -274,36 +326,48 @@ async function handleBatch(request, env) {
   if (!list.length) return json({ ok: false, error: "channels[] is required" }, 400);
 
   const results = [];
-  for (const item of list) {
-    const channel = normalizeChannel(item);
-    try {
-      getAdapter(channel.type);
-      const { result, via } = action === "checkin"
-        ? await checkinWithFallback(channel, env)
-        : { result: await runAction(channel.type, action, channel), via: "worker" };
+  if (action === "checkin") {
+    // 批量核心：worker 直连 + 统一降级分发（整组一次 dispatch）
+    const outcomes = await batchCheckinCore(list, env);
+    for (const { item, result, via } of outcomes) {
       const pushed = {
-        id: channel.id,
-        name: channel.name,
-        type: channel.type,
-        baseUrl: channel.baseUrl,
+        id: item.id,
+        name: item.name,
+        type: item.type,
+        baseUrl: item.baseUrl,
         ...publicResult(action, result),
         via,
       };
       results.push(pushed);
-      // 适配器降级刷新出的新 token 写回请求体，供调用方（UI/KV 同步）持久化
-      if (result.tokens) {
-        results[results.length - 1].tokens = result.tokens;
+    }
+  } else {
+    for (const raw of list) {
+      const channel = normalizeChannel(raw);
+      try {
+        getAdapter(channel.type);
+        const result = await runAction(channel.type, action, channel);
+        results.push({
+          id: channel.id,
+          name: channel.name,
+          type: channel.type,
+          baseUrl: channel.baseUrl,
+          ...publicResult(action, result),
+        });
+        // 适配器降级刷新出的新 token 写回请求体，供调用方（UI/KV 同步）持久化
+        if (result.tokens) {
+          results[results.length - 1].tokens = result.tokens;
+        }
+      } catch (err) {
+        results.push({
+          id: channel.id,
+          name: channel.name,
+          type: channel.type,
+          baseUrl: channel.baseUrl,
+          ok: false,
+          action,
+          message: err.message || String(err),
+        });
       }
-    } catch (err) {
-      results.push({
-        id: channel.id,
-        name: channel.name,
-        type: channel.type,
-        baseUrl: channel.baseUrl,
-        ok: false,
-        action,
-        message: err.message || String(err),
-      });
     }
   }
   // 签到动作推送 TG 报告（余额/状态查询不打扰）
@@ -439,6 +503,8 @@ async function runScheduled(env) {
 
   const results = [];
   let skipped = 0;
+  // enabled[i] 与 outcomes[i] 一一对应，跑完后统一处理降级分发与 KV 回写
+  const enabled = [];
   for (const item of channels) {
     if (!isChannelEnabled(item)) {
       skipped += 1;
@@ -452,48 +518,30 @@ async function runScheduled(env) {
       });
       continue;
     }
-    const channel = normalizeChannel(item);
-    try {
-      const { result, via } = await checkinWithFallback(channel, env);
-      if (via === "worker") {
-        if (result.tokens) {
-          item.auth = { ...(item.auth || {}), ...result.tokens };
-        }
-        item.lastResult = {
-          ok: !!result.ok,
-          summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`,
-          at: Date.now(),
-        };
-      } else {
-        // 降级分发已受理；真实结果等 GHA 回传（/api/gh/result 覆盖 lastResult）
-        item.lastResult = {
-          ok: true,
-          summary: `checkin: ${result.message}`,
-          at: Date.now(),
-        };
-      }
-      results.push({
-        name: channel.name,
-        type: channel.type,
-        baseUrl: channel.baseUrl,
-        ok: !!result.ok,
-        message: result.message,
-      });
-    } catch (err) {
-      item.lastResult = {
-        ok: false,
-        summary: `checkin: ${err.message || String(err)}`,
-        at: Date.now(),
-      };
-      results.push({
-        name: channel.name,
-        type: channel.type,
-        baseUrl: channel.baseUrl,
-        ok: false,
-        message: err.message || String(err),
-      });
-    }
+    enabled.push(item);
   }
+
+  // 批量核心：worker 渠道直连、非 worker 渠道标记分发、失败渠道收集降级
+  const outcomes = await batchCheckinCore(enabled, env);
+  for (const { item, result, via } of outcomes) {
+    if (result.tokens) {
+      item.auth = { ...(item.auth || {}), ...result.tokens };
+    }
+    item.lastResult = {
+      ok: !!result.ok,
+      summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`,
+      at: Date.now(),
+    };
+    results.push({
+      name: item.name,
+      type: item.type,
+      baseUrl: item.baseUrl,
+      ok: !!result.ok,
+      message: result.message,
+      ...(via !== "worker" ? { via } : {}),
+    });
+  }
+
   await putChannels(env, channels);
   const ran = results.filter((r) => !r.skipped);
   if (!ran.length && skipped) {
@@ -814,7 +862,7 @@ function sealBox(publicKeyB64, message) {
 }
 
 // 命名导出仅供本地单测/脚本复用；Worker 入口仍是 default export
-export { handleCheckin, handleBatch, runScheduled, checkinWithFallback };
+export { handleCheckin, handleBatch, runScheduled, checkinWithFallback, batchCheckinCore };
 
 export default {
   async fetch(request, env) {

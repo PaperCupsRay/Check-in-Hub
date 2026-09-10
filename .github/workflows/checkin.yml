@@ -65,7 +65,7 @@ jobs:
       # api job 产出的失败渠道清单（gha_api → gha_browser 降级源）。
       # api job 被跳过时该 artifact 不存在，continue-on-error 静默放行。
       - name: Download api fallback list
-        if: ${{ github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_api') }}
+        if: ${{ github.event_name != 'repository_dispatch' || contains(join(github.event.client_payload.runners || '[]', ','), 'gha_api') }}
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
