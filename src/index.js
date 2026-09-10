@@ -657,7 +657,9 @@ async function handleGhDispatch(request, env) {
       400
     );
   }
-  // 允许 body 指定本次通道；缺省 = 所有非 worker 通道的启用渠道
+  // 允许 body 指定本次通道与渠道名单；names 缺省时按通道推全部启用渠道。
+  // names 必须原样透传（降级链靠它精确分发单个渠道）——不能按 runner 重新过滤，
+  // 否则 worker 渠道的降级请求会被「没有属于该通道的渠道」拒绝或偷换成整组重跑。
   let body = {};
   try {
     body = await request.json();
@@ -665,6 +667,7 @@ async function handleGhDispatch(request, env) {
     body = {};
   }
   const requested = Array.isArray(body.runners) ? body.runners.filter((r) => RUNNERS.has(r)) : null;
+  const requestedNames = Array.isArray(body.names) ? body.names.map(String).filter(Boolean) : null;
 
   let channels = [];
   try {
@@ -672,10 +675,12 @@ async function handleGhDispatch(request, env) {
   } catch (err) {
     return json({ ok: false, error: `读取 KV 失败: ${err.message}` }, 500);
   }
-  const names = channels
-    .filter((c) => c.enabled !== false)
-    .filter((c) => (requested ? requested.includes(runnerOf(c)) : runnerOf(c) !== "worker"))
-    .map((c) => c.name);
+  const names = requestedNames
+    ? [...new Set(requestedNames)]
+    : channels
+        .filter((c) => c.enabled !== false)
+        .filter((c) => (requested ? requested.includes(runnerOf(c)) : runnerOf(c) !== "worker"))
+        .map((c) => c.name);
   if (!names.length) {
     return json({ ok: false, error: "没有属于所选通道的启用渠道" }, 422);
   }
