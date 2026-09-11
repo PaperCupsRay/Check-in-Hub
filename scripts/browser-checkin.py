@@ -123,6 +123,38 @@ def report_results(results):
 
 # ---------------- 浏览器签到 ----------------
 
+def quota_usd(quota, per_unit=500000):
+    try:
+        n = float(quota) / (float(per_unit) or 500000)
+    except (TypeError, ValueError):
+        return None
+    return f"${n:.4f}" if 0 < abs(n) < 0.01 else f"${n:.2f}"
+
+
+def checkin_message(ok, body, status):
+    """拼出能自证的签到结论。
+
+    NewAPI 成功时只回 message:"" 或 "success"，直接透传会让日志变成「渠道名：success」，
+    看不出是真发了奖励还是只是请求通了。这里把奖励额度带出来。
+    """
+    body = body or {}
+    d = body.get("data") or {}
+    srv = str(body.get("message") or "").strip()
+    if not ok:
+        return (srv or f"HTTP {status}")[:200]
+    already = "已签到" in srv or "already" in srv.lower()
+    reward = d.get("quota_awarded") if isinstance(d, dict) else None
+    parts = []
+    if already:
+        parts.append("今日已签到（未重复发放）")
+    else:
+        money = quota_usd(reward) if reward is not None else None
+        parts.append(f"签到成功，奖励 {money}" if money else "签到成功（接口未返回奖励字段）")
+    if srv and srv.lower() not in ("ok", "success", "成功") and srv not in parts[0]:
+        parts.append(f"服务端：{srv}")
+    return "，".join(parts)[:200]
+
+
 def parse_cookie_pairs(raw):
     """'a=1; b=2' → [(name, value)]；容忍多行/JSON 导出格式。"""
     if not raw:
@@ -596,7 +628,7 @@ async def checkin_one(channel) -> dict:
         result = {
             "name": name,
             "ok": ok,
-            "message": str(body.get("message") or ("HTTP " + str(checkin.get("status"))))[:120],
+            "message": checkin_message(ok, body, checkin.get("status")),
         }
 
         # 顺手取余额（失败不影响签到结果）

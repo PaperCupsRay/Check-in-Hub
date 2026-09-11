@@ -51,6 +51,13 @@ function timezoneOf(channel) {
   return channel.options?.timezone || DEFAULT_TZ;
 }
 
+/** sub2api 的 balance/reward 本身就是美元金额，不需要按 quota_per_unit 换算 */
+function money(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return null;
+  return `$${n.toFixed(Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2)}`;
+}
+
 function normalizeUser(data) {
   const u = data?.data || data || {};
   return {
@@ -82,28 +89,55 @@ function normalizeStatus(payload) {
   };
 }
 
+/**
+ * 拼装可读的签到结论。
+ *
+ * 服务端成功时只回 message:"success"，直接透传会让日志变成「百倍1：success」，
+ * 无法区分「真发了奖励」「今日已签到」还是「只登录没签到」。这里始终用结构化
+ * 字段自行拼装：奖励 / 余额 / 连续天数 / 累计天数，原始 message 仅在服务端给出
+ * 了非套话内容时作为前缀保留。
+ */
+function checkinSummary({ alreadyCheckedIn, reward, balance, serverMsg, d }) {
+  const parts = [];
+  const rewardStr = money(reward);
+  if (alreadyCheckedIn) {
+    parts.push("今日已签到（未重复发放）");
+  } else if (rewardStr && Number(reward) !== 0) {
+    parts.push(`签到成功，奖励 ${rewardStr}`);
+  } else if (reward != null) {
+    // 明确返回 0 与「没有该字段」是两回事，后者说明接口没给奖励信息
+    parts.push("签到成功，本次奖励 $0");
+  } else {
+    parts.push("签到成功（接口未返回奖励字段）");
+  }
+  const balStr = money(balance);
+  if (balStr) parts.push(`余额 ${balStr}`);
+  const streak = d.current_streak ?? null;
+  if (streak != null) parts.push(`连续 ${streak} 天`);
+  const total = d.total_check_in_days ?? null;
+  if (total != null) parts.push(`累计 ${total} 天`);
+  let out = parts.join("，");
+  // 服务端返回了真实说明（非 ok/success 套话）时保留，便于排查
+  const msg = String(serverMsg || "").trim();
+  if (msg && !/^(ok|success|成功)$/i.test(msg) && !out.includes(msg)) {
+    out = `${out}（服务端：${msg}）`;
+  }
+  return out;
+}
+
 function normalizeCheckin(payload) {
   const d = payload?.data || payload || {};
   const reward = d.reward_amount ?? d.reward ?? d.today_reward ?? d.quota_awarded ?? null;
   const alreadyCheckedIn =
     !!d.already_checked_in || /already|已签到/i.test(String(payload?.message || ""));
   const balance = d.balance_after ?? d.balance ?? null;
-  let message = payload?.message || "";
-  if (!message || /^(ok|success)$/i.test(message)) {
-    if (alreadyCheckedIn) message = "今日已签到";
-    else if (reward != null) {
-      const n = Number(reward);
-      message = Number.isFinite(n)
-        ? `签到成功，奖励 $${n.toFixed(Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2)}`
-        : "签到成功";
-    } else message = "签到成功";
-  }
-  if (balance != null) {
-    const n = Number(balance);
-    if (Number.isFinite(n) && !/\$/.test(String(message))) {
-      message = `${message}，余额 $${n.toFixed(Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2)}`;
-    }
-  }
+  const message = checkinSummary({
+    alreadyCheckedIn,
+    reward,
+    balance,
+    serverMsg: payload?.message,
+    d,
+  });
   return {
     success:
       payload?.code === 0 ||
@@ -122,6 +156,14 @@ function normalizeCheckin(payload) {
     raw: payload,
   };
 }
+
+/** 鉴权路径前缀：让日志分得清「直接签到」和「登录后签到」 */
+const AUTH_VIA_LABEL = {
+  token: "",
+  login: "登录后签到：",
+  refresh: "刷新 token 后签到：",
+  relogin: "重新登录后签到：",
+};
 
 export const sub2apiAdapter = {
   id: "sub2api",
@@ -241,20 +283,33 @@ export const sub2apiAdapter = {
     };
   },
 
+  /**
+   * runner 会收到第二个参数 authVia，说明本次请求用的是哪条鉴权路径：
+   *   token   直接用已存的 accessToken
+   *   login   本地没有 token，先账密登录再请求
+   *   refresh token 失效，用 refreshToken 换新后重试
+   *   relogin token 失效且刷新不可用/失败，重新账密登录后重试
+   * 签到日志据此写明「直接签到」还是「登录后签到」——只看 success 分不出这点。
+   */
   async withAuthRetry(channel, runner) {
     let ensured = await this.ensureToken(channel);
     if (!ensured.ok) return { ok: false, message: ensured.message, raw: ensured.raw };
 
-    let result = await runner(ensured.accessToken);
+    let result = await runner(ensured.accessToken, ensured.refreshed ? "login" : "token");
+    // 只有失败的结果才谈得上「鉴权失效」。成功结果一律不重试：否则成功文案里出现
+    // 「登录」「token」等字样（如「登录后签到：…」）会被误判成 401，触发第二次
+    // POST /api/v1/check-in —— 重复签到请求，且第二次通常报「今日已签到」覆盖真实奖励。
     const unauthorized =
-      result?.httpStatus === 401 ||
-      result?.raw?.code === 401 ||
-      /unauthor|token|session|登录/i.test(String(result?.message || ""));
+      !result?.ok &&
+      (result?.httpStatus === 401 ||
+        result?.raw?.code === 401 ||
+        /unauthor|token|session|登录/i.test(String(result?.message || "")));
 
     if (unauthorized) {
       const auth = pickAuth(channel);
       let nextToken = null;
       let tokens = null;
+      let retryVia = null;
       if (auth.refreshToken) {
         const refreshed = await this.refresh({
           ...channel,
@@ -263,6 +318,7 @@ export const sub2apiAdapter = {
         if (refreshed.ok) {
           nextToken = refreshed.tokens.accessToken;
           tokens = refreshed.tokens;
+          retryVia = "refresh";
         }
       }
       if (!nextToken && auth.email && auth.password) {
@@ -273,10 +329,11 @@ export const sub2apiAdapter = {
         if (login.ok) {
           nextToken = login.tokens.accessToken;
           tokens = login.tokens;
+          retryVia = "relogin";
         }
       }
       if (nextToken) {
-        result = await runner(nextToken);
+        result = await runner(nextToken, retryVia);
         result.tokens = tokens;
       }
     } else if (ensured.tokens) {
@@ -332,7 +389,7 @@ export const sub2apiAdapter = {
   },
 
   async checkin(channel) {
-    return this.withAuthRetry(channel, async (token) => {
+    return this.withAuthRetry(channel, async (token, authVia) => {
       const auth = pickAuth(channel);
       // HAR observed empty JSON body {}; timezone/turnstile are optional extras
       const body = {};
@@ -365,8 +422,10 @@ export const sub2apiAdapter = {
         ok: true,
         httpStatus: res.status,
         result: normalized,
-        message: data.message || normalized.message || "签到成功",
+        // 自行拼装的结论优先于服务端的 "success" 套话，否则日志只剩「渠道名：success」
+        message: `${AUTH_VIA_LABEL[authVia] || ""}${normalized.message || data.message || "签到成功"}`,
         raw: data,
+        authVia: authVia || null,
       };
     });
   },

@@ -47,6 +47,68 @@ function currentMonth(tz = "Asia/Shanghai") {
   }
 }
 
+function currentDate(tz = "Asia/Shanghai") {
+  try {
+    // en-CA formats as YYYY-MM-DD, matching the API's checkin_date
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function quotaUsd(quota, perUnit = 500000) {
+  const n = Number(quota) / (Number(perUnit) || 500000);
+  if (!Number.isFinite(n)) return null;
+  return `$${n.toFixed(Math.abs(n) > 0 && Math.abs(n) < 0.01 ? 4 : 2)}`;
+}
+
+/**
+ * sota 变体（sotamodel.net）的奖励说明。
+ * 该端点回 reward_credits（积分）+ reward_quota（额度），原来两个都被丢掉，
+ * 日志只剩一句「今日已签到」，看不出到底发了多少。
+ */
+function sotaReward(d = {}) {
+  const parts = [];
+  if (d.reward_credits != null) parts.push(`${d.reward_credits} 积分`);
+  const money = d.reward_quota != null ? quotaUsd(d.reward_quota) : null;
+  if (money) parts.push(money);
+  return parts.length ? `，奖励 ${parts.join(" / ")}` : "";
+}
+
+function todayReward(st, tz) {
+  const today = currentDate(tz);
+  const rec = (st?.records || []).find((r) => (r.checkin_date || r.check_in_date) === today);
+  if (!rec) return null;
+  return rec.quota_awarded ?? rec.quota ?? null;
+}
+
+/**
+ * 把签到状态查询拼成有信息量的一句话。
+ *
+ * 「今日已签到」单独一句看不出到底拿到多少，而状态接口的 records 里就有当天的
+ * quota_awarded（HAR 实测：justwoker 返回整月每天的奖励额度）。这里把当天奖励、
+ * 本月次数、本月累计一并带出，日志才能自证「确实签到并拿到奖励」。
+ */
+function statusSummary(st, tz) {
+  const parts = [];
+  const todayQuota = todayReward(st, tz);
+  if (st.checkedInToday) {
+    const money = quotaUsd(todayQuota);
+    parts.push(money ? `今日已签到，奖励 ${money}` : "今日已签到");
+  } else {
+    parts.push("今日未签到");
+  }
+  if (st.checkinCount != null) parts.push(`本月 ${st.checkinCount} 次`);
+  const monthMoney = st.totalQuota != null ? quotaUsd(st.totalQuota) : null;
+  if (monthMoney) parts.push(`本月累计 ${monthMoney}`);
+  return parts.join(" · ");
+}
+
 function parseSetCookie(res) {
   // Workers/fetch may expose getSetCookie()
   const cookies = [];
@@ -204,6 +266,22 @@ function looksLikeHtmlChallenge(data, status) {
 }
 
 /**
+ * 站点把签到挂在 Turnstile 后面时（/api/status 的 turnstile_check 为 true），
+ * 不带 token 的 POST 会被业务层拒掉，返回 HTTP 200 + success:false +
+ * message:"Turnstile token 为空"。
+ *
+ * 注意这不是凭证问题，也不代表站点「打开网页就自动签到」：站点前端本身就是
+ * 先不带 token POST 一次，拿到含 "Turnstile" 的报错后才弹出人机校验框、带
+ * token 重发。所以页面上平时看不到 Turnstile 组件 —— 它是惰性挂载的。
+ * 纯 HTTP 通道（worker / gha_api）无法产出 token，只能走浏览器通道。
+ */
+function turnstileRejected(data) {
+  const raw = responseTextHint(data);
+  if (!/turnstile/i.test(raw)) return false;
+  return !/<!doctype html|<html[\s>]/i.test(raw);
+}
+
+/**
  * 「未登录且未提供 access token」不代表服务端不读 Cookie。
  * 服务端先解 session，解不出才回退看 Authorization，两者都拿不到时报这一句。
  * 站点自身前端就是靠 Cookie(withCredentials) + New-Api-User 完成签到的，
@@ -235,7 +313,19 @@ function httpErrorMessage(action, res) {
     }
     return `${action} 接口不存在 (HTTP 404)${serverMsg ? `：${serverMsg}` : ""}。请确认 Base URL 是否为 API 根地址（如 https://api.pie-xian.com）。`;
   }
-  // 先判鉴权：应用层返回的 JSON 401 是凭证问题，跟 Cloudflare 无关，
+  // Turnstile 拦截要先判：它是 HTTP 200 + success:false，凭证其实是好的，
+  // 不能被下面的凭证/CF 分支误报成「Cookie 失效」或「出口 IP 不匹配」。
+  if (turnstileRejected(data)) {
+    return (
+      `${serverMsg || "Turnstile 校验未通过"} · 该站已开启签到人机校验` +
+      `（/api/status 的 turnstile_check=true），凭证本身有效，但纯 HTTP 通道产不出 token。` +
+      `站点前端是「先试签到→被拒→才弹验证框」的惰性挂载，所以页面上平时看不到组件，` +
+      `看不到 ≠ 服务端不校验。注意 gha_browser 通道也未必能解：Cloudflare 对 GitHub ` +
+      `Actions 的机房 IP 常静默不签发挑战（组件能渲染但永远等不到 token），` +
+      `gorouter / SeekAi / JustDoWork 均已实测失败。只能用住宅 IP（本机或家宽 VPS）跑浏览器流程。`
+    );
+  }
+  // 再判鉴权：应用层返回的 JSON 401 是凭证问题，跟 Cloudflare 无关，
   // 否则会被下面的 CF 分支误报成「出口 IP 不匹配」。
   if (needsAccessTokenHint(data)) {
     // 「invalid access token」= 只有 Authorization 被识别且校验失败；
@@ -579,7 +669,9 @@ export const newapiAdapter = {
             rewardCredits: d.reward_credits ?? null,
             rewardQuota: d.reward_quota ?? null,
           },
-          message: d.checked_in_today ? "今日已签到" : "今日未签到",
+          message: d.checked_in_today
+            ? `今日已签到${sotaReward(d)}`
+            : "今日未签到",
           raw: data,
           tokens: ensured.tokens,
         };
@@ -624,18 +716,11 @@ export const newapiAdapter = {
       };
     }
     const st = normalizeStatus(data);
-    const parts = [];
-    if (st.checkedInToday != null) parts.push(st.checkedInToday ? "今日已签到" : "今日未签到");
-    if (st.checkinCount != null) parts.push(`本月 ${st.checkinCount} 次`);
-    if (st.totalQuota != null) {
-      const usd = Number(st.totalQuota) / 500000;
-      if (Number.isFinite(usd)) parts.push(`本月获得 $${usd.toFixed(2)}`);
-    }
     return {
       ok: true,
       httpStatus: res.status,
       status: st,
-      message: parts.join(" · ") || data.message || "ok",
+      message: statusSummary(st, channel.options?.timezone || "Asia/Shanghai") || data.message || "ok",
       raw: data,
       tokens: ensured.tokens,
     };
@@ -645,6 +730,7 @@ export const newapiAdapter = {
     const ensured = await this.ensureSession(channel);
     if (!ensured.ok) return ensured;
     const auth = pickAuth(channel);
+    const tz = channel.options?.timezone || "Asia/Shanghai";
     let cookie = ensured.cookie;
     let tokens = ensured.tokens;
 
@@ -665,10 +751,10 @@ export const newapiAdapter = {
           result: {
             success: true,
             alreadyCheckedIn: true,
-            message: "今日已签到",
+            message: `今日已签到${sotaReward(st)}`,
             reward: st.reward_quota ?? null,
           },
-          message: "今日已签到",
+          message: `今日已签到${sotaReward(st)}（状态查询确认，未再发起 POST）`,
           raw: stRes.data,
           tokens,
         };
@@ -689,7 +775,7 @@ export const newapiAdapter = {
           alreadyCheckedIn: false,
         },
         message: ok
-          ? `签到成功${d.reward_credits != null ? `，奖励 ${d.reward_credits} 积分` : ""}`
+          ? `签到成功${sotaReward(d) || "（接口未返回奖励字段）"}`
           : data.message || `签到失败 HTTP ${res.status}`,
         raw: data,
         tokens,
@@ -712,17 +798,18 @@ export const newapiAdapter = {
       if (stRes.status < 400 && stRes.data?.success !== false) {
         preStatus = normalizeStatus(stRes.data);
         if (preStatus.checkedInToday) {
+          const summary = statusSummary(preStatus, tz);
           return {
             ok: true,
             httpStatus: stRes.status,
             result: {
               success: true,
               alreadyCheckedIn: true,
-              message: "今日已签到",
-              reward: null,
+              message: summary,
+              reward: todayReward(preStatus, tz),
             },
             status: preStatus,
-            message: "今日已签到（未再发起 POST，避免 Cloudflare 拦截）",
+            message: `${summary}（状态查询确认，未再发起 POST 以免触发 Cloudflare）`,
             raw: stRes.data,
             tokens,
           };
@@ -763,16 +850,18 @@ export const newapiAdapter = {
         if (stRes.status < 400 && stRes.data?.success !== false) {
           preStatus = normalizeStatus(stRes.data);
           if (preStatus.checkedInToday) {
+            const summary = statusSummary(preStatus, tz);
             return {
               ok: true,
               httpStatus: stRes.status,
               result: {
                 success: true,
                 alreadyCheckedIn: true,
-                message: "今日已签到",
+                message: summary,
+                reward: todayReward(preStatus, tz),
               },
               status: preStatus,
-              message: "POST 被 Cloudflare 拦截，但状态查询显示今日已签到",
+              message: `${summary}（POST 被 Cloudflare 拦截，结论取自状态查询）`,
               raw: { post: data, status: stRes.data },
               tokens,
             };
