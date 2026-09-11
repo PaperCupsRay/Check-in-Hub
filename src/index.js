@@ -16,7 +16,13 @@ import {
   getProxies,
   putProxies,
 } from "./kv.js";
-import { normalizeProxy, maskProxyUrl, testSocks5 } from "./proxy.js";
+import {
+  normalizeProxy,
+  maskProxyUrl,
+  testProxy,
+  parseProxyUrl,
+  browserAuthSupported,
+} from "./proxy.js";
 import uiHtml from "./ui.html";
 import { sendTelegram, formatCheckinReport } from "./tg.js";
 import _nacl from "tweetnacl";
@@ -508,7 +514,18 @@ async function handleProxiesGet(env) {
     return json({
       ok: true,
       count: proxies.length,
-      proxies: proxies.map((p) => ({ ...p, url: maskProxyUrl(p.url), rawUrl: p.url })),
+      // scheme/browserAuth 是给面板显示用的派生字段：SOCKS 的凭证 Chromium 用不了，
+      // HTTP(S) 的能用，面板要能一眼看出区别。老数据没存 scheme，这里现算。
+      proxies: proxies.map((p) => {
+        const parsed = parseProxyUrl(p.url);
+        return {
+          ...p,
+          url: maskProxyUrl(p.url),
+          rawUrl: p.url,
+          scheme: p.scheme || parsed?.scheme || null,
+          browserAuth: parsed ? browserAuthSupported(parsed.scheme) : null,
+        };
+      }),
     });
   } catch (err) {
     return json({ ok: false, error: err.message || String(err) }, err.status || 500);
@@ -561,7 +578,7 @@ async function handleProxiesTest(request, env) {
 
   // 单条测试：不落库，用于「填之前先试一下」
   if (body.url) {
-    const r = await testSocks5(String(body.url), {
+    const r = await testProxy(String(body.url), {
       targetHost: body.targetHost || "api.ipify.org",
       timeoutMs: Number(body.timeoutMs) || 12000,
     });
@@ -581,7 +598,7 @@ async function handleProxiesTest(request, env) {
   const timeoutMs = Number(body.timeoutMs) || 12000;
   const results = await Promise.all(
     proxies.map(async (p) => {
-      const r = await testSocks5(p.url, { targetHost, timeoutMs });
+      const r = await testProxy(p.url, { targetHost, timeoutMs });
       return { entry: p, r };
     })
   );
@@ -610,12 +627,15 @@ async function handleProxiesTest(request, env) {
     browserUsable: usable,
     message:
       `连通 ${okCount}/${results.length}` +
-      (okCount ? `，其中 ${usable} 个免认证（浏览器可用）` : "") +
-      (okCount > usable ? `；带认证的 ${okCount - usable} 个 Chromium 用不了` : ""),
+      (okCount ? `，浏览器通道可用 ${usable} 个` : "") +
+      // 只有 SOCKS 会出现「连通但浏览器用不了」（Chromium 不支持 SOCKS 认证）；
+      // HTTP(S) 的凭证 Chromium 能用，不该被算进这一类。
+      (okCount > usable ? `；${okCount - usable} 个连通但需 SOCKS 认证，Chromium 用不了` : ""),
     results: results.map(({ entry, r }) => ({
       url: maskProxyUrl(entry.url),
       ok: r.ok,
       ms: r.ms ?? null,
+      scheme: r.scheme || null,
       authUsed: r.authUsed || null,
       browserUsable: r.browserUsable ?? null,
       error: r.error || null,

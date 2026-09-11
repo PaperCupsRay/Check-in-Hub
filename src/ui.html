@@ -496,12 +496,14 @@
       <div class="toolbar">
         <div>
           <h2>
-            <span>住宅代理池</span>
+            <span>代理池</span>
             <span class="badge" id="proxyBadge">0</span>
           </h2>
           <div class="hint">
             供「GitHub Actions · 浏览器过盾」通道使用。Cloudflare 对 GHA 机房 IP 常静默不签发 Turnstile 挑战（组件能渲染但永远等不到 token），换成住宅出口后实测 27s 即可拿到 token。<br />
-            每行一个，支持 <code>socks5://host:port</code> 或带 <code>#备注</code>。<strong>注意 Chromium 不支持 SOCKS5 用户名密码认证</strong>，带凭证的代理只能用于连通性测试，浏览器通道会自动跳过。
+            每行一个，支持 <code>socks5://</code>、<code>socks4://</code>、<code>http://</code>、<code>https://</code>，可带 <code>user:pass@</code> 和 <code>#备注</code>；省略协议按 socks5 处理。<br />
+            <strong>凭证差异（实测）</strong>：Chromium 不支持 SOCKS 用户名密码认证，SOCKS 代理的凭证会被自动剥掉（很多公开代理的 user:pass 只是摆设，剥掉照样能用）；HTTP/HTTPS 代理的 Basic 认证浏览器原生支持，凭证会保留。<br />
+            <strong style="color:#fca5a5">安全提示</strong>：签到时会带渠道 Cookie / 访问令牌，运行前会逐个校验代理有没有解密 TLS（对比证书指纹）。<strong>做中间人的代理会被自动拒用</strong>——2026-09-11 实测一批公开「住宅 SOCKS5」全部在换证书，用了等于把凭证明文交给代理方。
           </div>
         </div>
         <div class="toolbar-actions">
@@ -510,7 +512,7 @@
           <button id="btnClearProxies" class="ghost" type="button">清空</button>
         </div>
       </div>
-      <textarea id="proxyInput" rows="5" placeholder="socks5://184.178.172.11:4145#US 家宽&#10;socks5://user:pass@1.2.3.4:1080#带认证（浏览器用不了）"></textarea>
+      <textarea id="proxyInput" rows="5" placeholder="socks5://1.2.3.4:1080#US 家宽&#10;socks4://1.2.3.4:1080&#10;http://user:pass@proxy.example.com:8080#付费 HTTP&#10;https://user:pass@proxy.example.com:443&#10;1.2.3.4:4145  （省略协议＝socks5）"></textarea>
       <div class="proxy-results" id="proxyResults"></div>
     </section>
 
@@ -1795,20 +1797,30 @@
       box.innerHTML = list.map((p) => {
         const r = byUrl.get(p.url) || null;
         const chk = r || p.lastCheck || null;
+        const scheme = p.scheme || chk?.scheme || "";
         let tag = `<span class="tag">未测试</span>`;
         if (chk) {
           if (chk.ok && chk.browserUsable) tag = `<span class="tag ok">可用 ${chk.ms}ms</span>`;
           else if (chk.ok && chk.browserUsable === false) {
-            tag = `<span class="tag warn" title="Chromium 不支持 SOCKS5 用户名密码认证">通但浏览器不可用</span>`;
+            // 只有 SOCKS 才是「凭证 Chromium 用不了」；HTTP(S) 代理的 Basic 认证是支持的，
+            // 所以这里不能一律写成 SOCKS 的说法，否则 HTTP 代理用户会被误导。
+            const why = String(scheme).startsWith("socks")
+              ? "Chromium 不支持 SOCKS 用户名密码认证，本条会被浏览器通道跳过"
+              : "该代理需要认证但凭证未通过";
+            tag = `<span class="tag warn" title="${escapeHtml(why)}">通但浏览器不可用</span>`;
           } else if (chk.ok) tag = `<span class="tag ok">连通 ${chk.ms}ms</span>`;
           else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
         }
         if (p.enabled === false) tag = `<span class="tag off">已停用</span>` + tag;
         const err = chk && !chk.ok && chk.error
           ? `<div class="note" style="flex-basis:100%">${escapeHtml(chk.error)}</div>` : "";
+        const schemeTag = scheme
+          ? `<span class="tag" title="${p.browserAuth === false ? "SOCKS 代理的凭证 Chromium 用不了，会自动剥离" : "HTTP(S) 代理的凭证 Chromium 原生支持"}">${escapeHtml(scheme)}</span>`
+          : "";
         return `
           <div class="proxy-row" data-proxy-url="${escapeHtml(p.url)}">
             <span class="addr">${escapeHtml(p.url)}</span>
+            ${schemeTag}
             ${p.note ? `<span class="note">${escapeHtml(p.note)}</span>` : ""}
             <span class="spacer"></span>
             ${tag}
@@ -1884,7 +1896,7 @@
         showToast("代理测试完成", data.message || "", data.browserUsable ? "ok" : "warn", 5000);
         for (const r of data.results || []) {
           if (!r.ok) log(`  ✗ ${r.url} → ${r.error || "失败"}`, "err");
-          else log(`  ✓ ${r.url} → ${r.ms}ms${r.browserUsable ? "（免认证，浏览器可用）" : "（带认证，Chromium 不可用）"}`, "ok");
+          else log(`  ✓ ${r.url} → ${r.ms}ms${r.browserUsable === false ? "（SOCKS 认证，Chromium 用不了）" : ""}`, "ok");
         }
       } catch (e) {
         log("代理测试失败: " + (e.message || e), "err");

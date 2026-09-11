@@ -38,11 +38,18 @@ DEFAULT_SITEKEY = "0x4AAAAAAELziOpg1Y2gFtAt"
 # UA 必须与 CloakBrowser 内核版本一致（chromium-146）：报更高版本号（如 150）会造成
 # UA 与真实指纹不匹配，Cloudflare 静默不签发 challenge（render 成功但永不出 token）。
 
-# 本机（而非 GHA）跑时的逃生阀：部分网络环境会做 TLS 中间人劫持，Chromium 直接
-# ERR_CERT_AUTHORITY_INVALID，页面根本打不开（本机实测，curl 同样 rc=60）。
-# 这是**安全降级**（不再校验证书），所以默认关闭，只有显式设 CHECKIN_INSECURE_TLS=true
-# 才生效；GHA 环境没有这个问题，永远不要在 workflow 里打开。
-INSECURE_TLS = (os.environ.get("CHECKIN_INSECURE_TLS") or "false").lower() == "true"
+# 绝不要在这里加 --ignore-certificate-errors。
+#
+# 曾经加过，理由是「本机网络疑似 TLS 劫持，页面打不开」。2026-09-11 用 openssl
+# 逐个比对证书指纹后发现，劫持者不是本机网络，而是**代理自己**：这批
+# 184.178.172.* 公开 SOCKS5 全部在做 TLS 中间人，回给我们的证书签发者是
+# "C=US, ST=Texas, O=None, LLC"，而直连拿到的是 Google Trust Services。
+# 也就是说，Chromium 报 ERR_CERT_AUTHORITY_INVALID 是它**正确拦下了中间人**，
+# 而那个开关恰好把这层保护关掉了 —— 一旦打开，签到用的 Cookie / 访问令牌
+# 就会以明文暴露给代理运营者。
+#
+# 所以证书错误必须当作「这个代理不可信，换下一个」来处理，绝不是绕过。
+# 见 verify_proxy_tls()。
 
 # 导航策略。这些站都是 SPA，首屏要串几十个请求；走住宅代理时（RTT 实测 2-8s）
 # `domcontentloaded` 和 `load` 都可能永不触发——本机实测 45s、90s、120s 全部超时，
@@ -64,14 +71,21 @@ def nav_opts(proxy):
         return "commit", NAV_TIMEOUT_PROXY
     return "domcontentloaded", NAV_TIMEOUT_DIRECT
 
-# 两处 launch 共用的 Chromium 参数，避免改一处漏一处
+# 两处 launch 共用的 Chromium 参数，避免改一处漏一处。
+#
+# 绝对不要在这里加 --ignore-certificate-errors。曾经为了「本机 TLS 被劫持」加过，
+# 后来查明那个证书错误根本不是本机问题：那批公开 SOCKS5 代理在解密 TLS
+# （2026-09-11 实测，代理侧签发者是 "C=US, ST=Texas, O=None, LLC"，
+# 直连是 Google Trust Services，证书指纹完全不同）。也就是说
+# ERR_CERT_AUTHORITY_INVALID 是 Chromium 正确挡住了中间人，
+# 加这个参数等于把渠道 Cookie/令牌明文交给代理运营者。
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
     "--window-size=1366,768",
-] + (["--ignore-certificate-errors"] if INSECURE_TLS else [])
+]
 
 # 一个渠道最多换几个代理重试。代理都是慢的（实测 2-8s RTT），每次尝试含 45s
 # 等 token，试太多会把 job 拖到超时；3 个足够覆盖「个别代理临时挂掉」。
@@ -154,14 +168,13 @@ def fetch_all_channels():
 
 
 def fetch_proxies():
-    """住宅 SOCKS5 代理池（面板 KV）。
+    """住宅代理池（面板 KV），支持 socks5 / socks4 / http / https。
 
     为什么需要：Cloudflare 对 GitHub Actions 的机房 IP 常静默不签发 Turnstile
     挑战——组件能渲染但永远等不到 token（gorouter / SeekAi / JustDoWork 实测）。
     换成住宅出口后同一套代码 27s 就拿到了 token，所以代理是这类站的唯一解法。
 
-    只取 enabled 且**免认证**的：Chromium 不支持 SOCKS5 用户名密码认证，
-    带凭证一律 ERR_SOCKS_CONNECTION_FAILED（本机实测）。
+    返回的地址已按协议处理成 Chromium 能直接用的形式（见 proxy_url_for_browser）。
     """
     try:
         auth = hub_session_headers()
@@ -180,14 +193,14 @@ def fetch_proxies():
         if not url:
             continue
         chk = p.get("lastCheck") or {}
-        # Chromium 不支持 SOCKS5 用户名密码认证，带凭证会直接 ERR_SOCKS_CONNECTION_FAILED，
-        # 所以给浏览器的地址一律剥掉凭证。很多"带认证"的公开代理其实根本不校验
-        # （本批 OTC:OTC 实测 authUsed=none），剥掉后照样能用 —— 见 @ 就整条丢弃会白扔可用出口。
-        # 只有面板实测确认「需要认证」的才跳过：那种剥了凭证也连不上。
-        if chk.get("ok") and chk.get("browserUsable") is False:
-            log(f"  ⏭️ 跳过 {mask_proxy(url)}（实测需要 SOCKS5 认证，Chromium 用不了）")
+        # 面板实测「该 SOCKS 代理真的强制认证」时才跳过：Chromium 用不了 SOCKS 认证，
+        # 剥掉凭证也连不上，重试纯属浪费 45s。注意这只对 SOCKS 成立 ——
+        # HTTP(S) 代理的 Basic 认证 Chromium 原生支持，凭证要保留（见 proxy_url_for_browser）。
+        scheme = split_proxy(url)[0]
+        if scheme.startswith("socks") and chk.get("ok") and chk.get("browserUsable") is False:
+            log(f"  ⏭️ 跳过 {mask_proxy(url)}（实测强制 SOCKS 认证，Chromium 用不了）")
             continue
-        url = strip_proxy_credentials(url)
+        url = proxy_url_for_browser(url)
         # 面板测过的：连通的排前面，同为连通的按延迟升序；没测过的排中间
         rank = (0 if chk.get("ok") else 1 if chk.get("ok") is None else 2, chk.get("ms") or 9999)
         out.append((rank, url))
@@ -195,32 +208,158 @@ def fetch_proxies():
     return [u for _, u in out]
 
 
-def strip_proxy_credentials(url):
-    """剥掉 socks5:// 后面的 user:pass@。
-
-    Chromium 的 --proxy-server 不支持 SOCKS5 认证，带凭证一律
-    ERR_SOCKS_CONNECTION_FAILED（本机实测）；剥掉后对"假认证"代理照样可用。
-    """
+def split_proxy(url):
+    """拆成 (scheme, cred, host, port)。cred 是 "user:pass" 或 ""。"""
     try:
         scheme, rest = url.split("://", 1)
-        if "@" in rest:
-            rest = rest.rsplit("@", 1)[1]
-        return f"{scheme}://{rest}"
-    except Exception:  # noqa: BLE001
-        return url
+    except ValueError:
+        return "socks5", "", url, ""
+    scheme = scheme.lower()
+    cred = ""
+    if "@" in rest:
+        cred, rest = rest.rsplit("@", 1)
+    host, _, port = rest.partition(":")
+    return scheme, cred, host, port
+
+
+def proxy_url_for_browser(url):
+    """给 Chromium 的 --proxy-server 用的地址。
+
+    分协议处理，不能一刀切（2026-09-11 实测）：
+      socks5/socks4  **必须剥掉凭证** —— Chromium 不支持 SOCKS 用户名密码认证，
+                     带上直接 ERR_SOCKS_CONNECTION_FAILED。剥掉后对那些
+                     "假认证"代理照样能用（本批 OTC:OTC 实测 authUsed=none）。
+      http/https     **必须保留凭证** —— Chromium 原生支持代理 Basic 认证，
+                     剥掉反而会变成 407 Proxy Authentication Required。
+    """
+    scheme, cred, host, port = split_proxy(url)
+    hostport = f"{host}:{port}" if port else host
+    if scheme.startswith("socks"):
+        return f"{scheme}://{hostport}"
+    return f"{scheme}://{cred}@{hostport}" if cred else f"{scheme}://{hostport}"
 
 
 def mask_proxy(url):
-    """日志里不泄露代理凭证。"""
+    """日志里不泄露代理凭证（协议名要照实回显，不能一律写 socks5）。"""
     try:
-        rest = url.split("://", 1)[1]
-        if "@" in rest:
-            cred, host = rest.split("@", 1)
-            user = cred.split(":", 1)[0]
-            return f"socks5://{user}:***@{host}"
-        return url
+        scheme, cred, host, port = split_proxy(url)
+        hostport = f"{host}:{port}" if port else host
+        if cred:
+            return f"{scheme}://{cred.split(':', 1)[0]}:***@{hostport}"
+        return f"{scheme}://{hostport}"
     except Exception:  # noqa: BLE001
-        return "socks5://***"
+        return "(proxy)"
+
+
+def _peer_cert_sha256(host, port, proxy=None, timeout=15):
+    """取目标站 TLS 证书的 SHA-256 指纹；proxy 为 None 时直连。
+
+    故意用 verify_mode=NONE：我们要的是「看到对方递了什么证书」，
+    而不是「证书是否可信」——不关校验就拿不到 MITM 代理伪造的那张证书。
+    """
+    import hashlib
+    import socket as _socket
+    import ssl as _ssl
+
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+
+    if proxy:
+        scheme, cred, phost, pport = split_proxy(proxy)
+        raw = _socket.create_connection((phost, int(pport or 1080)), timeout=timeout)
+        try:
+            if scheme in ("http", "https"):
+                # https 代理要先对代理这一跳做 TLS，否则 Basic 凭证明文过网
+                if scheme == "https":
+                    praw = ctx.wrap_socket(raw, server_hostname=phost)
+                    raw = praw
+                req = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+                if cred:
+                    import base64
+                    req.append(
+                        "Proxy-Authorization: Basic "
+                        + base64.b64encode(cred.encode()).decode()
+                    )
+                raw.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
+                head = b""
+                while b"\r\n\r\n" not in head and len(head) < 4096:
+                    chunk = raw.recv(1024)
+                    if not chunk:
+                        break
+                    head += chunk
+                first = head.split(b"\r\n", 1)[0].decode(errors="replace")
+                if " 2" not in first:
+                    raise RuntimeError(f"代理 CONNECT 失败: {first[:60]}")
+            elif scheme == "socks4":
+                # SOCKS4a：IP 填 0.0.0.1 表示让代理解析域名
+                hb = host.encode()
+                raw.sendall(
+                    bytes([0x04, 0x01]) + port.to_bytes(2, "big")
+                    + bytes([0, 0, 0, 1]) + b"\x00" + hb + b"\x00"
+                )
+                rep = raw.recv(8)
+                if len(rep) < 2 or rep[1] != 0x5A:
+                    raise RuntimeError(f"SOCKS4 CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
+            else:
+                # SOCKS5：声明免认证 + 用户名密码两种方式
+                user, _, pwd = (cred or "").partition(":")
+                methods = [0x00, 0x02] if user else [0x00]
+                raw.sendall(bytes([0x05, len(methods)] + methods))
+                greet = raw.recv(2)
+                if greet[:1] != b"\x05":
+                    raise RuntimeError("不是 SOCKS5 代理")
+                if greet[1:2] == b"\x02":
+                    ub, pb = user.encode(), pwd.encode()
+                    raw.sendall(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
+                    if raw.recv(2)[1:2] != b"\x00":
+                        raise RuntimeError("SOCKS5 认证被拒绝")
+                hb = host.encode()
+                raw.sendall(bytes([0x05, 0x01, 0x00, 0x03, len(hb)]) + hb + port.to_bytes(2, "big"))
+                rep = raw.recv(4)
+                if len(rep) < 2 or rep[1] != 0x00:
+                    raise RuntimeError(f"CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
+                raw.recv(256)  # 丢掉绑定地址
+        except Exception:
+            try:
+                raw.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+    else:
+        raw = _socket.create_connection((host, port), timeout=timeout)
+
+    try:
+        with ctx.wrap_socket(raw, server_hostname=host) as ss:
+            return hashlib.sha256(ss.getpeercert(binary_form=True)).hexdigest()
+    finally:
+        try:
+            raw.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def proxy_is_safe(proxy, host, direct_fp, port=443):
+    """代理是否**没有**解密 TLS。
+
+    2026-09-11 实测教训：一批"住宅 SOCKS5"（184.178.172.*）会做 TLS 中间人——
+    递给客户端的是自签证书（issuer=O=None LLC, ST=Texas），指纹与直连完全不同。
+    这类代理能看到明文，签到凭证（Cookie / access token）会整个泄露给代理运营方。
+    Chromium 当时报的 ERR_CERT_AUTHORITY_INVALID 其实是**正确的保护**，
+    绝不能用 --ignore-certificate-errors 绕过。
+
+    返回 (safe, reason)。拿不到直连基准指纹时保守放行（reason 说明原因），
+    因为那通常意味着本机网络本身有问题，不该据此判所有代理有罪。
+    """
+    if not direct_fp:
+        return True, "无直连基准，跳过 MITM 校验"
+    try:
+        fp = _peer_cert_sha256(host, port, proxy=proxy)
+    except Exception as e:  # noqa: BLE001
+        return False, f"TLS 探测失败: {str(e)[:80]}"
+    if fp != direct_fp:
+        return False, "代理在解密 TLS（证书指纹与直连不一致），凭证会泄露"
+    return True, "证书指纹与直连一致"
 
 
 def report_results(results):
@@ -817,11 +956,49 @@ async def main():
     # 先直连（有的站不需要代理，直连最快也最稳），失败再依次换代理重试。
     proxies = fetch_proxies()
     if proxies:
-        log(f"可用住宅代理 {len(proxies)} 个（按实测延迟排序）")
+        log(f"代理池候选 {len(proxies)} 个（按实测延迟排序）")
+
+    # 用前必须验证 TLS 没被中间人替换。2026-09-11 实测这批公开 SOCKS5
+    # （184.178.172.*）全部在解密 TLS：证书签发者从 Google Trust Services 变成
+    # "None, LLC"（Dallas TX），指纹与直连完全不同。渠道 Cookie / 访问令牌
+    # 一旦经这种代理发出，等于明文交给代理运营方。宁可拿不到 token 也不能用。
+    safe = []
+    if proxies:
+        # 用第一个渠道的域名做基准：GHA 能直连目标站（只是拿不到 Turnstile token），
+        # 所以直连指纹是可得的，拿它当"真证书"的标准答案。
+        ref_host = ""
+        for c in channels:
+            try:
+                ref_host = c["baseUrl"].split("//", 1)[1].split("/", 1)[0]
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        direct_fp = None
+        if ref_host:
+            try:
+                direct_fp = _peer_cert_sha256(ref_host, 443)
+                log(f"TLS 基准（直连 {ref_host}）: {direct_fp[:16]}…")
+            except Exception as e:  # noqa: BLE001
+                log(f"⚠️ 取直连 TLS 基准失败（{str(e)[:60]}），本次跳过 MITM 校验")
+        for p in proxies[: MAX_PROXY_TRIES + 2]:  # 多验两个，给筛掉的留余量
+            ok, reason = proxy_is_safe(p, ref_host, direct_fp)
+            if ok:
+                safe.append(p)
+                log(f"  ✅ {mask_proxy(p)}：{reason}")
+                if len(safe) >= MAX_PROXY_TRIES:
+                    break
+            elif "解密 TLS" in reason:
+                log(f"  🚨 拒用 {mask_proxy(p)}：{reason}——凭证会泄露给代理运营方")
+            else:
+                log(f"  ⏭️ 跳过 {mask_proxy(p)}：{reason}")
+        if not safe:
+            log("⚠️ 代理池中没有一个通过 TLS 校验，本次只能直连（Turnstile 站预期拿不到 token）")
+        else:
+            log(f"通过 TLS 校验的代理 {len(safe)} 个")
     else:
         log("代理池为空，仅直连（Turnstile 站可能拿不到 token）")
 
-    attempts = [None] + proxies[:MAX_PROXY_TRIES]
+    attempts = [None] + safe
 
     results = []
     for ch in channels:
