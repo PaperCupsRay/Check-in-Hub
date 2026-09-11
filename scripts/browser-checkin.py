@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -67,6 +68,48 @@ NAV_TIMEOUT_DIRECT = 45000
 NAV_TIMEOUT_PROXY = 60000
 # commit 之后给页面留一点时间加载 turnstile api.js 等外部脚本
 PROXY_SETTLE_MS = 6000
+
+# 拟人光标移动的**最大**秒数。Camoufox 的 humanize=True 是「不设上限」，官方文档
+# 只说「光标通常最多 1.5 秒移动完」——而等 token 的循环每轮都要对每个 Cloudflare
+# iframe 做一次 mouse.move，于是 `for _ in range(45)` 根本不是 45 秒：
+# 2026-09-11 首次 GHA 实测跑到 30 分钟 job 上限被 cancelled（日志停在「等待
+# Turnstile token」那一行）。传具体秒数给 humanize 才有上限。
+HUMANIZE_MAX_S = 0.6
+
+# 等 token 的墙钟预算（秒）。原来按「循环轮数 ≈ 秒数」估算，那个假设在 humanize
+# 下不成立，所以改成真按时间判断，循环里每轮检查 time.monotonic()。
+TOKEN_WAIT_S = 45
+# sub2api 站填表后站点会自己渲染 widget，通常 4s 内出 token；这段先等它，
+# 超了才自行挂载一个。
+NATIVE_WIDGET_BUDGET_S = 40
+# 单个渠道的总墙钟预算：超了就放弃这次尝试，把时间留给换代理重试和后面的渠道，
+# 而不是把整个 job 拖到 GHA 超时（那样连结果回传都不会发生）。
+CHANNEL_BUDGET_S = int(os.environ.get("CHECKIN_CHANNEL_BUDGET_S") or 300)
+# 整个 job 的墙钟预算，必须**明显小于** workflow 的 timeout-minutes（现为 30 分钟）。
+# 留出余量是关键：被 GHA 掐死时 report_results() 不会执行，面板上渠道就永远停在
+# 「已触发」；自己先停下来至少能回传一条失败原因。
+JOB_BUDGET_S = int(os.environ.get("CHECKIN_JOB_BUDGET_S") or 1200)
+
+
+async def click_challenge(page, x_offset=35):
+    """拟人点击 Cloudflare 挑战 iframe 的勾选框区域。
+
+    三处等 token 的循环原本各自内联一份同样的代码，改预算时容易漏改一处。
+    异常一律忽略：iframe 随时可能被 CF 换掉或移除，拿不到 bounding_box 是常态，
+    下一轮重试即可。
+    """
+    for f in page.frames:
+        if "challenges.cloudflare.com" not in (f.url or ""):
+            continue
+        try:
+            el = await f.frame_element()
+            box = await el.bounding_box()
+            if box and box["width"] > 0:
+                x, y = box["x"] + x_offset, box["y"] + box["height"] / 2
+                await page.mouse.move(x, y, steps=5)
+                await page.mouse.click(x, y)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def nav_opts(proxy):
@@ -180,7 +223,11 @@ async def browser_page(proxy=None, window=(1366, 768)):
             # 有头才拿得到 token（见 HEADLESS 注释）。GHA 上用 'virtual'，
             # Camoufox 自己拉 Xvfb，workflow 不用再套 xvfb-run。
             "headless": "virtual" if (not HEADLESS and IN_CI) else HEADLESS,
-            "humanize": True,
+            # 传数值而不是 True：True 时 Camoufox 对光标移动时长不设上限（文档说
+            # "typically up to 1.5 seconds"）。等 token 的循环每轮都要 mouse.move，
+            # 45 轮就被拉到 20 分钟以上，2026-09-11 的 GHA run 因此撞上 30 分钟
+            # job 超时被 cancel。0.5s 足够保留拟人轨迹，又让单轮开销可预期。
+            "humanize": HUMANIZE_MAX_S,
             # 见 ev_script()：不开这个，主世界的 window.turnstile 取不到
             "main_world_eval": True,
             # 官方文档明确写着用于「让跨域 iframe 里的 Turnstile 勾选框可点击」
@@ -663,25 +710,19 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
         # 3) 等原生 widget 的 token（填表后站点自动渲染，4s 内出）；
         #    40s 还没有才自己挂一个。等待期间拟人点击 challenge iframe。
         ts_token = None
-        for i in range(20):
+        started = time.monotonic()
+        while time.monotonic() - started < NATIVE_WIDGET_BUDGET_S:
             await page.wait_for_timeout(2000)
             ts_token = await page.evaluate(
                 "() => { const h = document.querySelector('[name=cf-turnstile-response]'); return h && h.value ? h.value : null; }"
             )
             if ts_token:
-                log(f"  🎉 {name}: 原生 widget 第 {i*2+5}s 出 token（len {len(ts_token)}）")
+                log(
+                    f"  🎉 {name}: 原生 widget 第 {int(time.monotonic() - started)}s "
+                    f"出 token（len {len(ts_token)}）"
+                )
                 break
-            for f in page.frames:
-                if "challenges.cloudflare.com" in (f.url or ""):
-                    try:
-                        el = await f.frame_element()
-                        box = await el.bounding_box()
-                        if box and box["width"] > 0:
-                            x, y = box["x"] + 30, box["y"] + box["height"] / 2
-                            await page.mouse.move(x, y, steps=5)
-                            await page.mouse.click(x, y)
-                    except Exception:  # noqa: BLE001
-                        pass
+            await click_challenge(page, x_offset=30)
         if sitekey and not ts_token:
             # 原生 widget 40s 未出：自己挂一个（渲染在独立容器，不与表单冲突）
             log(f"  ⏳ {name}: 原生 widget 未出 token，自行挂载 ...")
@@ -711,23 +752,14 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
                 }""",
                 sitekey,
             )
-            log(f"  ⏳ {name}: 等 Turnstile token（拟人点击，最长 45s）...")
-            for _ in range(45):
+            log(f"  ⏳ {name}: 等 Turnstile token（拟人点击，最长 {TOKEN_WAIT_S}s）...")
+            deadline = time.monotonic() + TOKEN_WAIT_S
+            while time.monotonic() < deadline:
                 await page.wait_for_timeout(1000)
                 ts_token = await page.evaluate("() => window._tsToken")
                 if ts_token:
                     break
-                for f in page.frames:
-                    if "challenges.cloudflare.com" in (f.url or ""):
-                        try:
-                            el = await f.frame_element()
-                            box = await el.bounding_box()
-                            if box and box["width"] > 0:
-                                x, y = box["x"] + 35, box["y"] + box["height"] / 2
-                                await page.mouse.move(x, y, steps=5)
-                                await page.mouse.click(x, y)
-                        except Exception:  # noqa: BLE001
-                            pass
+                await click_challenge(page)
             if not ts_token:
                 err = await page.evaluate("() => window._tsError")
                 return {"name": name, "ok": False, "message": f"Turnstile 超时 err={err}"}
@@ -959,25 +991,16 @@ async def checkin_one(channel, proxy=None) -> dict:
         )
         log(f"  🔍 {name}: 诊断 {json.dumps(diag, ensure_ascii=False)[:320]}")
 
-        log(f"  ⏳ {name}: 等待 Turnstile token（拟人点击，最长 45s）...")
+        log(f"  ⏳ {name}: 等待 Turnstile token（拟人点击，最长 {TOKEN_WAIT_S}s）...")
         ts_token = None
-        for _ in range(45):
+        deadline = time.monotonic() + TOKEN_WAIT_S
+        while time.monotonic() < deadline:
             await page.wait_for_timeout(1000)
             ts_token = await page.evaluate("() => window._tsToken")
             if ts_token:
                 break
             # 拟人点击挑战 iframe 的 checkbox 区域
-            for f in page.frames:
-                if "challenges.cloudflare.com" in (f.url or ""):
-                    try:
-                        el = await f.frame_element()
-                        box = await el.bounding_box()
-                        if box and box["width"] > 0:
-                            x, y = box["x"] + 35, box["y"] + box["height"] / 2
-                            await page.mouse.move(x, y, steps=5)
-                            await page.mouse.click(x, y)
-                    except Exception:  # noqa: BLE001
-                        pass
+            await click_challenge(page)
         if not ts_token:
             # 兜底：不带 turnstile 直接页面内 fetch 签到（探测服务端是否真强制）
             hdrs = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
@@ -1158,18 +1181,40 @@ async def main():
     attempts = [None] + safe
 
     results = []
+    # 整个 job 的墙钟预算。超了就不再开新渠道，直接把已有结果回传 ——
+    # 被 GHA 按 timeout-minutes 掐死的话 report_results() 根本不会执行，
+    # 面板上那个渠道会一直停在「已触发」，比拿到一条失败记录更难排查。
+    job_deadline = time.monotonic() + JOB_BUDGET_S
     for ch in channels:
         name = ch.get("name", "?")
         r = None
+        if time.monotonic() > job_deadline:
+            log(f"  ⏭️ {name}: job 时间预算用尽，跳过（未执行）")
+            results.append({"name": name, "ok": False, "message": "job 时间预算用尽，本次未执行"})
+            continue
         for i, proxy in enumerate(attempts):
             via = "直连" if proxy is None else f"代理 {mask_proxy(proxy)}"
             if i:
+                if time.monotonic() > job_deadline:
+                    log(f"  ⏹️ {name}: job 预算用尽，停止重试")
+                    break
                 log(f"  🔁 {name}: 换 {via} 重试（第 {i} 次）")
             try:
-                if ch.get("type") == "sub2api":
-                    r = await sub2api_login_checkin(ch, proxy=proxy)
-                else:
-                    r = await checkin_one(ch, proxy=proxy)
+                # 单次尝试也要有硬上限：里面每一步都各自有超时，但「每步都刚好不超时」
+                # 累加起来仍能拖很久（首次 GHA 跑就是这样撞上 30 分钟 job 上限被
+                # cancelled）。这里兜一层，超时就当失败换下一个出口。
+                coro = (
+                    sub2api_login_checkin(ch, proxy=proxy)
+                    if ch.get("type") == "sub2api"
+                    else checkin_one(ch, proxy=proxy)
+                )
+                r = await asyncio.wait_for(coro, timeout=CHANNEL_BUDGET_S)
+            except asyncio.TimeoutError:
+                r = {
+                    "name": name,
+                    "ok": False,
+                    "message": f"{via}超时（单次尝试超过 {CHANNEL_BUDGET_S}s 预算）",
+                }
             except Exception as e:  # noqa: BLE001
                 r = {"name": name, "ok": False, "message": f"{via}异常: {str(e)[:120]}"}
             if r.get("ok"):
