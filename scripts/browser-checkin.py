@@ -1060,10 +1060,42 @@ def load_api_fallback_names():
         return []
 
 
+def requested_names():
+    """本次 dispatch 指定的渠道名（Worker 的 client_payload.names）。
+
+    api job（gha-checkin.mjs）早就按 names 精确执行了，browser job 之前一直漏掉
+    这一层，只按 runner 过滤 —— 于是「只重试 A」的 dispatch 会把该通道所有渠道
+    全跑一遍。这正是 commit 0785599 在 api 侧修掉的同一个 bug。
+    """
+    raw = (os.environ.get("CHECKIN_NAMES") or "").strip()
+    if not raw:
+        return None
+    try:
+        names = json.loads(raw) if raw.startswith("[") else raw.split(",")
+    except Exception:  # noqa: BLE001
+        names = raw.split(",")
+    out = [str(n).strip() for n in names if str(n).strip()]
+    return out or None
+
+
 async def main():
     if not HUB:
         raise SystemExit("缺少 HUB_BASE_URL")
     channels = fetch_browser_channels()
+    # 指定了 names 就精确选渠道：既避免「重试一个渠道却全通道重跑」，
+    # 也让降级链把非 gha_browser 的渠道显式交给本 job 处理。
+    only = requested_names()
+    if only:
+        wanted = set(only)
+        picked = [c for c in channels if c["name"] in wanted]
+        missing = wanted - {c["name"] for c in picked}
+        if missing:
+            # 降级链场景：渠道本身配的是 worker/gha_api，但被指名要浏览器兜底
+            for ch in fetch_all_channels():
+                if ch["name"] in missing:
+                    picked.append(ch)
+        channels = picked
+        log(f"指定渠道 {len(only)} 个: {only} → 匹配 {len(channels)} 个")
     log(f"browser 通道渠道 {len(channels)} 个: {[c['name'] for c in channels]}")
 
     # 降级：gha_api 失败的渠道并入本 job 重试（去重；sub2api 走浏览器登录+签到，

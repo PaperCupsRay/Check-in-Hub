@@ -105,6 +105,10 @@ jobs:
           # Camoufox 虚拟屏默认 1x1x24 —— 那样 Turnstile iframe 的 bounding_box 拿不到
           # 有效坐标，拟人点击点不中。这里给一块真实尺寸的 framebuffer。
           CAMOUFOX_VIRTUAL_DISPLAY_SIZE: "1366x768x24"
+          # 面板精确分发的渠道名（client_payload.names）。留空表示「本通道全部渠道」。
+          # 不传的话本 job 会把所有 gha_browser 渠道都跑一遍 —— 这正是 commit 0785599
+          # 在 api 侧修掉的那个 bug（每次 run 重复签到、指定渠道反而轮不到）。
+          CHECKIN_NAMES: ${{ github.event_name == 'repository_dispatch' && join(github.event.client_payload.names, ',') || '' }}
           # gha_api 失败渠道清单（api job 的 artifact），供 browser job 降级重试
           API_FALLBACK_LIST: "api-artifact/gha-fallback.json"
         run: python scripts/browser-checkin.py
