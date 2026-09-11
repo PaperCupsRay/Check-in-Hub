@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -27,6 +28,9 @@ import urllib.request
 
 HUB = (os.environ.get("HUB_BASE_URL") or "").rstrip("/")
 PASSWORD = os.environ.get("HUB_ACCESS_PASSWORD") or ""
+# GHA 上没有真实显示器。Camoufox 的 headless="virtual" 会自己拉 Xvfb，
+# 所以 workflow 不再需要外面套 xvfb-run；本机有头则直接开真窗口。
+IN_CI = bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
 # 无头模式拿不到 Turnstile token。同一代理、同一 sitekey、组件都 rendered 成功，
 # 无头下等满 45s 一个 token 都不出，切成有头（本机窗口 / GHA 的 xvfb）立刻 816 字符
 # 到手——2026-09-11 在 JustDoWork 上正反各测一次确认。workflow 里已固定 "false"，
@@ -71,7 +75,7 @@ def nav_opts(proxy):
         return "commit", NAV_TIMEOUT_PROXY
     return "domcontentloaded", NAV_TIMEOUT_DIRECT
 
-# 两处 launch 共用的 Chromium 参数，避免改一处漏一处。
+# CloakBrowser（Chromium）专用参数，仅在 ENGINE=cloakbrowser 时使用。
 #
 # 绝对不要在这里加 --ignore-certificate-errors。曾经为了「本机 TLS 被劫持」加过，
 # 后来查明那个证书错误根本不是本机问题：那批公开 SOCKS5 代理在解密 TLS
@@ -86,6 +90,149 @@ BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--window-size=1366,768",
 ]
+
+# ---------------- 浏览器引擎 ----------------
+#
+# camoufox（默认，Firefox 内核）/ cloakbrowser（Chromium，旧实现，保留可回退）。
+#
+# 换 Camoufox 的实际收益（2026-09-11 逐项实测，不是照搬宣传）：
+#   · disable_coop —— 官方为「点击跨域 iframe 里的 Turnstile 勾选框」提供的开关，
+#     正是本项目要干的事；Chromium 侧只能靠猜坐标点 iframe。
+#   · headless='virtual' —— 自带 Xvfb，workflow 不再需要 xvfb-run 包一层。
+#   · 指纹由 browserforge 按真实机型生成（navigator/screen/WebGL/字体一致），
+#     不用再手工维护「UA 必须跟内核版本对齐」这条脆弱约束。
+#
+# 必须说清的一点：**换 Firefox 并没有解决 SOCKS5 认证**。这原本是我推荐换引擎的
+# 主要理由，实测被推翻——拦截来自 Playwright 驱动本身而非浏览器：
+#   driver/package/lib/coreBundle.js: normalizeProxySettings()
+#   socks5:// + username/password → throw "Browser does not support socks5 proxy authentication"
+# 这个判断对 firefox/chromium 一视同仁。所以带认证的 SOCKS5 代理两个引擎都用不了，
+# 只有 http(s):// 代理的 Basic 认证能走（Playwright 自己处理）。付费住宅代理请优先
+# 选 HTTP(S) 端点，或用免认证 + IP 白名单的 SOCKS5。
+ENGINE = (os.environ.get("CHECKIN_ENGINE") or "camoufox").strip().lower()
+# 本机装的 Camoufox 内核版本可能与 pip 包要求的不一致（会触发每次启动都去 GitHub
+# 下载）。指到已装的 camoufox 可执行文件即可跳过下载；GHA 上留空走标准安装。
+CAMOUFOX_EXECUTABLE = os.environ.get("CAMOUFOX_EXECUTABLE") or None
+
+
+def is_camoufox():
+    return ENGINE != "cloakbrowser"
+
+
+def ev_script(script):
+    """Camoufox 的 page.evaluate 默认跑在**隔离世界**，看不到页面主世界的变量。
+
+    这是与 CloakBrowser 最容易踩的差异：不加前缀时 `window.turnstile` 恒为
+    undefined（实测 api.js 明明 302→200 加载成功、script 也触发了 onload），
+    于是 render 抛 "window.turnstile is undefined"，表现得像 api.js 没加载。
+    加 "mw:" 前缀 + launch 时 main_world_eval=True 才会在主世界求值。
+    实测确认：mw: 支持传参（单值/数组）、跨调用共享 window 状态、支持 async fetch。
+    """
+    return f"mw:{script}" if is_camoufox() else script
+
+
+def patch_main_world(page):
+    """让 page.evaluate / page.wait_for_function 默认在主世界求值。
+
+    为什么用包装而不是给每个调用点手加 "mw:"：签到流程里有二十多处 evaluate，
+    逐个改前缀既容易漏（漏一处就是 window.turnstile undefined，且报错长得像
+    api.js 没加载，极难定位），也让同一份脚本没法在两个引擎间切换。
+    这里统一在入口处补前缀，所有既有调用点保持原样。
+
+    只包装 Camoufox；CloakBrowser 原样返回。
+    """
+    if not is_camoufox():
+        return page
+
+    orig_eval = page.evaluate
+    orig_wait = page.wait_for_function
+
+    def with_prefix(script):
+        # 已经带前缀的不要重复加
+        if isinstance(script, str) and not script.startswith("mw:"):
+            return f"mw:{script}"
+        return script
+
+    async def evaluate(script, arg=None, **kw):
+        return await orig_eval(with_prefix(script), arg, **kw)
+
+    async def wait_for_function(script, arg=None, **kw):
+        return await orig_wait(with_prefix(script), arg, **kw)
+
+    page.evaluate = evaluate
+    page.wait_for_function = wait_for_function
+    return page
+
+
+@contextlib.asynccontextmanager
+async def browser_page(proxy=None, window=(1366, 768)):
+    """开一个浏览器并交出一个 page，退出时保证关闭。
+
+    proxy 传字符串（socks5://host:port 或 http://user:pass@host:port）；
+    两个引擎的代理格式不同，这里统一转换：
+      camoufox      Playwright dict {"server","username","password"}
+      cloakbrowser  字符串，且 SOCKS 必须先剥掉凭证（Chromium 不支持 SOCKS 认证）
+    """
+    if is_camoufox():
+        from camoufox.async_api import AsyncCamoufox
+
+        opts = {
+            # 有头才拿得到 token（见 HEADLESS 注释）。GHA 上用 'virtual'，
+            # Camoufox 自己拉 Xvfb，workflow 不用再套 xvfb-run。
+            "headless": "virtual" if (not HEADLESS and IN_CI) else HEADLESS,
+            "humanize": True,
+            # 见 ev_script()：不开这个，主世界的 window.turnstile 取不到
+            "main_world_eval": True,
+            # 官方文档明确写着用于「让跨域 iframe 里的 Turnstile 勾选框可点击」
+            "disable_coop": True,
+            "window": window,
+            "i_know_what_im_doing": True,
+        }
+        if CAMOUFOX_EXECUTABLE:
+            opts["executable_path"] = CAMOUFOX_EXECUTABLE
+        if proxy:
+            opts["proxy"] = camoufox_proxy(proxy)
+            # 按代理出口 IP 推地理位置/时区，避免「德州 IP + 上海时区」这种矛盾指纹
+            opts["geoip"] = True
+        async with AsyncCamoufox(**opts) as browser:
+            # 不要显式传 viewport：beta.29 + Playwright≥1.61 会 Protocol error
+            # (Browser.setDefaultViewport)，而 Camoufox 本就按指纹生成 screen。
+            page = await browser.new_page()
+            yield patch_main_world(page)
+        return
+
+    from cloakbrowser import launch_async
+
+    browser = await launch_async(
+        headless=HEADLESS,
+        humanize=True,
+        proxy=proxy_url_for_browser(proxy) if proxy else None,
+        args=list(BROWSER_ARGS),
+    )
+    try:
+        context = await browser.new_context(
+            viewport={"width": window[0], "height": window[1]}, user_agent=UA
+        )
+        yield await context.new_page()
+    finally:
+        try:
+            await browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def camoufox_proxy(url):
+    """字符串代理 → Playwright proxy dict。
+
+    Playwright 驱动对 socks5+凭证是硬拦（见 ENGINE 注释），所以 SOCKS 一律只传
+    server、丢掉凭证——反正带上就是 launch 直接抛错。http(s) 保留凭证走 Basic 认证。
+    """
+    scheme, cred, host, port = split_proxy(url)
+    server = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+    if scheme.startswith("socks") or not cred:
+        return {"server": server}
+    user, _, pwd = cred.partition(":")
+    return {"server": server, "username": user, "password": pwd}
 
 # 一个渠道最多换几个代理重试。代理都是慢的（实测 2-8s RTT），每次尝试含 45s
 # 等 token，试太多会把 job 拖到超时；3 个足够覆盖「个别代理临时挂掉」。
@@ -436,15 +583,13 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
     旧版只登录刷新 token 就报成功，导致百倍连续多天实际未签到）。
 
     流程（与 gorouter 的页面内 fetch 同构）：
-      1. CloakBrowser 打开 /login，从内嵌配置读 turnstile_site_key
+      1. 浏览器打开 /login，从内嵌配置读 turnstile_site_key
       2. 页面内用该 sitekey 主动挂 Turnstile，拟人点击等 token
       3. 拿到 token 后页面内 fetch /api/v1/auth/login（带 turnstile_token），
          绕开前端表单校验
       4. 带 Bearer 在页面内 fetch /api/v1/check-in 真实签到
       5. 新 accessToken/refreshToken 回传 Worker 写回 KV
     """
-    from cloakbrowser import launch_async
-
     name = channel.get("name", "unnamed")
     base = channel["baseUrl"].rstrip("/")
     auth = channel.get("auth") or {}
@@ -455,18 +600,10 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
 
     if proxy:
         log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
-    browser = await launch_async(
-        headless=HEADLESS,
-        humanize=True,
-        proxy=proxy or None,
-        args=list(BROWSER_ARGS),
-    )
+    stack = contextlib.AsyncExitStack()
     try:
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768}, user_agent=UA
-        )
-        page = await context.new_page()
-        log(f"  🌐 {name}: 打开登录页 {base}/login")
+        page = await stack.enter_async_context(browser_page(proxy))
+        log(f"  🌐 {name}: 打开登录页 {base}/login（引擎 {ENGINE}）")
         wait_until, nav_ms = nav_opts(proxy)
         await page.goto(base + "/login", wait_until=wait_until, timeout=nav_ms)
         await page.wait_for_timeout(PROXY_SETTLE_MS if proxy else 5000)
@@ -675,9 +812,10 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
         return {"name": name, "ok": False, "message": f"异常: {str(e)[:120]}"}
     finally:
         try:
-            await browser.close()
+            await stack.aclose()
         except Exception:  # noqa: BLE001
             pass
+
 
 async def checkin_one(channel, proxy=None) -> dict:
     """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。
@@ -686,8 +824,6 @@ async def checkin_one(channel, proxy=None) -> dict:
     浏览器的流量都走它——Turnstile 校验的是浏览器出口 IP，只有这样 CF 才肯
     签发挑战。
     """
-    from cloakbrowser import launch_async
-
     name = channel.get("name", "unnamed")
     base = channel["baseUrl"].rstrip("/")
     sitekey = (channel.get("options") or {}).get("turnstileSiteKey") or DEFAULT_SITEKEY
@@ -697,19 +833,11 @@ async def checkin_one(channel, proxy=None) -> dict:
 
     if proxy:
         log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
-    browser = await launch_async(
-        headless=HEADLESS,
-        humanize=True,
-        proxy=proxy or None,
-        args=list(BROWSER_ARGS),
-    )
+    stack = contextlib.AsyncExitStack()
     try:
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768}, user_agent=UA
-        )
-        page = await context.new_page()
+        page = await stack.enter_async_context(browser_page(proxy))
         # 直接开首页（kppq66 成功行为；绕道 /login 会触发登录页自己的 Turnstile 干扰挂载）
-        log(f"  🌐 {name}: 打开 {base}")
+        log(f"  🌐 {name}: 打开 {base}（引擎 {ENGINE}）")
         wait_until, nav_ms = nav_opts(proxy)
         await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
         await page.wait_for_timeout(PROXY_SETTLE_MS if proxy else 2000)
@@ -717,7 +845,7 @@ async def checkin_one(channel, proxy=None) -> dict:
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]
             domain = host[4:] if host.startswith("www.") else host
-            await context.add_cookies(
+            await page.context.add_cookies(
                 [
                     {"name": n, "value": v, "domain": domain, "path": "/"}
                     for n, v in pairs
@@ -918,10 +1046,7 @@ async def checkin_one(channel, proxy=None) -> dict:
             pass
         return result
     finally:
-        try:
-            await browser.close()
-        except Exception:  # noqa: BLE001
-            pass
+        await stack.aclose()
 
 
 def load_api_fallback_names():

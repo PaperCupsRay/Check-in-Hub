@@ -52,7 +52,7 @@ jobs:
             gha-fallback.json
           retention-days: 7
 
-  # ---------- 通道二：CloakBrowser 过 WAF（gorouter / SeekAi 等 CF 挑战站） ----------
+  # ---------- 通道二：Camoufox 过 WAF（gorouter / SeekAi 等 CF 挑战站） ----------
   # 同时承接降级链的最后一级：gha_api 失败的渠道由本 job 用浏览器模拟登录重试。
   browser:
     if: ${{ always() && (github.event_name != 'repository_dispatch' || contains(github.event.client_payload.runners, 'gha_browser')) }}
@@ -76,33 +76,38 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 依赖与 kppq66/gorouter-turnstile-checkin 对齐：装最新 cloakbrowser（反检测补丁随版本更新，
-      # 0.4.x 的补丁过不了当前 Turnstile），并且不跑 `python -m cloakbrowser install`
-      # —— launch_async() 内部会调 ensure_binary() 自动下载内核，那个显式步骤才是 exit 139 段错误的来源。
-      - name: Install system deps (xvfb + fonts + chromium libs)
+      # Camoufox 自带 Xvfb 管理（headless="virtual"），但 xvfb 这个二进制还是要装。
+      # 字体不能省：缺中文字体时页面渲染成方块，且字体列表本身就是指纹的一部分。
+      - name: Install system deps (xvfb + fonts + gtk libs)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libxkbcommon0 libgbm1 libnss3             fonts-liberation fonts-dejavu-core fonts-noto-color-emoji fonts-wqy-zenhei
+          sudo apt-get install -y xvfb libgtk-3-0 libasound2t64 libdbus-glib-1-2 \
+            fonts-liberation fonts-dejavu-core fonts-noto-color-emoji fonts-wqy-zenhei
 
-      - name: Install CloakBrowser (latest)
+      # camoufox fetch 下载 Firefox 内核；geoip 附加包用于按代理出口 IP 推时区/经纬度
+      # （见 browser_page() 里的 geoip=True，避免「美国 IP + 上海时区」这种矛盾指纹）。
+      - name: Install Camoufox
         run: |
           python -m pip install --upgrade pip
-          pip install cloakbrowser
+          pip install 'camoufox[geoip]'
+          python -m camoufox fetch
 
-      # 浏览器内完成 Turnstile 解证 + 页面内 fetch 签到（参照 kppq66 流程）。
+      # 浏览器内完成 Turnstile 解证 + 页面内 fetch 签到。
       # 请求从真实浏览器发出，TLS/IP/cookie 一致，绕开 TLS 指纹拦截。
       - name: Turnstile check-in (in-browser)
         env:
           HUB_BASE_URL: ${{ secrets.HUB_BASE_URL }}
           HUB_SECRET: ${{ secrets.HUB_SECRET }}
           HUB_ACCESS_PASSWORD: ${{ secrets.HUB_ACCESS_PASSWORD }}
-          CHECKIN_HEADLESS: "false" # xvfb 有头模式，CF 信任度更高
-          CLOAKBROWSER_SUPPRESS_FONT_WARNING: "1"
+          # 必须有头：无头下 Turnstile 组件 rendered 成功但永不签发 token（实测）。
+          # 脚本在 CI 里会把它翻译成 Camoufox 的 headless="virtual"，自己拉 Xvfb。
+          CHECKIN_HEADLESS: "false"
+          # Camoufox 虚拟屏默认 1x1x24 —— 那样 Turnstile iframe 的 bounding_box 拿不到
+          # 有效坐标，拟人点击点不中。这里给一块真实尺寸的 framebuffer。
+          CAMOUFOX_VIRTUAL_DISPLAY_SIZE: "1366x768x24"
           # gha_api 失败渠道清单（api job 的 artifact），供 browser job 降级重试
           API_FALLBACK_LIST: "api-artifact/gha-fallback.json"
-        run: |
-          set -e
-          xvfb-run -a --server-args="-screen 0 1366x768x24" python scripts/browser-checkin.py
+        run: python scripts/browser-checkin.py
 
       - name: Upload results
         if: always()
