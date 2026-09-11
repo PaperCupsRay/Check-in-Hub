@@ -27,12 +27,61 @@ import urllib.request
 
 HUB = (os.environ.get("HUB_BASE_URL") or "").rstrip("/")
 PASSWORD = os.environ.get("HUB_ACCESS_PASSWORD") or ""
+# 无头模式拿不到 Turnstile token。同一代理、同一 sitekey、组件都 rendered 成功，
+# 无头下等满 45s 一个 token 都不出，切成有头（本机窗口 / GHA 的 xvfb）立刻 816 字符
+# 到手——2026-09-11 在 JustDoWork 上正反各测一次确认。workflow 里已固定 "false"，
+# 不要图省事改回无头，那等于把浏览器通道废掉。
 HEADLESS = (os.environ.get("CHECKIN_HEADLESS") or "true") != "false"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 # gorouter 全站默认 sitekey（kppq66 内置值）；其他站用渠道 options.turnstileSiteKey 覆盖
 DEFAULT_SITEKEY = "0x4AAAAAAELziOpg1Y2gFtAt"
 # UA 必须与 CloakBrowser 内核版本一致（chromium-146）：报更高版本号（如 150）会造成
 # UA 与真实指纹不匹配，Cloudflare 静默不签发 challenge（render 成功但永不出 token）。
+
+# 本机（而非 GHA）跑时的逃生阀：部分网络环境会做 TLS 中间人劫持，Chromium 直接
+# ERR_CERT_AUTHORITY_INVALID，页面根本打不开（本机实测，curl 同样 rc=60）。
+# 这是**安全降级**（不再校验证书），所以默认关闭，只有显式设 CHECKIN_INSECURE_TLS=true
+# 才生效；GHA 环境没有这个问题，永远不要在 workflow 里打开。
+INSECURE_TLS = (os.environ.get("CHECKIN_INSECURE_TLS") or "false").lower() == "true"
+
+# 导航策略。这些站都是 SPA，首屏要串几十个请求；走住宅代理时（RTT 实测 2-8s）
+# `domcontentloaded` 和 `load` 都可能永不触发——本机实测 45s、90s、120s 全部超时，
+# 加大超时值无效，因为 SPA 一直有新请求在飞。
+#
+# 但 `commit`（首字节到达、document 开始解析）在同一代理下只要 2-4s，而且此后
+# 页面内的同源 fetch 完全正常（实测 /api/status 200、拿到 turnstile_site_key）。
+# 而我们真正需要的只是「一个同源的 document 上下文」用来挂 Turnstile 和发 fetch，
+# 并不需要 SPA 把界面渲染完。所以走代理时用 commit + 固定等待，直连时保持原策略。
+NAV_TIMEOUT_DIRECT = 45000
+NAV_TIMEOUT_PROXY = 60000
+# commit 之后给页面留一点时间加载 turnstile api.js 等外部脚本
+PROXY_SETTLE_MS = 6000
+
+
+def nav_opts(proxy):
+    """返回 (wait_until, timeout)。走代理时只等 commit，否则 SPA 永远等不完。"""
+    if proxy:
+        return "commit", NAV_TIMEOUT_PROXY
+    return "domcontentloaded", NAV_TIMEOUT_DIRECT
+
+# 两处 launch 共用的 Chromium 参数，避免改一处漏一处
+BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--window-size=1366,768",
+] + (["--ignore-certificate-errors"] if INSECURE_TLS else [])
+
+# 一个渠道最多换几个代理重试。代理都是慢的（实测 2-8s RTT），每次尝试含 45s
+# 等 token，试太多会把 job 拖到超时；3 个足够覆盖「个别代理临时挂掉」。
+MAX_PROXY_TRIES = 3
+# 只有「疑似出口 IP 导致」的失败才值得换代理重试。凭证缺失/表单找不到这类
+# 换出口也一样失败，重试纯属浪费 45s。
+RETRYABLE_VIA_PROXY = re.compile(
+    r"Turnstile|token 为空|超时|timeout|挂载失败|ERR_|拒绝|blocked|403|503|challenge",
+    re.I,
+)
 
 
 def log(msg):
@@ -104,6 +153,76 @@ def fetch_all_channels():
     return [c for c in data.get("channels", []) if c.get("enabled", True) and c.get("baseUrl")]
 
 
+def fetch_proxies():
+    """住宅 SOCKS5 代理池（面板 KV）。
+
+    为什么需要：Cloudflare 对 GitHub Actions 的机房 IP 常静默不签发 Turnstile
+    挑战——组件能渲染但永远等不到 token（gorouter / SeekAi / JustDoWork 实测）。
+    换成住宅出口后同一套代码 27s 就拿到了 token，所以代理是这类站的唯一解法。
+
+    只取 enabled 且**免认证**的：Chromium 不支持 SOCKS5 用户名密码认证，
+    带凭证一律 ERR_SOCKS_CONNECTION_FAILED（本机实测）。
+    """
+    try:
+        auth = hub_session_headers()
+        data = hub_api("/api/proxies", headers=auth)
+    except Exception as e:  # noqa: BLE001
+        log(f"拉取代理池失败（将直连）: {e}")
+        return []
+    if not data.get("ok"):
+        return []
+    out = []
+    for p in data.get("proxies", []):
+        if p.get("enabled") is False:
+            continue
+        # rawUrl 带凭证（GET 里 url 是打码的，不能用）
+        url = p.get("rawUrl") or p.get("url") or ""
+        if not url:
+            continue
+        chk = p.get("lastCheck") or {}
+        # Chromium 不支持 SOCKS5 用户名密码认证，带凭证会直接 ERR_SOCKS_CONNECTION_FAILED，
+        # 所以给浏览器的地址一律剥掉凭证。很多"带认证"的公开代理其实根本不校验
+        # （本批 OTC:OTC 实测 authUsed=none），剥掉后照样能用 —— 见 @ 就整条丢弃会白扔可用出口。
+        # 只有面板实测确认「需要认证」的才跳过：那种剥了凭证也连不上。
+        if chk.get("ok") and chk.get("browserUsable") is False:
+            log(f"  ⏭️ 跳过 {mask_proxy(url)}（实测需要 SOCKS5 认证，Chromium 用不了）")
+            continue
+        url = strip_proxy_credentials(url)
+        # 面板测过的：连通的排前面，同为连通的按延迟升序；没测过的排中间
+        rank = (0 if chk.get("ok") else 1 if chk.get("ok") is None else 2, chk.get("ms") or 9999)
+        out.append((rank, url))
+    out.sort(key=lambda x: x[0])
+    return [u for _, u in out]
+
+
+def strip_proxy_credentials(url):
+    """剥掉 socks5:// 后面的 user:pass@。
+
+    Chromium 的 --proxy-server 不支持 SOCKS5 认证，带凭证一律
+    ERR_SOCKS_CONNECTION_FAILED（本机实测）；剥掉后对"假认证"代理照样可用。
+    """
+    try:
+        scheme, rest = url.split("://", 1)
+        if "@" in rest:
+            rest = rest.rsplit("@", 1)[1]
+        return f"{scheme}://{rest}"
+    except Exception:  # noqa: BLE001
+        return url
+
+
+def mask_proxy(url):
+    """日志里不泄露代理凭证。"""
+    try:
+        rest = url.split("://", 1)[1]
+        if "@" in rest:
+            cred, host = rest.split("@", 1)
+            user = cred.split(":", 1)[0]
+            return f"socks5://{user}:***@{host}"
+        return url
+    except Exception:  # noqa: BLE001
+        return "socks5://***"
+
+
 def report_results(results):
     if not (HUB and os.environ.get("HUB_SECRET")):
         log("未配置 HUB_SECRET，跳过回传")
@@ -171,7 +290,7 @@ def parse_cookie_pairs(raw):
     return out
 
 
-async def sub2api_login_checkin(channel) -> dict:
+async def sub2api_login_checkin(channel, proxy=None) -> dict:
     """sub2api 站（百倍等）：账密登录 + 页面内真实签到。
 
     注意：登录本身不发奖励，必须再调 POST /api/v1/check-in（2026-09-09 修复：
@@ -195,11 +314,13 @@ async def sub2api_login_checkin(channel) -> dict:
     if not (email and password):
         return {"name": name, "ok": False, "message": "缺少邮箱/密码，无法走登录流程"}
 
+    if proxy:
+        log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
     browser = await launch_async(
         headless=HEADLESS,
         humanize=True,
-        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-              "--disable-blink-features=AutomationControlled", "--window-size=1366,768"],
+        proxy=proxy or None,
+        args=list(BROWSER_ARGS),
     )
     try:
         context = await browser.new_context(
@@ -207,8 +328,9 @@ async def sub2api_login_checkin(channel) -> dict:
         )
         page = await context.new_page()
         log(f"  🌐 {name}: 打开登录页 {base}/login")
-        await page.goto(base + "/login", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(5000)
+        wait_until, nav_ms = nav_opts(proxy)
+        await page.goto(base + "/login", wait_until=wait_until, timeout=nav_ms)
+        await page.wait_for_timeout(PROXY_SETTLE_MS if proxy else 5000)
 
         # 1) 先填表（关键：widget 只在表单交互后才渲染，填表必须先于等 token）
         #    SPA 冷启动时脚本加载慢，表单可能 5s 后才出现 —— 在页面内轮询等待输入框
@@ -418,8 +540,13 @@ async def sub2api_login_checkin(channel) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
-async def checkin_one(channel) -> dict:
-    """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。"""
+async def checkin_one(channel, proxy=None) -> dict:
+    """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。
+
+    proxy: 住宅 SOCKS5 出口（socks5://host:port，不能带凭证）。传入时整个
+    浏览器的流量都走它——Turnstile 校验的是浏览器出口 IP，只有这样 CF 才肯
+    签发挑战。
+    """
     from cloakbrowser import launch_async
 
     name = channel.get("name", "unnamed")
@@ -429,16 +556,13 @@ async def checkin_one(channel) -> dict:
     cookie_raw = auth.get("cookie") or ""
     token = auth.get("token") or ""
 
+    if proxy:
+        log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
     browser = await launch_async(
         headless=HEADLESS,
         humanize=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1366,768",
-        ],
+        proxy=proxy or None,
+        args=list(BROWSER_ARGS),
     )
     try:
         context = await browser.new_context(
@@ -447,8 +571,9 @@ async def checkin_one(channel) -> dict:
         page = await context.new_page()
         # 直接开首页（kppq66 成功行为；绕道 /login 会触发登录页自己的 Turnstile 干扰挂载）
         log(f"  🌐 {name}: 打开 {base}")
-        await page.goto(base + "/", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(2000)
+        wait_until, nav_ms = nav_opts(proxy)
+        await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
+        await page.wait_for_timeout(PROXY_SETTLE_MS if proxy else 2000)
         pairs = parse_cookie_pairs(cookie_raw)
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]
@@ -688,15 +813,38 @@ async def main():
             channels.append(ch)
             existing.add(ch["name"])
 
+    # 住宅代理池：GHA 机房 IP 拿不到 Turnstile token，必须借住宅出口。
+    # 先直连（有的站不需要代理，直连最快也最稳），失败再依次换代理重试。
+    proxies = fetch_proxies()
+    if proxies:
+        log(f"可用住宅代理 {len(proxies)} 个（按实测延迟排序）")
+    else:
+        log("代理池为空，仅直连（Turnstile 站可能拿不到 token）")
+
+    attempts = [None] + proxies[:MAX_PROXY_TRIES]
+
     results = []
     for ch in channels:
-        try:
-            if ch.get("type") == "sub2api":
-                r = await sub2api_login_checkin(ch)
-            else:
-                r = await checkin_one(ch)
-        except Exception as e:  # noqa: BLE001
-            r = {"name": ch.get("name", "?"), "ok": False, "message": str(e)[:150]}
+        name = ch.get("name", "?")
+        r = None
+        for i, proxy in enumerate(attempts):
+            via = "直连" if proxy is None else f"代理 {mask_proxy(proxy)}"
+            if i:
+                log(f"  🔁 {name}: 换 {via} 重试（第 {i} 次）")
+            try:
+                if ch.get("type") == "sub2api":
+                    r = await sub2api_login_checkin(ch, proxy=proxy)
+                else:
+                    r = await checkin_one(ch, proxy=proxy)
+            except Exception as e:  # noqa: BLE001
+                r = {"name": name, "ok": False, "message": f"{via}异常: {str(e)[:120]}"}
+            if r.get("ok"):
+                if i:
+                    r["message"] = f"{r.get('message', '')}（经{via}）"
+                break
+            # 只有「拿不到 token / 网络层失败」才值得换出口；凭证类错误换 IP 也白搭
+            if not RETRYABLE_VIA_PROXY.search(str(r.get("message", ""))):
+                break
         log(f"  {'✅' if r['ok'] else '❌'} {r['name']}: {r['message']}")
         results.append(r)
     report_results(results)

@@ -13,7 +13,10 @@ import {
   putChannels,
   getLastRun,
   putLastRun,
+  getProxies,
+  putProxies,
 } from "./kv.js";
+import { normalizeProxy, maskProxyUrl, testSocks5 } from "./proxy.js";
 import uiHtml from "./ui.html";
 import { sendTelegram, formatCheckinReport } from "./tg.js";
 import _nacl from "tweetnacl";
@@ -487,6 +490,137 @@ async function handleKvDeleteChannels(env) {
       err.status || 500
     );
   }
+}
+
+/**
+ * 代理池管理（住宅 SOCKS5 出口）。
+ *
+ * 用途：GHA 机房 IP 拿不到 Turnstile token（Cloudflare 静默不签发挑战），
+ * 住宅 IP 可以。浏览器通道带上代理后才能过这类站。
+ *
+ * GET  /api/proxies        列出（凭证打码）
+ * PUT  /api/proxies        整表覆盖写入（body.proxies 支持字符串或对象数组）
+ * POST /api/proxies/test   测连通性（body.url 测单条；body.all=true 测全部并回写结果）
+ */
+async function handleProxiesGet(env) {
+  try {
+    const proxies = await getProxies(env);
+    return json({
+      ok: true,
+      count: proxies.length,
+      proxies: proxies.map((p) => ({ ...p, url: maskProxyUrl(p.url), rawUrl: p.url })),
+    });
+  } catch (err) {
+    return json({ ok: false, error: err.message || String(err) }, err.status || 500);
+  }
+}
+
+async function handleProxiesPut(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+  const list = Array.isArray(body.proxies) ? body.proxies : Array.isArray(body) ? body : null;
+  if (!list) return json({ ok: false, error: "proxies[] is required" }, 400);
+
+  const seen = new Set();
+  const proxies = [];
+  const rejected = [];
+  for (const item of list) {
+    const norm = normalizeProxy(item);
+    if (!norm) {
+      rejected.push(typeof item === "string" ? item.slice(0, 60) : JSON.stringify(item).slice(0, 60));
+      continue;
+    }
+    if (seen.has(norm.url)) continue; // 同一代理填两次只留一条
+    seen.add(norm.url);
+    proxies.push(norm);
+  }
+  try {
+    await putProxies(env, proxies);
+    return json({
+      ok: true,
+      count: proxies.length,
+      rejected,
+      message: `已保存 ${proxies.length} 个代理${rejected.length ? `，${rejected.length} 条格式不合法已忽略` : ""}`,
+    });
+  } catch (err) {
+    return json({ ok: false, error: err.message || String(err) }, err.status || 500);
+  }
+}
+
+async function handleProxiesTest(request, env) {
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+
+  // 单条测试：不落库，用于「填之前先试一下」
+  if (body.url) {
+    const r = await testSocks5(String(body.url), {
+      targetHost: body.targetHost || "api.ipify.org",
+      timeoutMs: Number(body.timeoutMs) || 12000,
+    });
+    return json({ ok: true, result: { url: maskProxyUrl(String(body.url)), ...r } });
+  }
+
+  // 全量测试：并发跑完后把结果写回 KV，面板直接显示每条的状态
+  let proxies;
+  try {
+    proxies = await getProxies(env);
+  } catch (err) {
+    return json({ ok: false, error: err.message || String(err) }, err.status || 500);
+  }
+  if (!proxies.length) return json({ ok: false, error: "代理池为空" }, 422);
+
+  const targetHost = body.targetHost || "api.ipify.org";
+  const timeoutMs = Number(body.timeoutMs) || 12000;
+  const results = await Promise.all(
+    proxies.map(async (p) => {
+      const r = await testSocks5(p.url, { targetHost, timeoutMs });
+      return { entry: p, r };
+    })
+  );
+  const at = Date.now();
+  for (const { entry, r } of results) {
+    entry.lastCheck = {
+      ok: r.ok,
+      ms: r.ms ?? null,
+      authUsed: r.authUsed || null,
+      browserUsable: r.browserUsable ?? null,
+      error: r.error || null,
+      at,
+    };
+  }
+  try {
+    await putProxies(env, proxies);
+  } catch {
+    /* 结果仍然返回，只是没存下来 */
+  }
+  const okCount = results.filter((x) => x.r.ok).length;
+  const usable = results.filter((x) => x.r.ok && x.r.browserUsable).length;
+  return json({
+    ok: true,
+    count: results.length,
+    okCount,
+    browserUsable: usable,
+    message:
+      `连通 ${okCount}/${results.length}` +
+      (okCount ? `，其中 ${usable} 个免认证（浏览器可用）` : "") +
+      (okCount > usable ? `；带认证的 ${okCount - usable} 个 Chromium 用不了` : ""),
+    results: results.map(({ entry, r }) => ({
+      url: maskProxyUrl(entry.url),
+      ok: r.ok,
+      ms: r.ms ?? null,
+      authUsed: r.authUsed || null,
+      browserUsable: r.browserUsable ?? null,
+      error: r.error || null,
+    })),
+  });
 }
 
 async function runScheduled(env) {
@@ -1032,6 +1166,17 @@ export default {
     }
     if (pathname === "/api/kv/channels" && request.method === "DELETE") {
       return handleKvDeleteChannels(env);
+    }
+
+    // 代理池（住宅 SOCKS5 出口，供 GHA 浏览器通道过 Turnstile）
+    if (pathname === "/api/proxies" && request.method === "GET") {
+      return handleProxiesGet(env);
+    }
+    if (pathname === "/api/proxies" && (request.method === "PUT" || request.method === "POST")) {
+      return handleProxiesPut(request, env);
+    }
+    if (pathname === "/api/proxies/test" && request.method === "POST") {
+      return handleProxiesTest(request, env);
     }
 
     return json({ ok: false, error: "Not Found", path: pathname }, 404);

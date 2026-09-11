@@ -111,6 +111,18 @@
     .hero h2 { justify-content: flex-start; margin-bottom: 4px; }
     @media (max-width: 860px) { .hero { grid-template-columns: 1fr; } }
     .channel-panel { margin-top: 14px; }
+    .proxy-panel { margin-top: 14px; }
+    .proxy-panel textarea { min-height: 96px; }
+    .proxy-results { display: grid; gap: 6px; margin-top: 10px; }
+    .proxy-row {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      font-size: .82rem; font-family: var(--mono);
+      background: #0c1528; border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 10px;
+    }
+    .proxy-row .addr { color: #bfdbfe; word-break: break-all; }
+    .proxy-row .note { color: var(--muted); font-family: var(--sans); }
+    .proxy-row .spacer { flex: 1; }
     .toolbar {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -478,6 +490,28 @@
         <button id="btnExport" class="secondary" type="button">导出 JSON</button>
         <button id="btnImport" class="secondary" type="button">导入 JSON</button>
       </div>
+    </section>
+
+    <section class="card proxy-panel">
+      <div class="toolbar">
+        <div>
+          <h2>
+            <span>住宅代理池</span>
+            <span class="badge" id="proxyBadge">0</span>
+          </h2>
+          <div class="hint">
+            供「GitHub Actions · 浏览器过盾」通道使用。Cloudflare 对 GHA 机房 IP 常静默不签发 Turnstile 挑战（组件能渲染但永远等不到 token），换成住宅出口后实测 27s 即可拿到 token。<br />
+            每行一个，支持 <code>socks5://host:port</code> 或带 <code>#备注</code>。<strong>注意 Chromium 不支持 SOCKS5 用户名密码认证</strong>，带凭证的代理只能用于连通性测试，浏览器通道会自动跳过。
+          </div>
+        </div>
+        <div class="toolbar-actions">
+          <button id="btnTestProxies" class="secondary" type="button">测试全部连通性</button>
+          <button id="btnSaveProxies" class="success" type="button">保存代理池</button>
+          <button id="btnClearProxies" class="ghost" type="button">清空</button>
+        </div>
+      </div>
+      <textarea id="proxyInput" rows="5" placeholder="socks5://184.178.172.11:4145#US 家宽&#10;socks5://user:pass@1.2.3.4:1080#带认证（浏览器用不了）"></textarea>
+      <div class="proxy-results" id="proxyResults"></div>
     </section>
 
     <section class="card channel-panel">
@@ -1740,6 +1774,163 @@
       await doLogout();
     });
 
+    /* ---------------- 住宅代理池 ---------------- */
+    /**
+     * 为什么要这个面板：Cloudflare 对 GitHub Actions 的机房 IP 常静默不签发
+     * Turnstile 挑战（组件能渲染但永远等不到 token），换住宅出口后同一套代码
+     * 27 秒就拿到了 token。代理会频繁失效，所以要能随时增删 + 测连通性。
+     */
+    let proxyState = { list: [], testing: false };
+
+    function renderProxies(results = null) {
+      const box = $("proxyResults");
+      const list = proxyState.list;
+      $("proxyBadge").textContent = String(list.length);
+      if (!list.length && !results) {
+        box.innerHTML = `<div class="hint">代理池为空。填入上面的输入框后点「保存代理池」。</div>`;
+        return;
+      }
+      const byUrl = new Map();
+      for (const r of results || []) byUrl.set(r.url, r);
+      box.innerHTML = list.map((p) => {
+        const r = byUrl.get(p.url) || null;
+        const chk = r || p.lastCheck || null;
+        let tag = `<span class="tag">未测试</span>`;
+        if (chk) {
+          if (chk.ok && chk.browserUsable) tag = `<span class="tag ok">可用 ${chk.ms}ms</span>`;
+          else if (chk.ok && chk.browserUsable === false) {
+            tag = `<span class="tag warn" title="Chromium 不支持 SOCKS5 用户名密码认证">通但浏览器不可用</span>`;
+          } else if (chk.ok) tag = `<span class="tag ok">连通 ${chk.ms}ms</span>`;
+          else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
+        }
+        if (p.enabled === false) tag = `<span class="tag off">已停用</span>` + tag;
+        const err = chk && !chk.ok && chk.error
+          ? `<div class="note" style="flex-basis:100%">${escapeHtml(chk.error)}</div>` : "";
+        return `
+          <div class="proxy-row" data-proxy-url="${escapeHtml(p.url)}">
+            <span class="addr">${escapeHtml(p.url)}</span>
+            ${p.note ? `<span class="note">${escapeHtml(p.note)}</span>` : ""}
+            <span class="spacer"></span>
+            ${tag}
+            <button data-proxy-act="toggle" class="ghost" style="padding:4px 8px;font-size:.75rem">${p.enabled === false ? "启用" : "停用"}</button>
+            <button data-proxy-act="del" class="danger" style="padding:4px 8px;font-size:.75rem">删除</button>
+            ${err}
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function loadProxies() {
+      try {
+        const data = await apiRequest("/api/proxies");
+        // rawUrl 才是完整地址（url 是打码后的），保存回写要用原始值
+        proxyState.list = (data.proxies || []).map((p) => ({ ...p, url: p.rawUrl || p.url }));
+        renderProxies();
+      } catch (e) {
+        log("加载代理池失败: " + (e.message || e), "err");
+      }
+    }
+
+    async function saveProxies(list, { quiet = false } = {}) {
+      const data = await apiRequest("/api/proxies", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxies: list }),
+      });
+      await loadProxies();
+      if (!quiet) {
+        log(data.message || "代理池已保存", "ok");
+        showToast("代理池已保存", data.message || "", "ok");
+        if (data.rejected?.length) {
+          log(`忽略了 ${data.rejected.length} 条格式不合法的代理：${data.rejected.join(" / ")}`, "warn");
+        }
+      }
+      return data;
+    }
+
+    $("btnSaveProxies").addEventListener("click", async () => {
+      const text = $("proxyInput").value.trim();
+      if (!text) return showToast("请先粘贴代理地址", "每行一个", "warn");
+      // 追加而不是覆盖：面板已有的代理不该因为输入框只填了新的就被清掉
+      const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const merged = [...proxyState.list.map((p) => ({ ...p })), ...lines];
+      $("btnSaveProxies").disabled = true;
+      try {
+        await saveProxies(merged);
+        $("proxyInput").value = "";
+      } catch (e) {
+        showToast("保存失败", e.message, "err", 5200);
+      } finally {
+        $("btnSaveProxies").disabled = false;
+      }
+    });
+
+    $("btnTestProxies").addEventListener("click", async () => {
+      if (!proxyState.list.length) return showToast("代理池为空", "先保存几个代理", "warn");
+      if (proxyState.testing) return;
+      proxyState.testing = true;
+      $("btnTestProxies").disabled = true;
+      log(`开始测试 ${proxyState.list.length} 个代理的连通性 ...`, "info");
+      showToast("正在测试代理", `${proxyState.list.length} 个，约需 10 秒`, "info", 4000);
+      try {
+        const data = await apiRequest("/api/proxies/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true }),
+        });
+        await loadProxies();
+        renderProxies(data.results || []);
+        log(`代理测试完成：${data.message || ""}`, data.okCount ? "ok" : "err");
+        showToast("代理测试完成", data.message || "", data.browserUsable ? "ok" : "warn", 5000);
+        for (const r of data.results || []) {
+          if (!r.ok) log(`  ✗ ${r.url} → ${r.error || "失败"}`, "err");
+          else log(`  ✓ ${r.url} → ${r.ms}ms${r.browserUsable ? "（免认证，浏览器可用）" : "（带认证，Chromium 不可用）"}`, "ok");
+        }
+      } catch (e) {
+        log("代理测试失败: " + (e.message || e), "err");
+        showToast("代理测试失败", e.message, "err", 5200);
+      } finally {
+        proxyState.testing = false;
+        $("btnTestProxies").disabled = false;
+      }
+    });
+
+    $("btnClearProxies").addEventListener("click", async () => {
+      if (!proxyState.list.length) return showToast("代理池已是空的", "", "info");
+      if (!confirm(`确定清空全部 ${proxyState.list.length} 个代理？`)) return;
+      try {
+        await saveProxies([]);
+      } catch (e) {
+        showToast("清空失败", e.message, "err", 5200);
+      }
+    });
+
+    $("proxyResults").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-proxy-act]");
+      if (!btn) return;
+      const row = btn.closest("[data-proxy-url]");
+      const url = row?.getAttribute("data-proxy-url");
+      if (!url) return;
+      const act = btn.getAttribute("data-proxy-act");
+      const next = proxyState.list.map((p) => ({ ...p }));
+      const i = next.findIndex((p) => p.url === url);
+      if (i < 0) return;
+      if (act === "del") {
+        next.splice(i, 1);
+      } else if (act === "toggle") {
+        next[i].enabled = next[i].enabled === false;
+      }
+      btn.disabled = true;
+      try {
+        await saveProxies(next, { quiet: true });
+        log(act === "del" ? `已删除代理 ${url}` : `代理 ${url} → ${next[i]?.enabled === false ? "已停用" : "已启用"}`, "info");
+      } catch (e) {
+        showToast("操作失败", e.message, "err", 5200);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     async function loadApp() {
       try {
         const res = await fetch("/api/adapters", {
@@ -1759,6 +1950,7 @@
         renderTypeOptions();
         renderList();
         await hydrateChannelsFromKv();
+        await loadProxies();
         log("界面就绪", "ok");
       } catch (e) {
         $("adapterBadge").textContent = "适配器加载失败";
