@@ -1088,7 +1088,9 @@ async def confirm_checked_in(page, token, name, tz="Asia/Shanghai"):
     msg = "今日已签到（状态查询确认）" + (f"，今日奖励 {money}" if money else "")
     if st.get("checkinCount") is not None:
         msg += f"，本月 {st['checkinCount']} 次"
-    log(f"  ✅ {name}: {msg}")
+    # 这一步只做「查询到什么」，最终结论由 main() 统一打印（否则日志里 ✅ 会出现两次，
+    # 读起来像签了两回）
+    log(f"  🔎 {name}: 状态查询 → {msg}")
     return {"name": name, "ok": True, "message": msg[:300]}
 
 
