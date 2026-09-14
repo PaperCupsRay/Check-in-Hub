@@ -417,7 +417,9 @@ function normalizeCheckin(payload) {
   const d = payload?.data || payload || {};
   const msg = payload?.message || "";
   const reward = d.quota_awarded ?? d.quota ?? null;
-  const alreadyCheckedIn = /already|已签到|重复/i.test(msg);
+  // 词表故意收窄：裸「重复」会命中「请勿重复提交」这类限流措辞，把**没签到**误报成
+  // 已签到，用户就不会去补签。必须与 scripts/browser-checkin.py 的 ALREADY_RE 保持一致。
+  const alreadyCheckedIn = /already|已签到|重复签到|重复领取|重复打卡/i.test(msg);
   let message = msg || "ok";
   if (alreadyCheckedIn) message = msg || "今日已签到";
   else if (reward != null && (!msg || /^(ok|success|签到成功)$/i.test(msg))) {

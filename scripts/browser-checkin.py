@@ -10,6 +10,13 @@
        缺省用 gorouter 的内置 key），拟人点击 checkbox，轮询拿 token（最长 45s）
      - 在页面内 fetch /api/user/checkin?turnstile=<token> 完成签到
        （请求从浏览器发出，TLS/IP/cookie 三者天然一致）
+    - 自挂组件拿不到 token 时，照站点自身流程把人的动作重放一遍：
+      ① 空 token POST 一次（站点前端就是这么开头的）；② 点站点自己的签到按钮，
+      让它前端去挂它自己的 widget；③ 从那个 widget 收 token 重发。
+      站点对空 token 的回话固定是「Turnstile token 为空」，那是**对空 token 的话术**，
+      不是「我们的 token 无效」；页面上平时看不到组件，因为它是这段流程里才惰性挂的。
+    - 每次「POST 说不清」都再用 GET /api/user/checkin?month= 查一次权威状态：
+      token 是一次性的，站点前端可能已经抢先用掉并领了奖励，光看 POST 回话会误报失败
      - 页面内 fetch /api/user/self 取余额
   3. 全部结果回传面板 /api/gh/result（写入 KV + TG 通知）
 
@@ -82,6 +89,9 @@ TOKEN_WAIT_S = 45
 # sub2api 站填表后站点会自己渲染 widget，通常 4s 内出 token；这段先等它，
 # 超了才自行挂载一个。
 NATIVE_WIDGET_BUDGET_S = 40
+# 权威状态查询（GET /api/user/checkin?month=）的单次上限。它只在「POST 说不清」时才跑，
+# 但悬挂会把一次很可能已经发奖的尝试拖成 ❌超时，所以和 attach_quota 一样要有上限。
+STATUS_QUERY_TIMEOUT_S = 12
 # 单个渠道的总墙钟预算：超了就放弃这次尝试，把时间留给换代理重试和后面的渠道，
 # 而不是把整个 job 拖到 GHA 超时（那样连结果回传都不会发生）。
 CHANNEL_BUDGET_S = int(os.environ.get("CHECKIN_CHANNEL_BUDGET_S") or 300)
@@ -287,7 +297,7 @@ MAX_PROXY_TRIES = 3
 # 只有「疑似出口 IP 导致」的失败才值得换代理重试。凭证缺失/表单找不到这类
 # 换出口也一样失败，重试纯属浪费 45s。
 RETRYABLE_VIA_PROXY = re.compile(
-    r"Turnstile|token 为空|超时|timeout|挂载失败|ERR_|拒绝|blocked|403|503|challenge",
+    r"Turnstile|token 为空|超时|timeout|挂载失败|ERR_|拒绝|blocked|403|\b5\d\d\b|challenge",
     re.I,
 )
 
@@ -583,18 +593,58 @@ def quota_usd(quota, per_unit=500000):
     return f"${n:.4f}" if 0 < abs(n) < 0.01 else f"${n:.2f}"
 
 
+ALREADY_RE = re.compile(r"已签到|重复签到|重复领取|重复打卡|already", re.I)
+
+
+def is_already_checked_in(body):
+    """服务端是不是在说「今天已经签过了」。
+
+    NewAPI 变体常把它表达成 success:false +「请勿重复签到」，那不是失败。
+    判据与 src/adapters/newapi.js 对齐（/already|已签到|重复/i + data.checkin_date）。
+    """
+    if not isinstance(body, dict):
+        return False
+    if ALREADY_RE.search(str(body.get("message") or "")):
+        return True
+    data = body.get("data")
+    if isinstance(data, dict):
+        return bool(data.get("checkin_date") or data.get("already_checked_in") is True)
+    return False
+
+
+def checkin_ok(body, status):
+    """签到是否算成功：HTTP 200，且满足以下任一条：
+      · success 为真；
+      · data.quota_awarded 非零 / data.checkin_date 有值 —— 变体站只回这个，没有 success 键；
+      · 服务端在说「今天已经签过了」。
+
+    判据与 src/adapters/newapi.js 的 normalizeCheckin() 对齐，免得同一个站点在 worker
+    通道 ✅、浏览器通道 ❌。body 不是 dict（顶层数组 / 标量 / 空）一律当失败，免得
+    AttributeError 逃逸成「异常: 'list' object has no attribute 'get'」这种读不出原因的文案。
+    """
+    if status != 200 or not isinstance(body, dict):
+        return False
+    if body.get("success"):
+        return True
+    data = body.get("data")
+    if isinstance(data, dict) and (data.get("quota_awarded") or data.get("checkin_date")):
+        return True
+    return is_already_checked_in(body)
+
+
 def checkin_message(ok, body, status):
     """拼出能自证的签到结论。
 
     NewAPI 成功时只回 message:"" 或 "success"，直接透传会让日志变成「渠道名：success」，
     看不出是真发了奖励还是只是请求通了。这里把奖励额度带出来。
     """
-    body = body or {}
-    d = body.get("data") or {}
+    body = body if isinstance(body, dict) else {}
+    d = body.get("data") if isinstance(body.get("data"), dict) else {}
     srv = str(body.get("message") or "").strip()
     if not ok:
         return (srv or f"HTTP {status}")[:200]
-    already = "已签到" in srv or "already" in srv.lower()
+    # 判据与 checkin_ok 共用：「请勿重复签到」这类回话也是「今天签过了」，不是失败
+    already = is_already_checked_in(body)
     reward = d.get("quota_awarded") if isinstance(d, dict) else None
     parts = []
     if already:
@@ -849,8 +899,233 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
             pass
 
 
+async def inpage_checkin(page, token, ts_token):
+    """页面内 fetch /api/user/checkin，返回 {status, body}。
+
+    ts_token 为 None 时不带 turnstile 参数 —— 站点两段式流程的第一枪就是这么发的，
+    同时也是「服务端是否真强制 Turnstile」的探针。
+    """
+    auth = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+    return await page.evaluate(
+        """async ([ts, headersJs]) => {
+            const url = '/api/user/checkin' + (ts ? '?turnstile=' + encodeURIComponent(ts) : '');
+            const res = await fetch(url, {
+                method: 'POST', credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+            });
+            let body = null; try { body = await res.json(); } catch (e) {}
+            return { status: res.status, body };
+        }""",
+        [ts_token, auth],
+    )
+
+
+async def attach_quota(page, result, token):
+    """顺手把余额写进 result["quotaInfo"]（失败不影响签到结果）。
+
+    提成公共函数是因为「探针命中」那条成功路径也要回余额 —— 它原本直接 return，
+    面板就少一项额度（src/index.js 会合并 quotaInfo）。
+    """
+    try:
+        headers_js = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+        # 必须设上限：/api/user/self 在慢代理上若卡住，会把一次**已经成功**的签到
+        # 拖到 CHANNEL_BUDGET_S 超时，报成 ❌「超时」并再触发换代理重试。
+        me = await asyncio.wait_for(
+            page.evaluate(
+                """async (headersJs) => {
+                    const res = await fetch('/api/user/self', {
+                        credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+                    });
+                    let b = null; try { b = await res.json(); } catch(e) {}
+                    return b && b.data ? b.data : null;
+                }""",
+                headers_js,
+            ),
+            timeout=15,
+        )
+        if isinstance(me, dict) and me.get("quota") is not None:
+            result["quotaInfo"] = {
+                "quota": me.get("quota"),
+                "usedQuota": me.get("used_quota"),
+                "quotaPerUnit": 500000,
+                "account": me.get("display_name") or me.get("username") or "",
+            }
+    except Exception as e:  # noqa: BLE001
+        # 静默会让「余额拿不到」完全无迹可查；签到结果不受影响，但日志要留一句
+        log(f"  ⚠️ 取余额失败（不影响签到结果）: {str(e)[:80]}")
+
+
+async def click_site_checkin(page):
+    """点站点自己的签到控件，把「人点签到」这个动作原样重放一遍。
+
+    为什么非点不可：站点那个 Turnstile widget 是**它自己的前端**在「自己那次请求被拒」
+    之后才渲染的（实测流程：点签到 → 弹「Turnstile token 为空」的 toast → 才出现人机
+    验证 → 通过后签到成功）。widget 的渲染挂在站点前端的组件状态上，而我们绕开前端
+    直接 fetch 的那一枪，站点前端并不知道，所以它未必会挂 widget —— 光靠空 token
+    POST 去"钓"它，可能等满 40s 也等不到。
+
+    点它自己的按钮就没有这个问题：站点前端会自己走完两段式流程，顺带把它自己的
+    widget 挂出来，我们再从那个 widget 收 token（见 wait_any_token 的 native 来源）。
+
+    找不到按钮不算错误（有的站首页没有签到卡片）：返回 {"found": False}，调用方照旧往下走。
+    """
+    hit = await page.evaluate(
+        """() => {
+            const WANT = /签到|check\\s*-?\\s*in/i;
+            // 只排除「显示状态」的元素（已签/已领、明日、连续、记录、历史、日历）。
+            // 故意不排除「奖励」：未签到状态下的按钮常写成「签到领奖励」，排掉就永远点不到。
+            const NEG = /已签|已领|签到成功|明日|明天|连续|记录|历史|日历/;
+            const away = (el) => {
+                if (el.tagName !== 'A') return false;
+                const raw = el.getAttribute('href') || '';
+                // javascript:/# 之类不是真的跳转，按本页处理；只看 http(s) 的目标路径
+                if (!/^https?:/i.test(raw) && raw !== '') return false;
+                try { return new URL(el.href, location.href).pathname !== location.pathname; }
+                catch (e) { return false; }
+            };
+            const find = () => {
+                const all = [...document.querySelectorAll('button,[role=button],a')];
+                const ok = all.filter(el => {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (!t || t.length > 12) return false;
+                    if (NEG.test(t) || !WANT.test(t)) return false;
+                    // 会跳到别的页面的链接直接不要：点它等于白跑一趟，还会把我们已经挂好的
+                    // widget 和待收的 token 一起冲掉（页头一个叫「Check-in」的导航链接就是这种）。
+                    if (away(el)) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && r.height <= 120;
+                });
+                // 真按钮优先于本页锚点
+                const rank = el => (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') ? 0 : 1;
+                ok.sort((a, b) => rank(a) - rank(b));
+                return ok[0] || null;
+            };
+            };
+            window.__hubFindCheckin = find;
+            const el = find();
+            if (!el) return { found: false };
+            el.scrollIntoView({ block: 'center' });
+            return { found: true, text: (el.innerText || '').trim().slice(0, 20) };
+        }"""
+    )
+    if not hit.get("found"):
+        return {"found": False, "why": "页面上没有匹配的签到控件"}
+    # 等滚动/布局落定后再取坐标，并做一次命中自检：elementFromPoint 必须落在候选元素
+    # （或其后代）上。滚动过程中取的旧坐标在 smooth-scroll / sticky 头的站点上会点到别处，
+    # 而 page.mouse.click 是裸坐标点击，不做任何 actionability 校验。
+    await page.wait_for_timeout(400)
+    pos = await page.evaluate(
+        """() => {
+            const el = window.__hubFindCheckin && window.__hubFindCheckin();
+            if (!el) return { ok: false, why: 'element-gone' };
+            const r = el.getBoundingClientRect();
+            const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+            const at = document.elementFromPoint(cx, cy);
+            if (!at || !(at === el || el.contains(at) || at.contains(el)))
+                return { ok: false, why: 'hit-test:' + (at ? at.tagName : 'null') };
+            return { ok: true, x: cx, y: cy };
+        }"""
+    )
+    if not pos.get("ok"):
+        return {"found": False, "why": pos.get("why") or "坐标自检失败", "text": hit.get("text")}
+    # 拟人点击（Camoufox 的 humanize 会接管 mouse.move 的轨迹）
+    await page.mouse.move(pos["x"], pos["y"], steps=5)
+    await page.mouse.click(pos["x"], pos["y"])
+    return {"found": True, "text": hit.get("text")}
+
+
+async def inpage_checkin_status(page, token, tz="Asia/Shanghai"):
+    """GET /api/user/checkin?month=YYYY-MM —— 签到的权威状态（照 worker 侧同一套做法）。
+
+    为什么非有不可：Turnstile token 是**一次性**的。我们点了站点自己的签到按钮之后，
+    站点前端和我们在抢同一个 token —— 它先 POST 就把 token 消费掉了，我们那一枪必然报
+    「校验失败」，可奖励其实已经发下来了。光看 POST 的回话分不清这两种，只有状态查询能定论。
+    """
+    auth = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+    # 必须设上限：状态查询悬挂会把这枪很可能已经发奖的尝试拖成 ❌「超时」，而「超时」
+    # 又匹配 RETRYABLE_VIA_PROXY，接着白烧一轮代理。超时按「不知道」处理（返回 None）。
+    return await asyncio.wait_for(
+        page.evaluate(
+            """async ([headersJs, tz]) => {
+                const fmt = new Intl.DateTimeFormat('en-CA', {
+                    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+                });
+                const ymd = fmt.format(new Date());
+                const r = await fetch('/api/user/checkin?month=' + encodeURIComponent(ymd.slice(0, 7)), {
+                    credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+                });
+                let b = null; try { b = await r.json(); } catch (e) {}
+                // 与 newapi.js 的 normalizeStatus 一致：data 缺失时退回 payload 自身
+                const d = (b && (b.data || b)) || {};
+                const stats = d.stats || d;
+                const rec = (stats.records || d.records || d.checkins || [])
+                    .find(x => (x.checkin_date || x.check_in_date) === ymd);
+                return {
+                    httpStatus: r.status,
+                    ok: r.status < 400 && !(b && b.success === false),
+                    checkedInToday: !!(stats.checked_in_today ?? d.checked_in_today),
+                    reward: rec ? (rec.quota_awarded ?? rec.quota ?? null) : null,
+                    checkinCount: stats.checkin_count ?? stats.total_checkins ?? d.checkin_count ?? null,
+                };
+            }""",
+            [auth, tz],
+        ),
+        timeout=STATUS_QUERY_TIMEOUT_S,
+    )
+
+
+async def confirm_checked_in(page, token, name, tz="Asia/Shanghai"):
+    """「今天到底签没签」的权威答案：签了返回成功结果，没签返回 None（调用方照旧报失败）。"""
+    try:
+        st = await inpage_checkin_status(page, token, tz)
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ {name}: 签到状态查询失败 {str(e)[:80]}")
+        return None
+    # 只有「查询本身可信」才采信它：403/挑战页也会返回 checked_in_today 缺省 false，
+    # 但那种情况属于查不到，绝不能拿它当结论。
+    if not st.get("ok") or not st.get("checkedInToday"):
+        return None
+    money = quota_usd(st["reward"]) if st.get("reward") else None
+    msg = "今日已签到（状态查询确认）" + (f"，今日奖励 {money}" if money else "")
+    if st.get("checkinCount") is not None:
+        msg += f"，本月 {st['checkinCount']} 次"
+    log(f"  ✅ {name}: {msg}")
+    return {"name": name, "ok": True, "message": msg[:300]}
+
+
+async def wait_any_token(page, budget_s):
+    """等一个可用的 Turnstile token，返回 (token, 来源)。来源是 'self' 或 'native'。
+
+    两处都要收，只盯一处就会漏：
+      self    我们自挂的组件写进 window._tsToken 的
+      native  站点自身 widget 的隐藏域 [name=cf-turnstile-response]，它只在站点自己的
+              两段式流程走到第二步时才出现（gorouter 就是这种）
+    等待期间照旧拟人点击挑战 iframe。
+    """
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(1000)
+        tok = await page.evaluate(
+            """() => {
+                if (window._tsToken) return { t: window._tsToken, s: 'self' };
+                const h = [...document.querySelectorAll('[name=cf-turnstile-response]')]
+                    .find(el => el.value && !el.closest('#cf-turnstile-box'));
+                return h && h.value ? { t: h.value, s: 'native' } : null;
+            }"""
+        )
+        if tok:
+            return tok.get("t"), tok.get("s")
+        await click_challenge(page)
+    return None, None
+
+
 async def checkin_one(channel, proxy=None) -> dict:
     """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。
+
+    站点的两段式流程（gorouter / SeekAi 这类 NewAPI 变体）：前端**先不带 token POST
+    一次 /api/user/checkin**，被拒（典型回话就是「Turnstile token 为空」）之后才惰性
+    挂载 Turnstile widget，再带 token 重发。所以页面上平时看不到组件；也所以那句
+    「为空」是站点对**空 token** 的固定话术，不能读成「我们的 token 无效」。
+    同一现象在 HTTP 通道侧记录于 src/adapters/newapi.js 的 turnstileRejected()。
 
     proxy: 住宅 SOCKS5 出口（socks5://host:port，不能带凭证）。传入时整个
     浏览器的流量都走它——Turnstile 校验的是浏览器出口 IP，只有这样 CF 才肯
@@ -862,7 +1137,9 @@ async def checkin_one(channel, proxy=None) -> dict:
     auth = channel.get("auth") or {}
     cookie_raw = auth.get("cookie") or ""
     token = auth.get("token") or ""
-
+    # 时区只影响状态查询里的 month= 与「当天奖励」的匹配（是否已签到由服务端标志决定），
+    # 但跨月/跨日时按站点自己的时区算才不会串天。与 worker 侧取同一个选项。
+    tz = (channel.get("options") or {}).get("timezone") or "Asia/Shanghai"
     if proxy:
         log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
     stack = contextlib.AsyncExitStack()
@@ -940,6 +1217,9 @@ async def checkin_one(channel, proxy=None) -> dict:
                             callback: (t) => { window._tsToken = t; },
                             'error-callback': (e) => { window._tsError = String(e); },
                             'expired-callback': () => { window._tsToken = null; },
+                            // 别让自挂组件往 DOM 注入同名的隐藏域：站点自身 widget 用的是
+                            // 同一个字段名，混在一起就分不清 token 是谁的（native 来源会认错）。
+                            'response-field': false,
                         });
                         window._tsRendered = true;
                     } catch (e) {
@@ -991,82 +1271,130 @@ async def checkin_one(channel, proxy=None) -> dict:
         )
         log(f"  🔍 {name}: 诊断 {json.dumps(diag, ensure_ascii=False)[:320]}")
 
+        # 是否点过站点自己的签到按钮（两段式兜底里才会置 True），末尾据此标注来源
+        clicked_site_button = False
         log(f"  ⏳ {name}: 等待 Turnstile token（拟人点击，最长 {TOKEN_WAIT_S}s）...")
-        ts_token = None
-        deadline = time.monotonic() + TOKEN_WAIT_S
-        while time.monotonic() < deadline:
-            await page.wait_for_timeout(1000)
-            ts_token = await page.evaluate("() => window._tsToken")
-            if ts_token:
-                break
-            # 拟人点击挑战 iframe 的 checkbox 区域
-            await click_challenge(page)
+        ts_token, ts_src = await wait_any_token(page, TOKEN_WAIT_S)
         if not ts_token:
-            # 兜底：不带 turnstile 直接页面内 fetch 签到（探测服务端是否真强制）
-            hdrs = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
-            direct = await page.evaluate(
-                """async (h) => {
-                    const res = await fetch('/api/user/checkin', {
-                        method: 'POST', credentials: 'include', headers: JSON.parse(h),
-                    });
-                    let b = null; try { b = await res.json(); } catch (e) {}
-                    return { status: res.status, body: b };
-                }""",
-                hdrs,
-            )
-            db = direct.get("body") or {}
-            dmsg = str(db.get("message") or "")[:120]
-            dok = direct.get("status") == 200 and (db.get("success") or "已签到" in dmsg)
-            return {
-                "name": name,
-                "ok": dok,
-                "message": f"无token直签 HTTP {direct.get('status')}: {dmsg or str(db)[:100]}",
-            }
+            # 站点两段式流程的第一段：先不带 token POST 一次。这就是站点前端自己干的事
+            # （见 checkin_one 文档字符串与 src/adapters/newapi.js 的 turnstileRejected）。
+            # 一枪两用：① 站点若其实没强制 Turnstile，这一枪就是真签到；
+            #          ② gorouter 这类站的前端正是**被这一枪拒掉之后**才惰性挂载 widget，
+            #             所以自挂组件不出 token 时，可以借它这一挂拿站点自己的原生 token。
+            log(f"  🧪 {name}: 自挂组件未出 token，按站点自身流程先空 token POST 一次 ...")
+            pre = await inpage_checkin(page, token, None)
+            pb = pre.get("body") if isinstance(pre.get("body"), dict) else {}
+            pmsg = str(pb.get("message") or "")[:120]
+            if checkin_ok(pb, pre.get("status")):
+                # 站点其实没强制 Turnstile：这一枪就是真签到
+                res = {
+                    "name": name,
+                    "ok": True,
+                    "message": checkin_message(True, pb, pre.get("status")),
+                }
+                await attach_quota(page, res, token)
+                return res
+            log(f"  🧪 {name}: 空 token POST 被拒（{pmsg or str(pb)[:100]}）")
+            if not re.search(r"turnstile|challenge|人机|校验|验证", pmsg + str(pb)[:200], re.I):
+                # 与 Turnstile 无关的失败：站点不会因此挂 widget，别再白等几十秒。
+                # 也显式标不可重试 —— 额度/凭证/风控类拒绝换出口没用，而每次尝试要烧
+                # 45s+，重试三次会把 JOB_BUDGET_S 吃光（尾部渠道当天直接漏签）。
+                # 文案仍写明「未取到 Turnstile token」，人读日志时知道卡在哪一步。
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        f"未取到 Turnstile token（自挂组件 {TOKEN_WAIT_S}s 无）；"
+                        f"空 token 直签 HTTP {pre.get('status')}：{pmsg or str(pb)[:100]}"
+                    )[:300],
+                }
+            # 先问一次权威状态再去折腾 widget：站点可能今天早就签过了（那它不会再挂
+            # widget、按钮文案也变成「已签到」），光等 40s 只会白等并报一条假失败。
+            done = await confirm_checked_in(page, token, name, tz)
+            if done:
+                await attach_quota(page, done, token)
+                return done
+            # 站点自己的 widget 是它前端在「自己那次请求被拒」之后才挂的，我们绕开前端
+            # 发的那一枪站点前端并不知道 —— 所以把人的动作重放一遍：点它自己的签到按钮，
+            # 让站点前端自己走完两段式流程并把 widget 挂出来。
+            hit = await click_site_checkin(page)
+            if hit.get("found"):
+                clicked_site_button = True
+                log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」，等它的前端挂 widget")
+            else:
+                log(f"  🖱️ {name}: 没点到签到按钮（{hit.get('why') or '页面上没有'}），只能继续等自挂组件的 token")
+            # 给站点前端一点时间跑它自己那次请求 + 弹 toast + 渲染 widget
+            await page.wait_for_timeout(2500)
+            log(f"  ⏳ {name}: 等站点自己挂载的 widget 出 token（最长 {NATIVE_WIDGET_BUDGET_S}s）...")
+            ts_token, ts_src = await wait_any_token(page, NATIVE_WIDGET_BUDGET_S)
+            if not ts_token:
+                # 两处都拿不到 token 时，先问权威状态再下结论：我们点过站点自己的按钮，
+                # 站点前端很可能已经把签到做完了（它拿到 token 就自己 POST 了）。
+                done = await confirm_checked_in(page, token, name, tz)
+                if done:
+                    await attach_quota(page, done, token)
+                    return done
+                # 写清这条失败的性质：空 token POST 的回话是**站点对空 token 的固定话术**，
+                # 不是「我们的 token 被拒」。旧日志把这句话原样透传，读起来像是盾没过或
+                # token 无效，很容易把人带去查 token / 换代理。带上 _tsError 保留 CF 错误码。
+                err = await page.evaluate("() => window._tsError")
+                return {
+                    "name": name,
+                    "ok": False,
+                    "message": (
+                        f"未取到 Turnstile token（自挂组件 {TOKEN_WAIT_S}s + 站点自身 widget "
+                        f"{NATIVE_WIDGET_BUDGET_S}s 均无，_tsError={err}）；"
+                        f"空 token POST 回话为站点固定话术：{pmsg or str(pb)[:80]}"
+                    )[:300],
+                }
 
-        log(f"  🎉 {name}: 拿到 token（长度 {len(ts_token)}），页面内签到...")
-        headers_js = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
-        checkin = await page.evaluate(
-            """async ([tokenQs, headersJs]) => {
-                const res = await fetch('/api/user/checkin?turnstile=' + encodeURIComponent(tokenQs), {
-                    method: 'POST', credentials: 'include',
-                    headers: JSON.parse(headersJs || '{}'),
-                });
-                let body = null; try { body = await res.json(); } catch(e) {}
-                return { status: res.status, body };
-            }""",
-            [ts_token, headers_js],
-        )
-        body = checkin.get("body") or {}
-        ok = checkin.get("status") == 200 and (
-            body.get("success") or "已签到" in str(body.get("message", ""))
-        )
+        log(f"  🎉 {name}: 拿到 token（来源 {ts_src}，长度 {len(ts_token)}），页面内签到...")
+        checkin = await inpage_checkin(page, token, ts_token)
+        body = checkin.get("body") if isinstance(checkin.get("body"), dict) else {}
+        ok = checkin_ok(body, checkin.get("status"))
         result = {
             "name": name,
             "ok": ok,
             "message": checkin_message(ok, body, checkin.get("status")),
         }
+        if ts_src == "native":
+            result["message"] = f"{result['message']}（token 来自站点自身 widget）"[:300]
+        if clicked_site_button and "已签到" in result["message"]:
+            # 我们点过它自己的按钮：站点前端很可能已经自己把签到做了，服务端于是回「已签到」。
+            # 不标出来的话这条会读成「今天早就签过了、没发奖励」，正好与事实相反。
+            result["message"] = f"{result['message']}（本次由站点自身按钮触发）"[:300]
+        if not ok:
+            st_code = checkin.get("status")
+            raw = json.dumps(body, ensure_ascii=False)
+            # 与上面探针那一枪用同一套词：站点把拒绝写成「人机验证失败」这类时也算
+            turnstile_said = bool(re.search(r"turnstile|challenge|人机|校验|验证", raw, re.I))
+            # POST 可能压根没到应用层：CF 直接拦成 HTML/403，此时 body 是空的
+            cf_blocked = st_code in (403, 429) or (isinstance(st_code, int) and st_code >= 500)
+            if turnstile_said or cf_blocked or clicked_site_button:
+                # token 是一次性的，而站点前端和我们在抢同一个：点过它自己的按钮之后，
+                # 它先 POST 就把 token 消费掉了，我们这一枪必然报校验失败 —— 奖励其实已经发了。
+                # 所以先问权威状态，能定论就按成功算，别报一条「站点已经签到成功」的假失败。
+                done = await confirm_checked_in(page, token, name, tz)
+                if done:
+                    await attach_quota(page, done, token)
+                    return done
+            if turnstile_said and st_code == 200:
+                # 服务端在**应用层**拒了这次 token（不是 CF 层拦截），才写这句说明
+                result["message"] = (
+                    f"{result['message']} · 注：本次已带 turnstile token（来源 {ts_src}，"
+                    f"长度 {len(ts_token)}），服务端仍报 Turnstile 问题 → 是这次 token 未被接受"
+                )[:300]
+                # token 已经发出去了，换出口解决不了；标不可重试，别把 job 预算烧在重试上
+                result["retryable"] = False
+            elif cf_blocked:
+                # CF 层拦截是出口 IP 的问题，换代理**可能**有效，所以不标不可重试
+                result["message"] = (
+                    f"{result['message']} · 注：HTTP {st_code}，疑似 Cloudflare 层拦截"
+                    f"（本次已带 turnstile token，来源 {ts_src}）"
+                )[:300]
 
-        # 顺手取余额（失败不影响签到结果）
-        try:
-            me = await page.evaluate(
-                """async (headersJs) => {
-                    const res = await fetch('/api/user/self', {
-                        credentials: 'include', headers: JSON.parse(headersJs || '{}'),
-                    });
-                    let b = null; try { b = await res.json(); } catch(e) {}
-                    return b && b.data ? b.data : null;
-                }""",
-                headers_js,
-            )
-            if me and me.get("quota") is not None:
-                result["quotaInfo"] = {
-                    "quota": me.get("quota"),
-                    "usedQuota": me.get("used_quota"),
-                    "quotaPerUnit": 500000,
-                    "account": me.get("display_name") or me.get("username") or "",
-                }
-        except Exception:  # noqa: BLE001
-            pass
+        await attach_quota(page, result, token)
         return result
     finally:
         await stack.aclose()
@@ -1220,6 +1548,11 @@ async def main():
             if r.get("ok"):
                 if i:
                     r["message"] = f"{r.get('message', '')}（经{via}）"
+                break
+            # 结果里显式标了不可重试的直接停：这类失败换出口也解决不了，而每次尝试要烧
+            # 45s+40s，重试三次足以把 JOB_BUDGET_S 吃光，尾部渠道当天就漏签了。
+            if r.get("retryable") is False:
+                log(f"  ⏹️ {name}: 该失败换出口无效，不再重试")
                 break
             # 只有「拿不到 token / 网络层失败」才值得换出口；凭证类错误换 IP 也白搭
             if not RETRYABLE_VIA_PROXY.search(str(r.get("message", ""))):
