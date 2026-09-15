@@ -568,28 +568,135 @@ def _proxy_tunnel_socket(host, port, proxy=None, timeout=15):
     return raw
 
 
-def _peer_cert_sha256(host, port, proxy=None, timeout=15):
-    """取目标站 TLS 证书的 SHA-256 指纹；proxy 为 None 时直连。
+def _tls_ctx():
+    """不校验证书的 TLS 上下文。
 
-    故意用 verify_mode=NONE：我们要的是「看到对方递了什么证书」，
-    而不是「证书是否可信」——不关校验就拿不到 MITM 代理伪造的那张证书。
+    故意用 verify_mode=NONE：我们要的是「看到对方递了什么证书」，而不是
+    「证书是否可信」——不关校验就拿不到 MITM 代理伪造的那张证书。
     """
-    import hashlib
     import ssl as _ssl
 
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = _ssl.CERT_NONE
+    return ctx
 
-    raw = _proxy_tunnel_socket(host, port, proxy=proxy, timeout=timeout)
-    try:
-        with ctx.wrap_socket(raw, server_hostname=host) as ss:
-            return hashlib.sha256(ss.getpeercert(binary_form=True)).hexdigest()
-    finally:
+
+class _TlsInTls:
+    """在一条已经是 TLS 的连接上再套一层 TLS（https 代理的 CONNECT 隧道）。
+
+    为什么非要这个类：ssl.SSLContext.wrap_socket **不能**套在 SSLSocket 上。
+    它直接拿底层 fd 收发，会绕过外层 TLS，把内层 ClientHello 明文发给代理。
+    2026-09-15 实测症状：7 个 https 代理全报 INVALID_ALERT / UNEXPECTED_MESSAGE，
+    被 proxy_is_safe() 记成「TLS 探测失败」而全部跳过 —— 看起来像代理都挂了，
+    其实它们的 CONNECT 全都正常返回 200 Connection Established。
+
+    内层因此必须走 SSLObject + MemoryBIO：加解密只在内存里做，密文由我们自己
+    通过外层连接搬运。
+    """
+
+    def __init__(self, transport, server_hostname, ctx):
+        import ssl as _ssl
+
+        self._t = transport
+        self._incoming = _ssl.MemoryBIO()
+        self._outgoing = _ssl.MemoryBIO()
+        self._obj = ctx.wrap_bio(
+            self._incoming, self._outgoing, server_hostname=server_hostname
+        )
+        self._handshake()
+
+    def _push(self):
+        """把内层攒下的密文经外层发出去。"""
+        data = self._outgoing.read()
+        if data:
+            self._t.sendall(data)
+
+    def _pull(self):
+        """从外层读一段密文喂给内层；对端关闭时写 EOF。"""
+        chunk = self._t.recv(16384)
+        if chunk:
+            self._incoming.write(chunk)
+        else:
+            self._incoming.write_eof()
+
+    def _handshake(self):
+        import ssl as _ssl
+
+        while True:
+            try:
+                self._obj.do_handshake()
+                self._push()
+                return
+            except _ssl.SSLWantReadError:
+                # 握手要来回好几轮：每轮先把自己要说的发出去，再等对方的回应
+                self._push()
+                self._pull()
+
+    def getpeercert(self, binary_form=False):
+        return self._obj.getpeercert(binary_form)
+
+    def sendall(self, data):
+        self._obj.write(data)
+        self._push()
+
+    def recv(self, size=16384):
+        import ssl as _ssl
+
+        while True:
+            try:
+                return self._obj.read(size)
+            except _ssl.SSLWantReadError:
+                self._push()
+                try:
+                    self._pull()
+                except OSError:
+                    return b""
+            except (_ssl.SSLZeroReturnError, _ssl.SSLEOFError):
+                # 对端正常关闭：按「读到末尾」处理，交给调用方结束循环
+                return b""
+
+    def close(self):
         try:
-            raw.close()
+            self._t.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _tls_wrap(transport, host, ctx):
+    """给隧道套上**目标站**的 TLS。
+
+    普通 socket 走 wrap_socket 快路径；https 代理交回来的是 SSLSocket，
+    必须走 MemoryBIO（原因见 _TlsInTls 的说明）。
+    """
+    import ssl as _ssl
+
+    if isinstance(transport, _ssl.SSLSocket):
+        return _TlsInTls(transport, host, ctx)
+    return ctx.wrap_socket(transport, server_hostname=host)
+
+
+def _close_all(*socks):
+    for sock in socks:
+        if sock is None:
+            continue
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _peer_cert_sha256(host, port, proxy=None, timeout=15):
+    """取目标站 TLS 证书的 SHA-256 指纹；proxy 为 None 时直连。"""
+    import hashlib
+
+    raw = _proxy_tunnel_socket(host, port, proxy=proxy, timeout=timeout)
+    ss = None
+    try:
+        ss = _tls_wrap(raw, host, _tls_ctx())
+        return hashlib.sha256(ss.getpeercert(binary_form=True)).hexdigest()
+    finally:
+        _close_all(ss, raw)
 
 
 def proxy_exit_ip(proxy, timeout=15):
@@ -604,26 +711,24 @@ def proxy_exit_ip(proxy, timeout=15):
     只在 `geoip is True` 时才自己去查，传字符串就跳过那一步。
     """
     import re as _re
-    import ssl as _ssl
 
-    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = _ssl.CERT_NONE
+    ctx = _tls_ctx()
     for host in ("api.ipify.org", "checkip.amazonaws.com", "icanhazip.com"):
         raw = None
+        ss = None
         try:
             raw = _proxy_tunnel_socket(host, 443, proxy=proxy, timeout=timeout)
-            with ctx.wrap_socket(raw, server_hostname=host) as ss:
-                ss.sendall(
-                    f"GET / HTTP/1.1\r\nHost: {host}\r\n"
-                    f"User-Agent: {UA}\r\nConnection: close\r\n\r\n".encode()
-                )
-                buf = b""
-                while len(buf) < 8192:
-                    chunk = ss.recv(2048)
-                    if not chunk:
-                        break
-                    buf += chunk
+            ss = _tls_wrap(raw, host, ctx)
+            ss.sendall(
+                f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                f"User-Agent: {UA}\r\nConnection: close\r\n\r\n".encode()
+            )
+            buf = b""
+            while len(buf) < 8192:
+                chunk = ss.recv(2048)
+                if not chunk:
+                    break
+                buf += chunk
             # 正文可能是 chunked（大小前缀是十六进制，不会被下面的正则误认成 IP）
             body = buf.split(b"\r\n\r\n", 1)[-1].decode(errors="replace")
             m = _re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", body)
@@ -632,11 +737,7 @@ def proxy_exit_ip(proxy, timeout=15):
         except Exception:  # noqa: BLE001
             continue
         finally:
-            if raw is not None:
-                try:
-                    raw.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            _close_all(ss, raw)
     return None
 
 
@@ -697,16 +798,24 @@ def is_already_checked_in(body):
     """服务端是不是在说「今天已经签过了」。
 
     NewAPI 变体常把它表达成 success:false +「请勿重复签到」，那不是失败。
-    判据与 src/adapters/newapi.js 对齐（/already|已签到|重复/i + data.checkin_date）。
+
+    只认两种证据：服务端**话里**说了（ALREADY_RE，词表与 src/adapters/newapi.js 的
+    normalizeCheckin 逐字一致），或明确给了 already_checked_in:true 这个布尔标志。
+
+    绝不能把 data.checkin_date 当证据 —— 签到**成功**的回话里本来就带这个字段
+    （2026-09-15 实测 gorouter：message="签到成功" + data.checkin_date 齐全）。
+    旧版拿它当判据，于是全新签到也被判成「今日已签到（未重复发放）」，
+    checkin_message() 走 already 分支把真实奖励额度吞掉，日志里看不出到底发没发钱。
+
+    移掉这一条不会把成功误判成失败：checkin_ok() 自己单独看 quota_awarded /
+    checkin_date，成功判定不经过本函数这一路。
     """
     if not isinstance(body, dict):
         return False
     if ALREADY_RE.search(str(body.get("message") or "")):
         return True
     data = body.get("data")
-    if isinstance(data, dict):
-        return bool(data.get("checkin_date") or data.get("already_checked_in") is True)
-    return False
+    return isinstance(data, dict) and data.get("already_checked_in") is True
 
 
 def checkin_ok(body, status):
