@@ -33,3 +33,7 @@ checkin-hub-channels-*.json
 
 # local credential notes
 .password_note.txt
+
+# python cache（scripts/ 下的脚本本地跑会生成）
+__pycache__/
+*.py[cod]
