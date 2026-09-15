@@ -262,8 +262,21 @@ async def browser_page(proxy=None, window=(1366, 768)):
             opts["executable_path"] = CAMOUFOX_EXECUTABLE
         if proxy:
             opts["proxy"] = camoufox_proxy(proxy)
-            # 按代理出口 IP 推地理位置/时区，避免「德州 IP + 上海时区」这种矛盾指纹
-            opts["geoip"] = True
+            # 按代理出口 IP 推地理位置/时区，避免「德州 IP + 上海时区」这种矛盾指纹。
+            #
+            # 不能无条件用 geoip=True：Camoufox 的 public_ip() 硬编码 verify=True，
+            # 经 MITM 代理时证书校验失败 → launch 直接抛 InvalidIP，浏览器都开不起来。
+            # 所以放行 MITM 的场合自己查 IP（不校验证书）再把字符串传进去；
+            # 实在查不到就干脆不传 geoip —— 指纹一致性打点折扣，但至少能跑起来。
+            if ALLOW_MITM_PROXY:
+                ip = proxy_exit_ip(proxy)
+                if ip:
+                    opts["geoip"] = ip
+                    log(f"  🌐 代理出口 IP {ip}（自查，用于 geoip）")
+                else:
+                    log("  ⚠️ 查不到代理出口 IP，本次不传 geoip（时区/地理可能与出口 IP 矛盾）")
+            else:
+                opts["geoip"] = True
         async with AsyncCamoufox(**opts) as browser:
             # 不要显式传 viewport：beta.29 + Playwright≥1.61 会 Protocol error
             # (Browser.setDefaultViewport)，而 Camoufox 本就按指纹生成 screen。
@@ -475,6 +488,86 @@ def mask_proxy(url):
         return "(proxy)"
 
 
+def _proxy_tunnel_socket(host, port, proxy=None, timeout=15):
+    """建一条到 host:port 的裸 TCP 隧道；proxy 为 None 时直连。
+
+    从 _peer_cert_sha256 里抽出来的公共部分：取证书指纹和查代理出口 IP 都需要
+    「先按代理协议握手、再自己接管这条 socket」。两处的 CONNECT 逻辑必须完全一致，
+    否则一个能连另一个连不上，就会把「代理挂了」误判成「代理在解密 TLS」。
+
+    返回已连通的 socket（TLS 还没做，调用方自己 wrap）。
+    """
+    import socket as _socket
+    import ssl as _ssl
+
+    if not proxy:
+        return _socket.create_connection((host, port), timeout=timeout)
+
+    scheme, cred, phost, pport = split_proxy(proxy)
+    raw = _socket.create_connection((phost, int(pport or 1080)), timeout=timeout)
+    try:
+        if scheme in ("http", "https"):
+            # https 代理要先对代理这一跳做 TLS，否则 Basic 凭证明文过网
+            if scheme == "https":
+                pctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                pctx.check_hostname = False
+                pctx.verify_mode = _ssl.CERT_NONE
+                raw = pctx.wrap_socket(raw, server_hostname=phost)
+            req = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+            if cred:
+                import base64
+                req.append(
+                    "Proxy-Authorization: Basic "
+                    + base64.b64encode(cred.encode()).decode()
+                )
+            raw.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 4096:
+                chunk = raw.recv(1024)
+                if not chunk:
+                    break
+                head += chunk
+            first = head.split(b"\r\n", 1)[0].decode(errors="replace")
+            if " 2" not in first:
+                raise RuntimeError(f"代理 CONNECT 失败: {first[:60]}")
+        elif scheme == "socks4":
+            # SOCKS4a：IP 填 0.0.0.1 表示让代理解析域名
+            hb = host.encode()
+            raw.sendall(
+                bytes([0x04, 0x01]) + port.to_bytes(2, "big")
+                + bytes([0, 0, 0, 1]) + b"\x00" + hb + b"\x00"
+            )
+            rep = raw.recv(8)
+            if len(rep) < 2 or rep[1] != 0x5A:
+                raise RuntimeError(f"SOCKS4 CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
+        else:
+            # SOCKS5：声明免认证 + 用户名密码两种方式
+            user, _, pwd = (cred or "").partition(":")
+            methods = [0x00, 0x02] if user else [0x00]
+            raw.sendall(bytes([0x05, len(methods)] + methods))
+            greet = raw.recv(2)
+            if greet[:1] != b"\x05":
+                raise RuntimeError("不是 SOCKS5 代理")
+            if greet[1:2] == b"\x02":
+                ub, pb = user.encode(), pwd.encode()
+                raw.sendall(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
+                if raw.recv(2)[1:2] != b"\x00":
+                    raise RuntimeError("SOCKS5 认证被拒绝")
+            hb = host.encode()
+            raw.sendall(bytes([0x05, 0x01, 0x00, 0x03, len(hb)]) + hb + port.to_bytes(2, "big"))
+            rep = raw.recv(4)
+            if len(rep) < 2 or rep[1] != 0x00:
+                raise RuntimeError(f"CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
+            raw.recv(256)  # 丢掉绑定地址
+    except Exception:
+        try:
+            raw.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return raw
+
+
 def _peer_cert_sha256(host, port, proxy=None, timeout=15):
     """取目标站 TLS 证书的 SHA-256 指纹；proxy 为 None 时直连。
 
@@ -482,77 +575,13 @@ def _peer_cert_sha256(host, port, proxy=None, timeout=15):
     而不是「证书是否可信」——不关校验就拿不到 MITM 代理伪造的那张证书。
     """
     import hashlib
-    import socket as _socket
     import ssl as _ssl
 
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = _ssl.CERT_NONE
 
-    if proxy:
-        scheme, cred, phost, pport = split_proxy(proxy)
-        raw = _socket.create_connection((phost, int(pport or 1080)), timeout=timeout)
-        try:
-            if scheme in ("http", "https"):
-                # https 代理要先对代理这一跳做 TLS，否则 Basic 凭证明文过网
-                if scheme == "https":
-                    praw = ctx.wrap_socket(raw, server_hostname=phost)
-                    raw = praw
-                req = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
-                if cred:
-                    import base64
-                    req.append(
-                        "Proxy-Authorization: Basic "
-                        + base64.b64encode(cred.encode()).decode()
-                    )
-                raw.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
-                head = b""
-                while b"\r\n\r\n" not in head and len(head) < 4096:
-                    chunk = raw.recv(1024)
-                    if not chunk:
-                        break
-                    head += chunk
-                first = head.split(b"\r\n", 1)[0].decode(errors="replace")
-                if " 2" not in first:
-                    raise RuntimeError(f"代理 CONNECT 失败: {first[:60]}")
-            elif scheme == "socks4":
-                # SOCKS4a：IP 填 0.0.0.1 表示让代理解析域名
-                hb = host.encode()
-                raw.sendall(
-                    bytes([0x04, 0x01]) + port.to_bytes(2, "big")
-                    + bytes([0, 0, 0, 1]) + b"\x00" + hb + b"\x00"
-                )
-                rep = raw.recv(8)
-                if len(rep) < 2 or rep[1] != 0x5A:
-                    raise RuntimeError(f"SOCKS4 CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
-            else:
-                # SOCKS5：声明免认证 + 用户名密码两种方式
-                user, _, pwd = (cred or "").partition(":")
-                methods = [0x00, 0x02] if user else [0x00]
-                raw.sendall(bytes([0x05, len(methods)] + methods))
-                greet = raw.recv(2)
-                if greet[:1] != b"\x05":
-                    raise RuntimeError("不是 SOCKS5 代理")
-                if greet[1:2] == b"\x02":
-                    ub, pb = user.encode(), pwd.encode()
-                    raw.sendall(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
-                    if raw.recv(2)[1:2] != b"\x00":
-                        raise RuntimeError("SOCKS5 认证被拒绝")
-                hb = host.encode()
-                raw.sendall(bytes([0x05, 0x01, 0x00, 0x03, len(hb)]) + hb + port.to_bytes(2, "big"))
-                rep = raw.recv(4)
-                if len(rep) < 2 or rep[1] != 0x00:
-                    raise RuntimeError(f"CONNECT 被拒绝 rep={rep[1] if len(rep) > 1 else '?'}")
-                raw.recv(256)  # 丢掉绑定地址
-        except Exception:
-            try:
-                raw.close()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-    else:
-        raw = _socket.create_connection((host, port), timeout=timeout)
-
+    raw = _proxy_tunnel_socket(host, port, proxy=proxy, timeout=timeout)
     try:
         with ctx.wrap_socket(raw, server_hostname=host) as ss:
             return hashlib.sha256(ss.getpeercert(binary_form=True)).hexdigest()
@@ -561,6 +590,54 @@ def _peer_cert_sha256(host, port, proxy=None, timeout=15):
             raw.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def proxy_exit_ip(proxy, timeout=15):
+    """查代理的出口 IP；查不到返回 None。
+
+    为什么不能用 Camoufox 自带的 geoip=True：它内部 public_ip()（camoufox/ip.py）
+    对 6 个查询地址全是 HTTPS 且**硬编码 verify=True**，经 MITM 代理时证书校验必然
+    失败，于是 launch 阶段直接抛 InvalidIP「Failed to get IP address」，整个渠道连
+    浏览器都开不起来（2026-09-15 实测就是这么挂的）。
+
+    这里自己查、不校验证书，再把 IP 字符串交给 geoip 参数 —— camoufox/utils.py
+    只在 `geoip is True` 时才自己去查，传字符串就跳过那一步。
+    """
+    import re as _re
+    import ssl as _ssl
+
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    for host in ("api.ipify.org", "checkip.amazonaws.com", "icanhazip.com"):
+        raw = None
+        try:
+            raw = _proxy_tunnel_socket(host, 443, proxy=proxy, timeout=timeout)
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                ss.sendall(
+                    f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                    f"User-Agent: {UA}\r\nConnection: close\r\n\r\n".encode()
+                )
+                buf = b""
+                while len(buf) < 8192:
+                    chunk = ss.recv(2048)
+                    if not chunk:
+                        break
+                    buf += chunk
+            # 正文可能是 chunked（大小前缀是十六进制，不会被下面的正则误认成 IP）
+            body = buf.split(b"\r\n\r\n", 1)[-1].decode(errors="replace")
+            m = _re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", body)
+            if m:
+                return m.group(1)
+        except Exception:  # noqa: BLE001
+            continue
+        finally:
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    return None
 
 
 def proxy_is_safe(proxy, host, direct_fp, port=443):
