@@ -327,15 +327,45 @@ async function httpConnect(writer, reader, p, targetHost, targetPort) {
 }
 
 /**
+ * 裸 TCP 探一下端口活着没（不做 TLS、不发任何数据）。
+ *
+ * 只用来给 https 代理的失败定性：TLS 握手挂掉之后，端口本身通不通决定了
+ * 这是「代理死了」还是「Worker 校验不了它的证书」——两者的结论完全相反。
+ */
+async function tcpReachable(connect, host, port, timeoutMs) {
+  let socket;
+  try {
+    socket = connect({ hostname: host, port });
+    const opened = socket.opened;
+    // 运行时没有 opened 就别猜：宁可回落到通用报错，也不谎报「端口可达」
+    if (!opened) return false;
+    await Promise.race([
+      opened,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      await socket?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
  * 通过代理建连到目标，验证握手是否成功。
  *
  * 只做到隧道建立为止 —— 这已足以证明「代理活着且愿意转发到目标」。
  * 不在这里发 HTTP 请求，免得把 TLS/证书问题混进"代理是否连通"的判断
  * （本机踩过：curl rc=60 是证书问题，不是代理不通）。
  *
- * 返回 { ok, ms, error, scheme, authUsed, browserUsable }。
+ * 返回 { ok, ms, error, scheme, authUsed, browserUsable, certUntrusted }。
  * browserUsable：Chromium 能否真的用这条代理 —— socks5 带认证时为 false
  * （Chromium 不支持 SOCKS5 认证），http/https 带认证仍可用。
+ * certUntrusted：见下面 catch 里的说明，专指「端口通但 Worker 校验不了证书」。
  */
 export async function testProxy(
   url,
@@ -387,7 +417,31 @@ export async function testProxy(
       browserUsable: isSocks(p.scheme) ? authUsed === "none" : true,
     };
   } catch (err) {
-    return { ok: false, ms: Date.now() - started, scheme: p.scheme, error: friendlyError(err) };
+    const ms = Date.now() - started;
+    // https 代理失败要分清两件事，否则结论正好相反：
+    //   端口不通         → 代理真的失效了
+    //   端口通、TLS 挂了 → 多半是证书问题，代理本身好着
+    //
+    // Workers 的 connect() 对 secureTransport:"on" **强制校验证书且没有任何跳过
+    // 手段**（没有 rejectUnauthorized 这类选项），而公开 https 代理的证书几乎都是
+    // 自签、或证书里的名字与代理 IP 不匹配。2026-09-15 实测池里那 4 条全是
+    // "IP address mismatch"，但它们的 CONNECT 全部正常返回 200，GHA 侧也确实在用。
+    //
+    // 差别在于 GHA 侧自己做 TLS、不校验代理那一跳的证书（见 browser-checkin.py 的
+    // https_proxy_relay），所以 Worker 测不通 ≠ 浏览器通道用不了。旧代码把这种
+    // 失败一律报成「地址/端口不通，或该代理已失效」，两个原因都不成立。
+    if (p.scheme === "https" && (await tcpReachable(connect, p.host, p.port, timeoutMs))) {
+      return {
+        ok: false,
+        ms,
+        scheme: p.scheme,
+        certUntrusted: true,
+        error:
+          "端口可达，但 Worker 校验不了该代理自己的 TLS 证书（Workers 的 socket 不支持跳过校验）。" +
+          "这不等于代理不可用：浏览器通道自己完成到代理的 TLS，通常仍能用。",
+      };
+    }
+    return { ok: false, ms, scheme: p.scheme, error: friendlyError(err) };
   } finally {
     try {
       await socket?.close();

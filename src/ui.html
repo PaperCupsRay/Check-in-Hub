@@ -1809,7 +1809,11 @@
               : "该代理需要认证但凭证未通过";
             tag = `<span class="tag warn" title="${escapeHtml(why)}">通但浏览器不可用</span>`;
           } else if (chk.ok) tag = `<span class="tag ok">连通 ${chk.ms}ms</span>`;
-          else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
+          // 证书校验不过 ≠ 代理失效：Workers 的 socket 不能跳过校验，而浏览器通道
+          // 自己完成到代理的 TLS，这类代理通常仍能用。标成 warn，别让它看起来像挂了。
+          else if (chk.certUntrusted) {
+            tag = `<span class="tag warn" title="${escapeHtml(chk.error || "")}">证书本地校验不了</span>`;
+          } else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
         }
         if (p.enabled === false) tag = `<span class="tag off">已停用</span>` + tag;
         const err = chk && !chk.ok && chk.error
@@ -1892,10 +1896,16 @@
         });
         await loadProxies();
         renderProxies(data.results || []);
-        log(`代理测试完成：${data.message || ""}`, data.okCount ? "ok" : "err");
-        showToast("代理测试完成", data.message || "", data.browserUsable ? "ok" : "warn", 5000);
+        // certUntrusted 不算失败（Worker 校验不了代理自己的证书而已），
+        // 所以判断整体成败时要把它算进「不是错」的那一边，否则全是这类代理时
+        // 面板会通报一片红，而它们在浏览器通道其实能用。
+        const certUn = (data.results || []).filter((r) => r.certUntrusted).length;
+        const anyGood = data.okCount || certUn;
+        log(`代理测试完成：${data.message || ""}`, anyGood ? "ok" : "err");
+        showToast("代理测试完成", data.message || "", data.browserUsable || certUn ? "ok" : "warn", 5000);
         for (const r of data.results || []) {
-          if (!r.ok) log(`  ✗ ${r.url} → ${r.error || "失败"}`, "err");
+          if (r.certUntrusted) log(`  ⚠ ${r.url} → ${r.error || "证书本地校验不了"}`, "warn");
+          else if (!r.ok) log(`  ✗ ${r.url} → ${r.error || "失败"}`, "err");
           else log(`  ✓ ${r.url} → ${r.ms}ms${r.browserUsable === false ? "（SOCKS 认证，Chromium 用不了）" : ""}`, "ok");
         }
       } catch (e) {

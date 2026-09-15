@@ -609,6 +609,10 @@ async function handleProxiesTest(request, env) {
       ms: r.ms ?? null,
       authUsed: r.authUsed || null,
       browserUsable: r.browserUsable ?? null,
+      // 「端口通但 Worker 校验不了证书」要单独记：GHA 侧据此把它当「未测过」而不是
+      // 「测失败」排序（见 browser-checkin.py 的 fetch_proxies），否则面板测一遍
+      // 反而把真正能用的 https 代理排到最后。
+      certUntrusted: r.certUntrusted === true ? true : null,
       error: r.error || null,
       at,
     };
@@ -620,17 +624,21 @@ async function handleProxiesTest(request, env) {
   }
   const okCount = results.filter((x) => x.r.ok).length;
   const usable = results.filter((x) => x.r.ok && x.r.browserUsable).length;
+  const certUntrusted = results.filter((x) => x.r.certUntrusted).length;
   return json({
     ok: true,
     count: results.length,
     okCount,
     browserUsable: usable,
+    certUntrusted,
     message:
       `连通 ${okCount}/${results.length}` +
       (okCount ? `，浏览器通道可用 ${usable} 个` : "") +
       // 只有 SOCKS 会出现「连通但浏览器用不了」（Chromium 不支持 SOCKS 认证）；
       // HTTP(S) 的凭证 Chromium 能用，不该被算进这一类。
-      (okCount > usable ? `；${okCount - usable} 个连通但需 SOCKS 认证，Chromium 用不了` : ""),
+      (okCount > usable ? `；${okCount - usable} 个连通但需 SOCKS 认证，Chromium 用不了` : "") +
+      // 这一类不是失败：Worker 校验不了代理自己的证书而已，浏览器通道通常能用
+      (certUntrusted ? `；${certUntrusted} 个证书本地校验不了（浏览器通道可能仍可用）` : ""),
     results: results.map(({ entry, r }) => ({
       url: maskProxyUrl(entry.url),
       ok: r.ok,
@@ -638,6 +646,7 @@ async function handleProxiesTest(request, env) {
       scheme: r.scheme || null,
       authUsed: r.authUsed || null,
       browserUsable: r.browserUsable ?? null,
+      certUntrusted: r.certUntrusted === true ? true : null,
       error: r.error || null,
     })),
   });

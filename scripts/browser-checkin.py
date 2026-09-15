@@ -538,8 +538,19 @@ def fetch_proxies():
             log(f"  ⏭️ 跳过 {mask_proxy(url)}（实测强制 SOCKS 认证，Chromium 用不了）")
             continue
         url = proxy_url_for_browser(url)
-        # 面板测过的：连通的排前面，同为连通的按延迟升序；没测过的排中间
-        rank = (0 if chk.get("ok") else 1 if chk.get("ok") is None else 2, chk.get("ms") or 9999)
+        # 面板测过的：连通的排前面，同为连通的按延迟升序；没测过的排中间。
+        #
+        # certUntrusted 不算「测失败」：那只是面板（Worker）校验不了代理自己的
+        # TLS 证书 —— Workers 的 socket 不支持跳过校验。而我们这边自己做 TLS、
+        # 根本不看那张证书（见 https_proxy_relay），所以它对我们照样可用。
+        # 按「未测过」排，别让面板测一遍就把真正能用的 https 代理压到最后。
+        if chk.get("ok"):
+            tier = 0
+        elif chk.get("ok") is None or chk.get("certUntrusted"):
+            tier = 1
+        else:
+            tier = 2
+        rank = (tier, chk.get("ms") or 9999)
         out.append((rank, url))
     out.sort(key=lambda x: x[0])
     return [u for _, u in out]
