@@ -999,7 +999,6 @@ async def click_site_checkin(page):
                 ok.sort((a, b) => rank(a) - rank(b));
                 return ok[0] || null;
             };
-            };
             window.__hubFindCheckin = find;
             const el = find();
             if (!el) return { found: false };
