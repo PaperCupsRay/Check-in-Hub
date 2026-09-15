@@ -166,6 +166,19 @@ ENGINE = (os.environ.get("CHECKIN_ENGINE") or "camoufox").strip().lower()
 # 本机装的 Camoufox 内核版本可能与 pip 包要求的不一致（会触发每次启动都去 GitHub
 # 下载）。指到已装的 camoufox 可执行文件即可跳过下载；GHA 上留空走标准安装。
 CAMOUFOX_EXECUTABLE = os.environ.get("CAMOUFOX_EXECUTABLE") or None
+# 明知代理在解密 TLS 也照用（人工 dispatch 时显式打开，默认关）。
+#
+# 打开它意味着什么：MITM 代理递自签证书、能看到明文，本次签到用到的渠道 Cookie /
+# 访问令牌会整个泄露给代理运营方；同时浏览器必须跟着忽略证书错误，否则页面根本打不开
+# （ERR_CERT_AUTHORITY_INVALID）。用完请去站点改密码 / 换令牌。
+#
+# 为什么做成开关而不是直接删掉校验：每日 cron 会跑全部渠道，默认放行等于让所有渠道
+# 长期裸奔。这里保持「默认拦、单次放行」，cron 不受影响。
+ALLOW_MITM_PROXY = (os.environ.get("CHECKIN_ALLOW_MITM_PROXY") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 def is_camoufox():
@@ -254,7 +267,11 @@ async def browser_page(proxy=None, window=(1366, 768)):
         async with AsyncCamoufox(**opts) as browser:
             # 不要显式传 viewport：beta.29 + Playwright≥1.61 会 Protocol error
             # (Browser.setDefaultViewport)，而 Camoufox 本就按指纹生成 screen。
-            page = await browser.new_page()
+            # ignore_https_errors 只在显式允许 MITM 代理时才开：那种代理递自签证书，
+            # 不忽略就连页面都打不开（ERR_CERT_AUTHORITY_INVALID）。
+            page = await browser.new_page(
+                ignore_https_errors=bool(proxy and ALLOW_MITM_PROXY)
+            )
             yield patch_main_world(page)
         return
 
@@ -268,7 +285,10 @@ async def browser_page(proxy=None, window=(1366, 768)):
     )
     try:
         context = await browser.new_context(
-            viewport={"width": window[0], "height": window[1]}, user_agent=UA
+            viewport={"width": window[0], "height": window[1]},
+            user_agent=UA,
+            # MITM 代理递的是自签证书，不忽略就直接 ERR_CERT_AUTHORITY_INVALID 打不开页面
+            ignore_https_errors=bool(proxy and ALLOW_MITM_PROXY),
         )
         yield await context.new_page()
     finally:
@@ -1497,13 +1517,29 @@ async def main():
                 if len(safe) >= MAX_PROXY_TRIES:
                     break
             elif "解密 TLS" in reason:
-                log(f"  🚨 拒用 {mask_proxy(p)}：{reason}——凭证会泄露给代理运营方")
+                if ALLOW_MITM_PROXY:
+                    # 显式开关下照用。日志写足：事后要能查出「哪个渠道的凭证在哪个
+                    # 出口上暴露过」，否则这个开关就成了无痕的后门。
+                    safe.append(p)
+                    log(
+                        f"  ⚠️ 仍使用 {mask_proxy(p)}：{reason}"
+                        "——CHECKIN_ALLOW_MITM_PROXY 已开启，本次凭证会明文经过代理"
+                        "运营方，跑完请更换该渠道的密码/访问令牌"
+                    )
+                    if len(safe) >= MAX_PROXY_TRIES:
+                        break
+                else:
+                    log(f"  🚨 拒用 {mask_proxy(p)}：{reason}——凭证会泄露给代理运营方")
             else:
+                # 连不上/探测失败的代理，开关也救不了，照旧跳过
                 log(f"  ⏭️ 跳过 {mask_proxy(p)}：{reason}")
         if not safe:
-            log("⚠️ 代理池中没有一个通过 TLS 校验，本次只能直连（Turnstile 站预期拿不到 token）")
+            log("⚠️ 代理池中没有一个可用，本次只能直连（Turnstile 站预期拿不到 token）")
         else:
-            log(f"通过 TLS 校验的代理 {len(safe)} 个")
+            log(
+                f"可用代理 {len(safe)} 个"
+                + ("（含解密 TLS 的，已按开关放行）" if ALLOW_MITM_PROXY else "（均通过 TLS 校验）")
+            )
     else:
         log("代理池为空，仅直连（Turnstile 站可能拿不到 token）")
 

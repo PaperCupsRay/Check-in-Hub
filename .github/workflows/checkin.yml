@@ -111,6 +111,12 @@ jobs:
           CHECKIN_NAMES: ${{ github.event_name == 'repository_dispatch' && join(github.event.client_payload.names, ',') || '' }}
           # gha_api 失败渠道清单（api job 的 artifact），供 browser job 降级重试
           API_FALLBACK_LIST: "api-artifact/gha-fallback.json"
+          # 明知代理在解密 TLS 也照用（client_payload.allow_mitm=true 时开启，默认关）。
+          # 打开后本次签到的渠道 Cookie / 访问令牌会明文经过代理运营方，浏览器也会
+          # 跟着忽略证书错误。仅用于「机房 IP 拿不到 Turnstile token、手上只有 MITM
+          # 代理」的人工排查；跑完请更换该渠道的密码 / 访问令牌。
+          # 每日 cron 不传这个字段，所以常规调度仍然保持「发现解密就拒用」。
+          CHECKIN_ALLOW_MITM_PROXY: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.allow_mitm || '' }}
         run: python scripts/browser-checkin.py
 
       - name: Upload results
