@@ -231,7 +231,103 @@ def patch_main_world(page):
 
 
 @contextlib.asynccontextmanager
+async def https_proxy_relay(proxy):
+    """把 https:// 上游代理包成一个本地**明文** http 代理，产出 http://127.0.0.1:<port>。
+
+    为什么必须有这一层：这批开放 https 代理自己的证书全都不可信（证书里的名字与
+    代理 IP 不匹配，或签发者未知）。而 Firefox 对**代理那一跳**的证书错误不提供任何
+    绕过手段 —— ignore_https_errors 只作用于页面，代理握手失败照样 SEC_ERROR_UNKNOWN
+    （2026-09-15 实测：开关开与不开，报的是同一个错）。
+
+    于是由我们自己完成到上游的 TLS：
+        浏览器 → 本地明文 http 代理（回环）→ 我们做 TLS → 上游 https 代理 → 目标站
+    浏览器只看到一个普通的 http 代理，不参与上游那一跳的证书判断。
+
+    安全性不因此打折：防 MITM 的闸门是 proxy_is_safe() 的证书指纹比对，它比的是
+    **目标站**的证书，与代理这一跳自己的证书可信度是两件事。上游若在解密 TLS，
+    目标站指纹照样对不上，照样会被拒用。
+    """
+    scheme, cred, phost, pport = split_proxy(proxy)
+    pport = int(pport or 443)
+
+    async def handle(reader, writer):
+        up_w = None
+        try:
+            # 浏览器发来的第一行是 CONNECT host:port（https 目标）或 GET http://...
+            head = await reader.readuntil(b"\r\n\r\n")
+            # 上游代理的证书不可信（这正是要中继的原因），这里刻意不校验
+            up_r, up_w = await asyncio.open_connection(
+                phost, pport, ssl=_tls_ctx(), server_hostname=phost
+            )
+            if cred:
+                import base64
+
+                # 浏览器不知道上游要认证，凭证由我们补进去
+                basic = base64.b64encode(cred.encode()).decode()
+                head = head[:-2] + f"Proxy-Authorization: Basic {basic}\r\n\r\n".encode()
+            up_w.write(head)
+            await up_w.drain()
+
+            async def pump(r, w):
+                try:
+                    while True:
+                        chunk = await r.read(65536)
+                        if not chunk:
+                            break
+                        w.write(chunk)
+                        await w.drain()
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    try:
+                        w.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            await asyncio.gather(pump(reader, up_w), pump(up_r, writer))
+        except Exception:  # noqa: BLE001
+            # 单条连接失败不该拖垮整个中继：浏览器开很多条连接，坏一条它会自己重试
+            for w in (writer, up_w):
+                if w is None:
+                    continue
+                try:
+                    w.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.close()
+        try:
+            await server.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@contextlib.asynccontextmanager
 async def browser_page(proxy=None, window=(1366, 768)):
+    """开浏览器并交出 page；https:// 代理先经本地中继（见 https_proxy_relay）。
+
+    中继对下游是完全透明的：出口 IP 自查、geoip、页面流量都照原样走，
+    只是浏览器看到的是 http://127.0.0.1:<port> 而不是那个证书不可信的上游。
+    """
+    if proxy and split_proxy(proxy)[0] == "https":
+        async with https_proxy_relay(proxy) as local:
+            log(f"  🔀 {mask_proxy(proxy)} 经本地中继（浏览器不信任该代理自己的证书）")
+            # geoip 查询要走**上游**代理，不能走中继：proxy_exit_ip() 是同步阻塞的，
+            # 经中继就等于在事件循环里等自己（中继 accept 不到连接），必然超时。
+            async with _browser_page_raw(local, window, geoip_proxy=proxy) as page:
+                yield page
+        return
+    async with _browser_page_raw(proxy, window) as page:
+        yield page
+
+
+@contextlib.asynccontextmanager
+async def _browser_page_raw(proxy=None, window=(1366, 768), geoip_proxy=None):
     """开一个浏览器并交出一个 page，退出时保证关闭。
 
     proxy 传字符串（socks5://host:port 或 http://user:pass@host:port）；
@@ -264,19 +360,23 @@ async def browser_page(proxy=None, window=(1366, 768)):
             opts["proxy"] = camoufox_proxy(proxy)
             # 按代理出口 IP 推地理位置/时区，避免「德州 IP + 上海时区」这种矛盾指纹。
             #
-            # 不能无条件用 geoip=True：Camoufox 的 public_ip() 硬编码 verify=True，
-            # 经 MITM 代理时证书校验失败 → launch 直接抛 InvalidIP，浏览器都开不起来。
-            # 所以放行 MITM 的场合自己查 IP（不校验证书）再把字符串传进去；
-            # 实在查不到就干脆不传 geoip —— 指纹一致性打点折扣，但至少能跑起来。
-            if ALLOW_MITM_PROXY:
-                ip = proxy_exit_ip(proxy)
-                if ip:
-                    opts["geoip"] = ip
-                    log(f"  🌐 代理出口 IP {ip}（自查，用于 geoip）")
-                else:
-                    log("  ⚠️ 查不到代理出口 IP，本次不传 geoip（时区/地理可能与出口 IP 矛盾）")
+            # 出口 IP 一律自己查，不用 geoip=True。Camoufox 的 public_ip()
+            # （camoufox/ip.py）用 requests 且硬编码 verify=True，对我们这两类代理
+            # 都会失败，而失败是在 launch 阶段抛 InvalidIP —— 浏览器根本开不起来：
+            #   MITM 代理     证书校验过不去（2026-09-15 实测 gorouter1 挂在这）
+            #   https:// 代理  requests 不做 TLS-in-TLS，报 Unable to connect to proxy
+            # proxy_exit_ip() 自己搬密文、不校验证书，这两类都能查（见 _TlsInTls）。
+            # 实在查不到就干脆不传 geoip —— 指纹一致性打点折扣，但至少能跑起来，
+            # 比 launch 直接崩掉强。
+            # 必须放线程：这是同步阻塞调用，直接 await 不了。走 https 中继时事件循环
+            # 正在跑那个中继 server，在循环里同步阻塞会让中继永远 accept 不到连接 ——
+            # 症状是 IP 查不到（耗满重试）+ 随后导航超时（2026-09-15 实测踩过）。
+            ip = await asyncio.to_thread(proxy_exit_ip, geoip_proxy or proxy)
+            if ip:
+                opts["geoip"] = ip
+                log(f"  🌐 代理出口 IP {ip}（自查，用于 geoip）")
             else:
-                opts["geoip"] = True
+                log("  ⚠️ 查不到代理出口 IP，本次不传 geoip（时区/地理可能与出口 IP 矛盾）")
         async with AsyncCamoufox(**opts) as browser:
             # 不要显式传 viewport：beta.29 + Playwright≥1.61 会 Protocol error
             # (Browser.setDefaultViewport)，而 Camoufox 本就按指纹生成 screen。
