@@ -114,6 +114,7 @@ async function runOne(channel, runner) {
       runner,
       message: r.message || (r.ok ? "ok" : "failed"),
       httpStatus: r.httpStatus ?? null,
+      needsBrowser: !!r.needsBrowser,
       quotaInfo: qi,
       ms: Date.now() - started,
     };
@@ -144,6 +145,36 @@ function payloadNames() {
     if (Array.isArray(n) && n.length) return n.map(String);
   } catch {}
   return null;
+}
+
+/**
+ * 反向请求面板触发浏览器通道（只带这批渠道）。
+ *
+ * 用于「本次 run 不带 browser job」的场景：那时 gha-fallback.json 没人接手，
+ * api 侧再失败也传不出去，渠道会一直漏签到浏览器通道能解为止。
+ */
+async function dispatchBrowserFallback(names) {
+  if (!HUB || !PASSWORD) {
+    console.log(`无处转交浏览器通道（缺 HUB_BASE_URL / HUB_ACCESS_PASSWORD）: ${names.join("、")}`);
+    return;
+  }
+  try {
+    const auth = await hubLogin();
+    const headers = { "Content-Type": "application/json", "User-Agent": UA };
+    if (auth?.token) headers.Authorization = `Bearer ${auth.token}`;
+    if (auth?.cookie) headers.Cookie = auth.cookie;
+    const res = await fetch(`${HUB}/api/gh/dispatch`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ runners: ["gha_browser"], names }),
+    });
+    const data = await res.json().catch(() => ({}));
+    console.log(
+      `已请求面板触发浏览器通道（${names.join("、")}）: HTTP ${res.status} ${data.message || data.error || ""}`
+    );
+  } catch (e) {
+    console.log(`触发浏览器通道失败: ${e.message || e}`);
+  }
 }
 
 async function main() {
@@ -190,6 +221,17 @@ async function main() {
   fs.writeFileSync("gha-fallback.json", JSON.stringify(retryable, null, 2));
   if (retryable.length) {
     console.log(`降级到 browser 通道: ${retryable.join("、")}`);
+  }
+
+  // 本次 run 里没有 browser job（payload 只给了 gha_api）时，上面那份 fallback 清单没有
+  // 人接手：由本 job 反向请求面板再派一次浏览器通道，否则「只有浏览器能解」的失败
+  // （登录接口要 Turnstile / WAF）只会一直失败到当天漏签 —— 2026-09-24「林夕」就是这样。
+  if (!new Set(runners).has("gha_browser")) {
+    const needBrowser = [...new Set(results.filter((r) => !r.ok && r.needsBrowser).map((r) => r.name))];
+    if (needBrowser.length) {
+      console.log(`需要浏览器通道: ${needBrowser.join("、")}`);
+      await dispatchBrowserFallback(needBrowser);
+    }
   }
 
   await report(results);

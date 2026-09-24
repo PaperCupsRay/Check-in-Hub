@@ -187,6 +187,22 @@ curl -X POST https://<your-worker>/api/cron/run \
   -H "X-Cron-Secret: your-secret"
 ```
 
+### 降级与 token 过期自愈
+
+渠道签到按 `worker → gha_api / gha_browser` 降级，token 过期优先在本地自愈：
+
+- **Worker 直连**失败后看适配器结论：sub2api 站 accessToken 过期会自动
+  `refreshToken` 换新 → 不行再账密重新登录 → 用新 token 重试签到；成功就完全不降级
+  （文案分别标「刷新 token 后签到」「重新登录后签到」）；
+- 两条回退都拿不到 token 时，**原因会写进面板文案**（旧版只透传站点原文，
+  看起来像「根本没尝试重新登录」）：
+  `Token has expired（accessToken 已过期或失效；刷新失败：invalid refresh token；账密登录失败：turnstile verification failed）`；
+- 若失败形态是「登录接口本身要求人机验证（Turnstile）/ WAF」，换出口无解：适配器会标
+  `needsBrowser`，Worker 直接把它降级到**浏览器通道**（不再浪费一次注定失败的 gha_api 运行）；
+- `gha_api` 侧同理：本次 run 没带 browser job 时，`scripts/gha-checkin.mjs` 会反向请求
+  面板补触发一次浏览器通道，否则这类渠道当天就漏签。
+
+
 ---
 
 ## 🧩 扩展新渠道

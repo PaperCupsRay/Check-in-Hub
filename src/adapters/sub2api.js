@@ -165,6 +165,50 @@ const AUTH_VIA_LABEL = {
   relogin: "重新登录后签到：",
 };
 
+/**
+ * 鉴权是否失效（token 过期 / 未授权）。
+ *
+ * 判据三条任一成立：HTTP 401、业务码 401、或回话里出现 token/过期/未授权字样。
+ * 文案匹配这一条不能省：sub2api 变体常把过期写成 HTTP 200 +
+ * code:"TOKEN_EXPIRED"（k40 实测），只看状态码就会漏判，明明能回退刷新也不回退。
+ */
+function authExpired(result) {
+  if (!result || result.ok) return false;
+  const code = String(result?.raw?.code ?? "");
+  if (result?.httpStatus === 401 || code === "401" || /TOKEN_EXPIRED|UNAUTHORIZED/i.test(code)) {
+    return true;
+  }
+  return /unauthor|token|session|expired|过期|失效|登录/i.test(String(result?.message || ""));
+}
+
+/** 只有真实浏览器能过的门槛：登录接口自己要求人机验证 / WAF（换多少出口都没用） */
+const BROWSER_ONLY_RE = /turnstile|人机|challenge|cloudflare|cf-|waf|拦截/i;
+
+/**
+ * 刷新与重新登录都拿不到新 token 时，把「试了什么、为什么不行」拼进 message。
+ *
+ * 旧实现直接返回原始失败（例如只有一句 "Token has expired"），看不出回退链其实跑过，
+ * 面板上读起来像「根本没尝试重新登录」。同时按失败原因标 needsBrowser —— 登录要求
+ * 人机验证这类失败纯 HTTP 换多少出口都过不去，只能转浏览器通道（见 src/index.js 的
+ * 降级路由）。k40（林夕）2026-09-24 实测就是这一形态：accessToken 过期、
+ * refreshToken 失效（REFRESH_TOKEN_INVALID）、登录回 TURNSTILE_VERIFICATION_FAILED。
+ */
+function annotateAuthFailure(result, { auth, refreshMsg, loginMsg }) {
+  const details = [auth.accessToken ? "accessToken 已过期或失效" : "没有 accessToken"];
+  if (auth.refreshToken) details.push(`刷新失败：${refreshMsg || "未知原因"}`);
+  else details.push("没有 refreshToken，无法刷新");
+  if (auth.email && auth.password) details.push(`账密登录失败：${loginMsg || "未知原因"}`);
+  else details.push("没有账密，无法重新登录");
+  const browserOnly = BROWSER_ONLY_RE.test(`${refreshMsg} ${loginMsg}`);
+  const base = String(result?.message || "鉴权失败").trim();
+  return {
+    ...result,
+    message: `${base}（${details.join("；")}）`.slice(0, 400),
+    authFallback: { refreshFailed: refreshMsg || null, reloginFailed: loginMsg || null },
+    ...(browserOnly ? { needsBrowser: true } : {}),
+  };
+}
+
 export const sub2apiAdapter = {
   id: "sub2api",
   name: "Sub2API",
@@ -290,56 +334,69 @@ export const sub2apiAdapter = {
    *   refresh token 失效，用 refreshToken 换新后重试
    *   relogin token 失效且刷新不可用/失败，重新账密登录后重试
    * 签到日志据此写明「直接签到」还是「登录后签到」——只看 success 分不出这点。
+   *
+   * 回退链失败的两种形态要分清（旧实现把两者都压成一句原始报错，读不出发生过什么）：
+   *   · 换到新 token 后重试仍失败 → 标出「已用新 token 重试」；
+   *   · 刷新 / 重登都拿不到 token → 带上各自原因，并按是否只有浏览器能解标 needsBrowser。
    */
   async withAuthRetry(channel, runner) {
-    let ensured = await this.ensureToken(channel);
+    const ensured = await this.ensureToken(channel);
     if (!ensured.ok) return { ok: false, message: ensured.message, raw: ensured.raw };
 
     let result = await runner(ensured.accessToken, ensured.refreshed ? "login" : "token");
     // 只有失败的结果才谈得上「鉴权失效」。成功结果一律不重试：否则成功文案里出现
     // 「登录」「token」等字样（如「登录后签到：…」）会被误判成 401，触发第二次
     // POST /api/v1/check-in —— 重复签到请求，且第二次通常报「今日已签到」覆盖真实奖励。
-    const unauthorized =
-      !result?.ok &&
-      (result?.httpStatus === 401 ||
-        result?.raw?.code === 401 ||
-        /unauthor|token|session|登录/i.test(String(result?.message || "")));
-
-    if (unauthorized) {
-      const auth = pickAuth(channel);
-      let nextToken = null;
-      let tokens = null;
-      let retryVia = null;
-      if (auth.refreshToken) {
-        const refreshed = await this.refresh({
-          ...channel,
-          auth: { ...channel.auth, refreshToken: auth.refreshToken },
-        });
-        if (refreshed.ok) {
-          nextToken = refreshed.tokens.accessToken;
-          tokens = refreshed.tokens;
-          retryVia = "refresh";
-        }
-      }
-      if (!nextToken && auth.email && auth.password) {
-        const login = await this.login({
-          ...channel,
-          auth: { ...channel.auth, accessToken: "", refreshToken: auth.refreshToken },
-        });
-        if (login.ok) {
-          nextToken = login.tokens.accessToken;
-          tokens = login.tokens;
-          retryVia = "relogin";
-        }
-      }
-      if (nextToken) {
-        result = await runner(nextToken, retryVia);
-        result.tokens = tokens;
-      }
-    } else if (ensured.tokens) {
-      result.tokens = ensured.tokens;
+    if (!authExpired(result)) {
+      if (ensured.tokens) result.tokens = ensured.tokens;
+      return result;
     }
-    return result;
+
+    // 鉴权失效：先 refreshToken 换新，不行再账密重新登录；两条都拿不到 token 才算失败
+    const auth = pickAuth(channel);
+    let nextToken = null;
+    let tokens = null;
+    let retryVia = null;
+    let refreshMsg = "";
+    let loginMsg = "";
+    if (auth.refreshToken) {
+      const refreshed = await this.refresh({
+        ...channel,
+        auth: { ...channel.auth, refreshToken: auth.refreshToken },
+      });
+      if (refreshed.ok) {
+        nextToken = refreshed.tokens.accessToken;
+        tokens = refreshed.tokens;
+        retryVia = "refresh";
+      } else {
+        refreshMsg = String(refreshed.message || "");
+      }
+    }
+    if (!nextToken && auth.email && auth.password) {
+      const login = await this.login({
+        ...channel,
+        auth: { ...channel.auth, accessToken: "", refreshToken: auth.refreshToken },
+      });
+      if (login.ok) {
+        nextToken = login.tokens.accessToken;
+        tokens = login.tokens;
+        retryVia = "relogin";
+      } else {
+        loginMsg = String(login.message || "");
+      }
+    }
+    if (nextToken) {
+      result = await runner(nextToken, retryVia);
+      result.tokens = tokens;
+      // 新 token 仍被拒：说明问题不在 token，别让日志看着像「回退没跑」
+      if (!result.ok) {
+        result.message = `${result.message || "失败"}（已用${
+          retryVia === "refresh" ? "刷新" : "重新登录"
+        }得到的 token 重试）`;
+      }
+      return result;
+    }
+    return annotateAuthFailure(result, { auth, refreshMsg, loginMsg });
   },
 
   async me(channel) {

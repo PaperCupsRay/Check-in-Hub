@@ -168,8 +168,13 @@ function ghFallbackAvailable(env) {
   return !!(env.GH_TOKEN && env.GH_REPO);
 }
 
-// 换出口也不会成功的失败（凭证缺失/接口不存在/类型配错）不降级，避免浪费 Actions 运行
+// 换出口也不会成功的失败（凭证缺失/接口不存在/类型配错）不降级，避免浪费 Actions 运行。
+// 例外见下面的 browserOnly：适配器明确标了 needsBrowser 时以它为准，文案里的「需要」
+// 不该把「恰好只有浏览器能解」的失败拦在降级之外。
 const PERMANENT_FAIL_RE = /缺少|需要|未配置|不存在|404|无可用|未知渠道|不支持/;
+
+/** 浏览器通道能兜住的渠道类型（对应 scripts/browser-checkin.py 的两条流程） */
+const BROWSER_CAPABLE = new Set(["sub2api", "newapi"]);
 
 async function tryWorkerCheckin(channel) {
   try {
@@ -182,11 +187,12 @@ async function tryWorkerCheckin(channel) {
 /**
  * 批量签到降级核心（runScheduled / handleBatch / 单渠道共用）。
  *
- * 每个渠道按 worker → gha_api → gha_browser 降级：
+ * 每个渠道按 worker → gha_api / gha_browser 降级：
  * - options.runner = gha_api / gha_browser 的渠道：站点已知封 CF IP 或需浏览器，
  *   跳过注定失败的 worker 直连，直接按配置通道分发；
  * - worker 渠道：Worker 出口真实请求一次（这本身就是 token 有效性验证），
- *   失败且非永久性错误 → 降级 gha_api；
+ *   失败且非永久性错误 → 降级；适配器标了 needsBrowser 的失败（登录要 Turnstile/WAF，
+ *   纯 HTTP 换出口无解）直接进 gha_browser 组，其余进 gha_api 组；
  * - 全部收集完再按通道各发一次 dispatch（一次 workflow run 承载整组渠道，
  *   避免逐渠道分发造成 N 次运行 N 份报告）；gha_api 内失败的渠道由
  *   gha-checkin.mjs 写 fallback 清单转交同次运行的 browser job。
@@ -220,18 +226,28 @@ async function batchCheckinCore(items, env) {
     }
 
     const result = await tryWorkerCheckin(channel);
-    if (!result.ok && canFallback && !PERMANENT_FAIL_RE.test(String(result.message || ""))) {
-      if (!groups.has("gha_api")) groups.set("gha_api", []);
-      const reason = String(result.message || "").slice(0, 80) || "worker 直连失败";
-      groups.get("gha_api").push({ item, reason, tokens: result.tokens || null });
+    // 需要浏览器才能过的失败（登录接口要 Turnstile / WAF）直接进浏览器通道：这类失败
+    // 换出口没用，而 gha_api 与 Worker 跑的是同一份纯 HTTP 适配器，分发过去只会再失败
+    // 一次。2026-09-24「林夕」实测：worker 与 gha_api 双失败，浏览器通道根本没被触发。
+    const browserOnly = !!result.needsBrowser && BROWSER_CAPABLE.has(channel.type);
+    const permanent = !browserOnly && PERMANENT_FAIL_RE.test(String(result.message || ""));
+    if (!result.ok && canFallback && !permanent) {
+      const target = browserOnly ? "gha_browser" : "gha_api";
+      if (!groups.has(target)) groups.set(target, []);
+      // 适配器的回退说明（刷新/重登失败原因）就在 message 里，别截得太短以致丢失原因
+      const reason = String(result.message || "").slice(0, 180) || "worker 直连失败";
+      groups.get(target).push({ item, reason, tokens: result.tokens || null });
       out.push({
         item,
-        via: "gha_api",
+        via: target,
         result: {
           ok: true,
           degraded: true,
           tokens: result.tokens || null,
-          message: `worker 失败（${reason}），已降级 GitHub Actions（结果回传后更新）`,
+          ...(browserOnly ? { needsBrowser: true } : {}),
+          message: `worker 失败（${reason}），已降级 GitHub Actions · ${
+            target === "gha_browser" ? "浏览器通道" : "纯 HTTP 通道"
+          }（结果回传后更新）`,
         },
       });
       continue;
