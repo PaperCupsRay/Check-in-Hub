@@ -168,21 +168,58 @@ const AUTH_VIA_LABEL = {
 /**
  * 鉴权是否失效（token 过期 / 未授权）。
  *
- * 判据三条任一成立：HTTP 401、业务码 401、或回话里出现 token/过期/未授权字样。
- * 文案匹配这一条不能省：sub2api 变体常把过期写成 HTTP 200 +
- * code:"TOKEN_EXPIRED"（k40 实测），只看状态码就会漏判，明明能回退刷新也不回退。
+ * 判据：HTTP 401、业务码命中 401/TOKEN_EXPIRED/INVALID_TOKEN/UNAUTHORIZED，或回话是
+ * 明确的「token/会话失效」措辞。
+ *
+ * 文案兜底**刻意收窄**：裸的 token / 登录 / 失效 会把「账号需连续登录 3 天才能签到」
+ * 「Token 额度不足」「活动已失效」这类业务失败也算成鉴权失效 —— 于是白跑一次 refresh +
+ * 账密登录 + 第二次 POST /api/v1/check-in，而第二次通常回「今日已签到」，反而把真实奖励
+ * 文案覆盖掉（历史事故，见下面「成功不重试」那段注释）。k40 实测的
+ * HTTP 200 + code:"TOKEN_EXPIRED" 由 code 判据覆盖，不依赖文案。
  */
+const AUTH_FAIL_RE =
+  /unauthoriz|invalid[_\s-]?token|token[_\s-]*(?:has[_\s-]*)?expired|token\s*(?:已)?(?:过期|失效|无效)|jwt|session\s*(?:expired|invalid|失效|过期)|未授权|未登录|请先登录|重新登录|登录已?(?:过期|失效)/i;
+
 function authExpired(result) {
   if (!result || result.ok) return false;
   const code = String(result?.raw?.code ?? "");
-  if (result?.httpStatus === 401 || code === "401" || /TOKEN_EXPIRED|UNAUTHORIZED/i.test(code)) {
+  if (
+    result?.httpStatus === 401 ||
+    code === "401" ||
+    /TOKEN_EXPIRED|INVALID_TOKEN|UNAUTHORIZED/i.test(code)
+  ) {
     return true;
   }
-  return /unauthor|token|session|expired|过期|失效|登录/i.test(String(result?.message || ""));
+  return AUTH_FAIL_RE.test(String(result?.message || ""));
 }
 
-/** 只有真实浏览器能过的门槛：登录接口自己要求人机验证 / WAF（换多少出口都没用） */
-const BROWSER_ONLY_RE = /turnstile|人机|challenge|cloudflare|cf-|waf|拦截/i;
+/**
+ * 「只有真实浏览器能解」的信号：接口自己要求人机验证，或站点回的是 CF / 阿里云 WAF 挑战页。
+ *
+ * inspectRaw=true 时连原始响应体一起看 —— WAF 挑战页是 HTML，readJson 会把它塞进 raw.raw，
+ * 此时 message 只剩「登录失败 HTTP 403」这种无信息文案，光看文案会漏判。
+ * 默认只看文案：普通 CF 拦截（比如签到 POST 被挡）仍应先去 gha_api 换出口试，
+ * 不该一律跳去更重的浏览器通道。
+ */
+const BROWSER_ONLY_RE =
+  /turnstile|人机|challenge|just a moment|attention required|cdn-cgi|acw_sc__v2|acw_tc|enable javascript and cookies/i;
+
+function browserOnlySignal(result, { inspectRaw = false } = {}) {
+  if (!result || result.ok) return false;
+  if (BROWSER_ONLY_RE.test(String(result.message || ""))) return true;
+  if (!inspectRaw) return false;
+  try {
+    return BROWSER_ONLY_RE.test(JSON.stringify(result.raw || ""));
+  } catch {
+    return false;
+  }
+}
+
+/** 失败结果若带「只有浏览器能解」的信号，补 needsBrowser，供 src/index.js 的降级路由 */
+function withBrowserHint(result) {
+  if (!result || result.ok || result.needsBrowser) return result;
+  return browserOnlySignal(result) ? { ...result, needsBrowser: true } : result;
+}
 
 /**
  * 刷新与重新登录都拿不到新 token 时，把「试了什么、为什么不行」拼进 message。
@@ -193,20 +230,27 @@ const BROWSER_ONLY_RE = /turnstile|人机|challenge|cloudflare|cf-|waf|拦截/i;
  * 降级路由）。k40（林夕）2026-09-24 实测就是这一形态：accessToken 过期、
  * refreshToken 失效（REFRESH_TOKEN_INVALID）、登录回 TURNSTILE_VERIFICATION_FAILED。
  */
-function annotateAuthFailure(result, { auth, refreshMsg, loginMsg }) {
+function annotateAuthFailure(result, { auth, refreshMsg, loginMsg, browserOnly = false }) {
   const details = [auth.accessToken ? "accessToken 已过期或失效" : "没有 accessToken"];
   if (auth.refreshToken) details.push(`刷新失败：${refreshMsg || "未知原因"}`);
   else details.push("没有 refreshToken，无法刷新");
   if (auth.email && auth.password) details.push(`账密登录失败：${loginMsg || "未知原因"}`);
   else details.push("没有账密，无法重新登录");
-  const browserOnly = BROWSER_ONLY_RE.test(`${refreshMsg} ${loginMsg}`);
   const base = String(result?.message || "鉴权失败").trim();
-  return {
+  const annotated = {
     ...result,
     message: `${base}（${details.join("；")}）`.slice(0, 400),
     authFallback: { refreshFailed: refreshMsg || null, reloginFailed: loginMsg || null },
-    ...(browserOnly ? { needsBrowser: true } : {}),
   };
+  return browserOnly ? { ...annotated, needsBrowser: true } : withBrowserHint(annotated);
+}
+
+/** 失败文案带上业务码里的 reason：变体常只给 reason 不给 message（REFRESH_TOKEN_INVALID 等） */
+function failureMessage(data, fallback) {
+  const msg = String(data?.message || data?.detail || "").trim();
+  const reason = String(data?.reason || "").trim();
+  if (msg && reason && !msg.includes(reason)) return `${msg}（${reason}）`;
+  return msg || reason || fallback;
 }
 
 export const sub2apiAdapter = {
@@ -263,7 +307,7 @@ export const sub2apiAdapter = {
     if (res.status >= 400 || data.code !== 0) {
       return {
         ok: false,
-        message: data.message || data.detail || `登录失败 HTTP ${res.status}`,
+        message: failureMessage(data, `登录失败 HTTP ${res.status}`),
         raw: data,
       };
     }
@@ -295,7 +339,7 @@ export const sub2apiAdapter = {
     if (res.status >= 400 || data.code !== 0) {
       return {
         ok: false,
-        message: data.message || `刷新失败 HTTP ${res.status}`,
+        message: failureMessage(data, `刷新失败 HTTP ${res.status}`),
         raw: data,
       };
     }
@@ -341,15 +385,24 @@ export const sub2apiAdapter = {
    */
   async withAuthRetry(channel, runner) {
     const ensured = await this.ensureToken(channel);
-    if (!ensured.ok) return { ok: false, message: ensured.message, raw: ensured.raw };
+    if (!ensured.ok) {
+      // ensureToken 自己就失败（渠道只配账密、没有 accessToken 时走这条）：同样要把
+      // 「登录为什么不行」写清并标 needsBrowser —— 否则「登录要 Turnstile」的渠道会被
+      // 误降到注定再失败一次的 gha_api，浏览器通道永远轮不到。
+      return annotateAuthFailure(
+        { ok: false, message: ensured.message, raw: ensured.raw },
+        { auth: pickAuth(channel), refreshMsg: "", loginMsg: ensured.message || "" }
+      );
+    }
 
     let result = await runner(ensured.accessToken, ensured.refreshed ? "login" : "token");
     // 只有失败的结果才谈得上「鉴权失效」。成功结果一律不重试：否则成功文案里出现
     // 「登录」「token」等字样（如「登录后签到：…」）会被误判成 401，触发第二次
     // POST /api/v1/check-in —— 重复签到请求，且第二次通常报「今日已签到」覆盖真实奖励。
     if (!authExpired(result)) {
+      // 签到接口自己要求人机验证（message 含 turnstile 之类）也算「只有浏览器能解」
       if (ensured.tokens) result.tokens = ensured.tokens;
-      return result;
+      return withBrowserHint(result);
     }
 
     // 鉴权失效：先 refreshToken 换新，不行再账密重新登录；两条都拿不到 token 才算失败
@@ -359,6 +412,7 @@ export const sub2apiAdapter = {
     let retryVia = null;
     let refreshMsg = "";
     let loginMsg = "";
+    let authGatedByBrowser = false;
     if (auth.refreshToken) {
       const refreshed = await this.refresh({
         ...channel,
@@ -370,6 +424,7 @@ export const sub2apiAdapter = {
         retryVia = "refresh";
       } else {
         refreshMsg = String(refreshed.message || "");
+        if (browserOnlySignal(refreshed, { inspectRaw: true })) authGatedByBrowser = true;
       }
     }
     if (!nextToken && auth.email && auth.password) {
@@ -383,6 +438,7 @@ export const sub2apiAdapter = {
         retryVia = "relogin";
       } else {
         loginMsg = String(login.message || "");
+        if (browserOnlySignal(login, { inspectRaw: true })) authGatedByBrowser = true;
       }
     }
     if (nextToken) {
@@ -394,9 +450,13 @@ export const sub2apiAdapter = {
           retryVia === "refresh" ? "刷新" : "重新登录"
         }得到的 token 重试）`;
       }
-      return result;
+      return withBrowserHint(result);
     }
-    return annotateAuthFailure(result, { auth, refreshMsg, loginMsg });
+    // 两条回退都拿不到 token；ensureToken 阶段登录得到的 tokens 也要带上，供面板写回持久化
+    return annotateAuthFailure(
+      ensured.tokens && !result.tokens ? { ...result, tokens: ensured.tokens } : result,
+      { auth, refreshMsg, loginMsg, browserOnly: authGatedByBrowser }
+    );
   },
 
   async me(channel) {

@@ -235,7 +235,7 @@ async function batchCheckinCore(items, env) {
       const target = browserOnly ? "gha_browser" : "gha_api";
       if (!groups.has(target)) groups.set(target, []);
       // 适配器的回退说明（刷新/重登失败原因）就在 message 里，别截得太短以致丢失原因
-      const reason = String(result.message || "").slice(0, 180) || "worker 直连失败";
+      const reason = String(result.message || "").slice(0, 400) || "worker 直连失败";
       groups.get(target).push({ item, reason, tokens: result.tokens || null });
       out.push({
         item,

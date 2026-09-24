@@ -30,6 +30,9 @@ const HEADLESS = (process.env.CHECKIN_HEADLESS || "true") !== "false";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
+/** 浏览器通道能兜住的渠道类型（与 scripts/browser-checkin.py 的两条流程一致） */
+const BROWSER_TYPES = new Set(["sub2api", "newapi"]);
+
 function payloadRunners() {
   // repository_dispatch payload 通过 GITHUB_EVENT_PATH 传入
   try {
@@ -110,6 +113,7 @@ async function runOne(channel, runner) {
       : null;
     return {
       name: channel.name,
+      type: channel.type,
       ok: !!r.ok,
       runner,
       message: r.message || (r.ok ? "ok" : "failed"),
@@ -154,15 +158,18 @@ function payloadNames() {
  * api 侧再失败也传不出去，渠道会一直漏签到浏览器通道能解为止。
  */
 async function dispatchBrowserFallback(names) {
-  if (!HUB || !PASSWORD) {
-    console.log(`无处转交浏览器通道（缺 HUB_BASE_URL / HUB_ACCESS_PASSWORD）: ${names.join("、")}`);
+  if (!HUB) {
+    console.log(`无处转交浏览器通道（缺 HUB_BASE_URL）: ${names.join("、")}`);
     return;
   }
   try {
-    const auth = await hubLogin();
-    const headers = { "Content-Type": "application/json", "User-Agent": UA };
-    if (auth?.token) headers.Authorization = `Bearer ${auth.token}`;
-    if (auth?.cookie) headers.Cookie = auth.cookie;
+    // 面板开了访问密码就用无状态头，省掉一次登录往返（也避开 set-cookie 的脆弱解析）；
+    // 面板没开密码时这个头无所谓，照发。
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": UA,
+      ...(PASSWORD ? { "X-Access-Password": PASSWORD } : {}),
+    };
     const res = await fetch(`${HUB}/api/gh/dispatch`, {
       method: "POST",
       headers,
@@ -187,6 +194,10 @@ async function main() {
   console.log(`本次通道: ${runners.join(", ")}${names ? ` | 指定渠道: ${names.join("、")}` : " | 全部"}`);
 
   const channels = await fetchChannels();
+  // 反向补触发浏览器通道时要一并带上的渠道名（见文件末尾的说明）
+  const ghaBrowserNames = channels
+    .filter((c) => (c.options?.runner || "worker") === "gha_browser")
+    .map((c) => c.name);
   // 精确分发（降级链）按 names 选渠道，并把其执行通道视为请求的主通道——
   // 渠道配置的 runner 是「常规调度」的归属，降级请求本身已决定用哪条通道。
   // 常规触发（无 names）仍按渠道配置的 runner 过滤。
@@ -223,18 +234,36 @@ async function main() {
     console.log(`降级到 browser 通道: ${retryable.join("、")}`);
   }
 
+  await report(results);
+
   // 本次 run 里没有 browser job（payload 只给了 gha_api）时，上面那份 fallback 清单没有
   // 人接手：由本 job 反向请求面板再派一次浏览器通道，否则「只有浏览器能解」的失败
   // （登录接口要 Turnstile / WAF）只会一直失败到当天漏签 —— 2026-09-24「林夕」就是这样。
+  //
+  // 放在 report 之后：反向触发的 run 与本 run 同属一个 concurrency group，先写完自己的
+  // 结果再派，免得新 run 的结果先落 KV、又被本次这份旧内容覆盖。
+  //
+  // names 要带上本通道（gha_browser）自己的渠道：GitHub 同 group 会取消「仍在 pending」
+  // 的旧 run，万一正好挤掉每日 cron 的浏览器 run，带上它们才不会漏签（代价是那几个
+  // 渠道会重复跑一次，站点一般回「今日已签到」，无害）。
   if (!new Set(runners).has("gha_browser")) {
-    const needBrowser = [...new Set(results.filter((r) => !r.ok && r.needsBrowser).map((r) => r.name))];
+    const needBrowser = [
+      ...new Set(
+        results
+          .filter((r) => !r.ok && r.needsBrowser && BROWSER_TYPES.has(r.type))
+          .map((r) => r.name)
+      ),
+    ];
     if (needBrowser.length) {
-      console.log(`需要浏览器通道: ${needBrowser.join("、")}`);
-      await dispatchBrowserFallback(needBrowser);
+      const names = [...new Set([...needBrowser, ...ghaBrowserNames])];
+      console.log(
+        `需要浏览器通道: ${needBrowser.join("、")}` +
+          (ghaBrowserNames.length ? `（同时带上本通道渠道：${ghaBrowserNames.join("、")}）` : "")
+      );
+      await dispatchBrowserFallback(names);
     }
   }
 
-  await report(results);
   fs.writeFileSync("gha-results.json", JSON.stringify(results, null, 2));
 }
 

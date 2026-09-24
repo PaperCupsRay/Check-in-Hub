@@ -272,6 +272,7 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
+| `npm test` | 鉴权回退 / 降级路由的离线回归测试（mock fetch，不联网） |
 
 ---
 
