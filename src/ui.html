@@ -115,13 +115,20 @@
     .proxy-panel textarea { min-height: 96px; }
     .proxy-results { display: grid; gap: 6px; margin-top: 10px; }
     .proxy-row {
+      min-width: 0;
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
       font-size: .82rem; font-family: var(--mono);
       background: #0c1528; border: 1px solid var(--border);
       border-radius: 10px; padding: 8px 10px;
     }
-    .proxy-row .addr { color: #bfdbfe; word-break: break-all; }
-    .proxy-row .note { color: var(--muted); font-family: var(--sans); }
+    .proxy-row .addr {
+      min-width: 0; max-width: 100%; color: #bfdbfe;
+      word-break: break-all; overflow-wrap: anywhere;
+    }
+    .proxy-row .note {
+      min-width: 0; max-width: 100%; color: var(--muted);
+      font-family: var(--sans); overflow-wrap: anywhere; word-break: break-word;
+    }
     .proxy-row .spacer { flex: 1; }
     .toolbar {
       display: grid;
@@ -140,8 +147,9 @@
       .toolbar { grid-template-columns: 1fr; }
       .filters { grid-template-columns: 1fr; }
     }
-    .list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 12px; }
     .channel {
+      min-width: 0;
       border: 1px solid var(--border);
       background: #0c1528;
       border-radius: 14px;
@@ -158,6 +166,7 @@
       display: flex; gap: 10px; align-items: flex-start; justify-content: space-between;
       min-width: 0;
     }
+    .channel .top > div:first-child { flex: 1 1 auto; min-width: 0; }
     .channel .enable-wrap {
       flex-shrink: 0;
       display: flex;
@@ -213,15 +222,34 @@
     .channel .quota {
       margin-top: 8px; font-size: .82rem; color: #bfdbfe;
       font-family: var(--mono); line-height: 1.45;
+      max-width: 100%; overflow-wrap: anywhere;
     }
     .channel .result-detail {
       margin-top: 8px; font-size: .8rem; color: #cbd5e1;
       line-height: 1.45; word-break: break-word;
+      max-width: 100%; overflow-wrap: anywhere;
     }
-    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .tags {
+      display: flex; flex-wrap: wrap; align-items: flex-start;
+      gap: 6px; margin-top: 8px; min-width: 0;
+    }
     .tag {
-      font-size: .75rem; padding: 3px 8px; border-radius: 999px;
+      display: inline-block;
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 100%;
+      font-size: .75rem; line-height: 1.35;
+      padding: 3px 8px;
+      border-radius: 10px;
       background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .tag.compact {
+      flex: 0 0 auto;
+      white-space: nowrap;
+      border-radius: 999px;
     }
     .tag.ok { background: #052e16; color: #86efac; border-color: #166534; }
     .tag.warn { background: #422006; color: #fde68a; border-color: #a16207; }
@@ -259,6 +287,7 @@
     }
     #authGate.show { display: flex; }
     #authGate .box {
+      min-width: 0;
       width: min(420px, 100%);
       background: linear-gradient(180deg, var(--panel), var(--panel2));
       border: 1px solid var(--border);
@@ -267,9 +296,14 @@
       padding: 22px;
     }
     #authGate h2 { margin: 0 0 6px; font-size: 1.2rem; }
-    #authGate .desc { color: var(--muted); font-size: .9rem; margin-bottom: 14px; line-height: 1.45; }
+    #authGate .desc {
+      min-width: 0; max-width: 100%; color: var(--muted);
+      font-size: .9rem; margin-bottom: 14px; line-height: 1.45;
+      overflow-wrap: anywhere; word-break: break-word;
+    }
     #authGate .err {
-      display: none; margin-top: 10px; color: #fecaca; font-size: .85rem;
+      display: none; min-width: 0; max-width: 100%; margin-top: 10px;
+      color: #fecaca; font-size: .85rem; overflow-wrap: anywhere; word-break: break-word;
       background: #450a0a; border: 1px solid #991b1b; border-radius: 10px; padding: 8px 10px;
     }
     #authGate .err.show { display: block; }
@@ -349,11 +383,12 @@
     .toast {
       pointer-events: auto;
       width: fit-content;
+      min-width: 0;
       max-width: 100%;
       background: rgba(15, 23, 42, .88);
       border: 1px solid rgba(148, 163, 184, .28);
       box-shadow: 0 12px 40px rgba(0, 0, 0, .35);
-      border-radius: 999px;
+      border-radius: 16px;
       padding: 10px 18px;
       color: var(--text);
       backdrop-filter: blur(10px);
@@ -366,11 +401,15 @@
       flex-direction: column;
       align-items: center;
       gap: 2px;
+      overflow-wrap: anywhere;
     }
     .toast.ok { border-color: rgba(34, 197, 94, .45); background: rgba(6, 40, 22, .9); }
     .toast.err { border-color: rgba(248, 113, 113, .5); background: rgba(69, 10, 10, .9); }
     .toast.warn { border-color: rgba(251, 191, 36, .45); background: rgba(66, 32, 6, .9); }
-    .toast .title { font-weight: 700; }
+    .toast .title, .toast .desc {
+      min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .toast .desc { color: #cbd5e1; font-size: .8rem; max-width: min(46ch, 100%); }
     .toast .desc { color: #cbd5e1; font-size: .8rem; max-width: 46ch; }
     @keyframes toastIn {
       from { opacity: 0; transform: translateY(-10px) scale(.98); }
@@ -1284,14 +1323,24 @@
         const last = ch.lastResult;
         const enabled = isChannelEnabled(ch);
         const quotaText = formatQuotaLine(ch.type, ch.quotaInfo);
-        let tag = `<span class="tag">未运行</span>`;
+        let tag = `<span class="tag compact">未运行</span>`;
+        const resultText = String(last?.summary || last?.short || "").trim();
         if (last) {
-          const short = last.short || last.summary || (last.ok ? "成功" : "失败");
-          if (last.ok) tag = `<span class="tag ok">${escapeHtml(actionLabel(last.action || "") + (last.action ? " · " : "") + short)}</span>`;
-          else tag = `<span class="tag err">${escapeHtml(actionLabel(last.action || "") + (last.action ? " · " : "") + short)}</span>`;
+          const rawShort = String(last.short || "").trim();
+          const short =
+            rawShort &&
+            rawShort !== resultText &&
+            rawShort.length <= 28 &&
+            !/https?:\/\//i.test(rawShort)
+              ? rawShort
+              : last.ok
+                ? "成功"
+                : "失败";
+          const statusText = `${actionLabel(last.action || "")}${last.action ? " · " : ""}${short}`;
+          tag = `<span class="tag ${last.ok ? "ok" : "err"}">${escapeHtml(statusText)}</span>`;
         }
         if (!enabled) {
-          tag = `<span class="tag off">未启用</span>` + tag;
+          tag = `<span class="tag compact off">未启用</span>` + tag;
         }
         if (quotaText) {
           tag += `<span class="tag quota">${escapeHtml(quotaText)}</span>`;
@@ -1302,10 +1351,10 @@
         const RUNNER_LABEL = { worker: "Worker", gha_api: "GHA·API", gha_browser: "GHA·浏览器" };
         const runner = runnerOf(ch);
         if (runner !== "worker") {
-          tag += `<span class="tag" title="签到通过 GitHub Actions 执行">${RUNNER_LABEL[runner]}</span>`;
+          tag += `<span class="tag compact" title="签到通过 GitHub Actions 执行">${RUNNER_LABEL[runner]}</span>`;
         }
-        const detail = last?.summary
-          ? `<div class="result-detail">${escapeHtml(last.summary)}</div>`
+        const detail = resultText
+          ? `<div class="result-detail">${escapeHtml(resultText)}</div>`
           : "";
         const quotaBlock = quotaText
           ? `<div class="quota">${escapeHtml(quotaText)}</div>`
