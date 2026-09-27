@@ -1223,22 +1223,74 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
             pass
 
 
+def auth_headers_js(token):
+    """页内 fetch 用的凭证头（只给 Bearer）。
+
+    New-Api-User 故意不在这里拼：它是 NewAPI 系的强制头，而它的值就是
+    localStorage.user.id —— 我们进页面时已经写好了。所以由下面各处的 JS 在
+    页面里自己补（JSFUNC_MERGE_AUTH），跟站点前端发请求的方式一致，也省得给
+    每个函数加 user_id 参数。
+    """
+    return json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+
+
+# 页内合并凭证头：Bearer 由 Python 侧给，New-Api-User 从 localStorage.user.id 取。
+# 没有 id 就保持原样（cookie 模式的站不受影响）。
+JSFUNC_MERGE_AUTH = """
+            const __h = JSON.parse(headersJs || '{}');
+            try {
+                const __u = JSON.parse(localStorage.getItem('user') || 'null');
+                if (__u && __u.id != null) __h['New-Api-User'] = String(__u.id);
+            } catch (e) {}
+"""
+
+
+async def seed_localstorage_auth(page, token, user_id):
+    """把凭证写进 localStorage，让 NewAPI 系的前端**渲染成已登录**。
+
+    为什么非写不可：/console/personal 这类页面靠 localStorage 判登录态，没登录就
+    把我们甩到登录页，签到控件根本不存在（2026-09-27 星见雅线上就是这么失败的，
+    报「没找到签到控件」）。
+
+    为什么必须写 **id**：前端判登录读的是 localStorage.user，而 New-Api-User 请求头
+    就是从 user.id 取的（站点 bundle 实测）。旧写法只写 {token} 没有 id，前端照样
+    判定未登录。注意这跟「没配 Cookie」无关：星见雅那条 server_name_session 早已
+    401（实测 Unauthorized, not logged in），而 access token 一直有效，是白送的路。
+    """
+    if not (token or user_id):
+        return
+    await page.evaluate(
+        """([t, uid]) => { try {
+             if (t) localStorage.setItem('token', t);
+             const prev = (() => { try { return JSON.parse(localStorage.getItem('user') || 'null') || {}; } catch (e) { return {}; } })();
+             const id = uid != null && uid !== '' ? Number(uid) : prev.id;
+             localStorage.setItem('user', JSON.stringify({
+               ...prev,
+               ...(t ? { token: t } : {}),
+               ...(id != null && !Number.isNaN(id) ? { id } : {}),
+             }));
+           } catch(e) {} }""",
+        [token, user_id],
+    )
+
+
 async def inpage_checkin(page, token, ts_token):
     """页面内 fetch /api/user/checkin，返回 {status, body}。
 
     ts_token 为 None 时不带 turnstile 参数 —— 站点两段式流程的第一枪就是这么发的，
     同时也是「服务端是否真强制 Turnstile」的探针。
     """
-    auth = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+    auth = auth_headers_js(token)
     return await page.evaluate(
-        """async ([ts, headersJs]) => {
+        ("""async ([ts, headersJs]) => {
+            MERGE_AUTH
             const url = '/api/user/checkin' + (ts ? '?turnstile=' + encodeURIComponent(ts) : '');
             const res = await fetch(url, {
-                method: 'POST', credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+                method: 'POST', credentials: 'include', headers: __h,
             });
             let body = null; try { body = await res.json(); } catch (e) {}
             return { status: res.status, body };
-        }""",
+        }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
         [ts_token, auth],
     )
 
@@ -1250,18 +1302,19 @@ async def attach_quota(page, result, token):
     面板就少一项额度（src/index.js 会合并 quotaInfo）。
     """
     try:
-        headers_js = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+        headers_js = auth_headers_js(token)
         # 必须设上限：/api/user/self 在慢代理上若卡住，会把一次**已经成功**的签到
         # 拖到 CHANNEL_BUDGET_S 超时，报成 ❌「超时」并再触发换代理重试。
         me = await asyncio.wait_for(
             page.evaluate(
-                """async (headersJs) => {
+                ("""async (headersJs) => {
+                    MERGE_AUTH
                     const res = await fetch('/api/user/self', {
-                        credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+                        credentials: 'include', headers: __h,
                     });
                     let b = null; try { b = await res.json(); } catch(e) {}
                     return b && b.data ? b.data : null;
-                }""",
+                }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
                 headers_js,
             ),
             timeout=15,
@@ -1386,18 +1439,19 @@ async def inpage_checkin_status(page, token, tz="Asia/Shanghai"):
     站点前端和我们在抢同一个 token —— 它先 POST 就把 token 消费掉了，我们那一枪必然报
     「校验失败」，可奖励其实已经发下来了。光看 POST 的回话分不清这两种，只有状态查询能定论。
     """
-    auth = json.dumps({"Authorization": f"Bearer {token}"} if token else {})
+    auth = auth_headers_js(token)
     # 必须设上限：状态查询悬挂会把这枪很可能已经发奖的尝试拖成 ❌「超时」，而「超时」
     # 又匹配 RETRYABLE_VIA_PROXY，接着白烧一轮代理。超时按「不知道」处理（返回 None）。
     return await asyncio.wait_for(
         page.evaluate(
-            """async ([headersJs, tz]) => {
+            ("""async ([headersJs, tz]) => {
+                MERGE_AUTH
                 const fmt = new Intl.DateTimeFormat('en-CA', {
                     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
                 });
                 const ymd = fmt.format(new Date());
                 const r = await fetch('/api/user/checkin?month=' + encodeURIComponent(ymd.slice(0, 7)), {
-                    credentials: 'include', headers: JSON.parse(headersJs || '{}'),
+                    credentials: 'include', headers: __h,
                 });
                 let b = null; try { b = await r.json(); } catch (e) {}
                 // 与 newapi.js 的 normalizeStatus 一致：data 缺失时退回 payload 自身
@@ -1412,7 +1466,7 @@ async def inpage_checkin_status(page, token, tz="Asia/Shanghai"):
                     reward: rec ? (rec.quota_awarded ?? rec.quota ?? null) : null,
                     checkinCount: stats.checkin_count ?? stats.total_checkins ?? d.checkin_count ?? null,
                 };
-            }""",
+            }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
             [auth, tz],
         ),
         timeout=STATUS_QUERY_TIMEOUT_S,
@@ -1649,6 +1703,10 @@ async def checkin_one(channel, proxy=None) -> dict:
     auth = channel.get("auth") or {}
     cookie_raw = auth.get("cookie") or ""
     token = auth.get("token") or ""
+    # New-Api-User 是 NewAPI 系的**强制**头：只带 Bearer 会 401
+    # 「Unauthorized, New-Api-User header not provided」（new.xinjianya.top 实测）。
+    # 页内 fetch 的头一律从 localStorage.user.id 取，见 auth_headers_js。
+    user_id = str(auth.get("userId") or auth.get("newApiUser") or "").strip()
     # 时区只影响状态查询里的 month= 与「当天奖励」的匹配（是否已签到由服务端标志决定），
     # 但跨月/跨日时按站点自己的时区算才不会串天。与 worker 侧取同一个选项。
     tz = (channel.get("options") or {}).get("timezone") or "Asia/Shanghai"
@@ -1673,15 +1731,7 @@ async def checkin_one(channel, proxy=None) -> dict:
                 ]
             )
 
-        # localStorage token 鉴权（有 system access token 的站，登录态影响签到请求）
-        if token:
-            await page.evaluate(
-                """(t) => { try {
-                     localStorage.setItem('token', t);
-                     localStorage.setItem('user', JSON.stringify({ token: t }));
-                   } catch(e) {} }""",
-                token,
-            )
+        await seed_localstorage_auth(page, token, user_id)
 
         # 站点用 Google reCAPTCHA 时必须在这里分流。下面的 Turnstile 流程会先自挂
         # 组件死等 TOKEN_WAIT_S(45s) 才去探针，而 reCAPTCHA 站上 Turnstile 组件永远
