@@ -470,6 +470,13 @@
           <label>Turnstile SiteKey（仅浏览器通道；留空用 gorouter 默认）</label>
           <input id="tsSiteKey" placeholder="0x4AAAAAAELziOpg1Y2gFtAt" />
         </div>
+        <div>
+          <label>该站用 Google reCAPTCHA v2</label>
+          <div class="check-row" style="margin:0">
+            <input type="checkbox" id="rcCheck" />
+            <label for="rcCheck">勾选后强制走「点站点签到按钮 + 点勾选框」（留空则自动探测）</label>
+          </div>
+        </div>
       </div>
 
       <div class="check-row">
@@ -1027,6 +1034,14 @@
         delete channel.options.turnstileSiteKey;
         clearedKeys.push("options.turnstileSiteKey");
       }
+      // 只存一个标记而不是 sitekey：reCAPTCHA v2 的解法是驱动站点自己的 UI，
+      // 我们全程不挂组件、不接触 token，sitekey 没有用途。存一个用不上的 key
+      // 只会让人以为改了它就能生效。
+      if ($("rcCheck")?.checked) channel.options.recaptchaSiteKey = "1";
+      else {
+        delete channel.options.recaptchaSiteKey;
+        clearedKeys.push("options.recaptchaSiteKey");
+      }
       return channel;
     }
 
@@ -1040,6 +1055,7 @@
       if (rs) rs.value = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner) ? ch.options.runner : "worker";
       const tsk = $("tsSiteKey");
       if (tsk) tsk.value = ch.options?.turnstileSiteKey || "";
+      if ($("rcCheck")) $("rcCheck").checked = !!ch.options?.recaptchaSiteKey;
       if ($("channelEnabled")) $("channelEnabled").checked = isChannelEnabled(ch);
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");

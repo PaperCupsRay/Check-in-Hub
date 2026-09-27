@@ -282,6 +282,29 @@ function turnstileRejected(data) {
 }
 
 /**
+ * 站点用 Google reCAPTCHA（而非 Cloudflare Turnstile）时的拒绝判定。
+ *
+ * 与 turnstileRejected 分开写而不是并成一个正则：两者解法完全不同。Turnstile 能
+ * 自挂组件拿 token 再自己带 token POST；reCAPTCHA v2 的 token 与「哪个页面渲染的」
+ * 强绑定（服务端校验 origin），自挂 widget 拿到的 token 会被判低分，所以只能驱动
+ * 站点自己的 UI（scripts/browser-checkin.py 的 recaptcha_site_ui_checkin）。
+ * 文案若混成一句「人机校验」，会误导人去配 Turnstile sitekey。
+ *
+ * 实测形态（new.xinjianya.top，2026-09-27）：POST /api/user/checkin 不带 token →
+ * success:false 且 message 点名 recaptcha；带上 token 则 200 签到成功。
+ */
+function recaptchaRejected(data) {
+  const raw = responseTextHint(data);
+  if (!/recaptcha|g-recaptcha/i.test(raw)) return false;
+  return !/<!doctype html|<html[\s>]/i.test(raw);
+}
+
+const RECAPTCHA_GUIDE =
+  "该站用 Google reCAPTCHA v2 保护签到，纯 HTTP 通道产不出 token：必须真实浏览器点一次" +
+  "勾选框，且 token 与渲染它的页面 origin 绑定，不能自挂组件代劳。已转 GitHub Actions · " +
+  "浏览器通道，由脚本点站点自己的签到按钮与勾选框完成。";
+
+/**
  * 「未登录且未提供 access token」不代表服务端不读 Cookie。
  * 服务端先解 session，解不出才回退看 Authorization，两者都拿不到时报这一句。
  * 站点自身前端就是靠 Cookie(withCredentials) + New-Api-User 完成签到的，
@@ -324,6 +347,12 @@ function httpErrorMessage(action, res) {
       `Actions 的机房 IP 常静默不签发挑战（组件能渲染但永远等不到 token），` +
       `gorouter / SeekAi / JustDoWork 均已实测失败。只能用住宅 IP（本机或家宽 VPS）跑浏览器流程。`
     );
+  }
+  // reCAPTCHA 与 Turnstile 同样是「HTTP 200 + success:false」，也必须排在鉴权/CF
+  // 分支前面，否则会被误报成「Cookie 失效」，把一条换浏览器通道就能过的失败
+  // 引导去重配凭证。
+  if (recaptchaRejected(data)) {
+    return `${serverMsg || "reCAPTCHA 校验未通过"} · ${RECAPTCHA_GUIDE}`;
   }
   // 再判鉴权：应用层返回的 JSON 401 是凭证问题，跟 Cloudflare 无关，
   // 否则会被下面的 CF 分支误报成「出口 IP 不匹配」。
@@ -876,6 +905,10 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
+        // reCAPTCHA v2 换出口无解：纯 HTTP 通道无论从 Worker 还是 GHA 发出都拿不到
+        // token，标 needsBrowser 让 src/index.js 直接分发到 gha_browser，
+        // 省掉一次注定失败的 gha_api 运行。
+        ...(recaptchaRejected(data) ? { needsBrowser: true } : {}),
         result: normalized,
         status: preStatus,
         raw: data,
@@ -888,6 +921,7 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
+        ...(recaptchaRejected(data) ? { needsBrowser: true } : {}),
         result: normalized,
         status: preStatus,
         raw: data,

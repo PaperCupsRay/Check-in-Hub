@@ -102,6 +102,15 @@ function installFetch(scenario) {
     if (u.includes("/api/v1/check-in")) {
       return (headers.Authorization || "") === `Bearer ${OLD_ACCESS}` ? scenario.checkinOld() : scenario.checkinNew();
     }
+    // newapi 系（星见雅等）：状态查询与签到 POST 共用路径，靠 month= 区分。
+    // 状态查询回「今天还没签」，签到 POST 回站点的 reCAPTCHA 拒绝 —— 2026-09-27 实测形态。
+    if (u.includes("/api/user/checkin")) {
+      if (u.includes("month=")) return scenario.checkinStatusNewapi();
+      return scenario.checkinNewapi();
+    }
+    if (u.includes("/api/user/self")) {
+      return json(200, { success: true, data: { id: 1829, username: "u", quota: 1000 } });
+    }
     return json(404, { message: `unexpected url ${u}` });
   };
   return calls;
@@ -195,6 +204,36 @@ await scenario("普通 500 仍走 gha_api", { fetch: { checkinOld: () => json(50
   check("降级到 gha_api", via === "gha_api", `via=${via}`);
   check("dispatch 走纯 HTTP 通道", JSON.stringify(payloads[0]?.runners) === '["gha_api"]');
 });
+
+// 9) reCAPTCHA v2 站（星见雅）：纯 HTTP 通道产不出 token，必须直连浏览器通道。
+//    与第 7 条的 Turnstile 形态一样是「HTTP 200 + success:false」，最容易踩的坑是
+//    不标 needsBrowser → 被丢进 gha_api 再失败一次（纯 HTTP 换出口无解）。
+const RC_CHANNEL = {
+  id: "ch_rc",
+  name: "星见雅",
+  type: "newapi",
+  baseUrl: "https://new.xinjianya.top",
+  enabled: true,
+  auth: { cookie: "session=fake", userId: "1829" },
+  options: {},
+};
+await scenario(
+  "reCAPTCHA v2 拒绝签到 → 标 needsBrowser 并降级浏览器通道",
+  {
+    channel: RC_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, { success: true, data: { enabled: true, stats: { checked_in_today: false } } }),
+      checkinNewapi: () => json(200, { success: false, message: "recaptcha verification failed" }),
+    },
+  },
+  ({ result, via, payloads }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+    check("文案点名 reCAPTCHA", /reCAPTCHA/.test(result.message || ""), result.message);
+    check("dispatch 走浏览器通道", JSON.stringify(payloads[0]?.runners) === '["gha_browser"]');
+  }
+);
 
 console.log(`\n失败断言: ${failures}`);
 process.exit(failures ? 1 : 0);

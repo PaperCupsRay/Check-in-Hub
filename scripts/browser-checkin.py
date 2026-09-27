@@ -89,6 +89,10 @@ TOKEN_WAIT_S = 45
 # sub2api 站填表后站点会自己渲染 widget，通常 4s 内出 token；这段先等它，
 # 超了才自行挂载一个。
 NATIVE_WIDGET_BUDGET_S = 40
+# reCAPTCHA 渠道的墙钟预算：点按钮 + 等勾选框出现 + 反复点 + 轮询权威状态。
+# 比 TOKEN_WAIT_S 长，因为 reCAPTCHA 要等站点前端把 widget 渲染出来（可能好几秒），
+# 而且勾选框还可能被前端重建，得反复点。
+RECAPTCHA_BUDGET_S = int(os.environ.get("CHECKIN_RECAPTCHA_BUDGET_S") or 90)
 # 权威状态查询（GET /api/user/checkin?month=）的单次上限。它只在「POST 说不清」时才跑，
 # 但悬挂会把一次很可能已经发奖的尝试拖成 ❌超时，所以和 attach_quota 一样要有上限。
 STATUS_QUERY_TIMEOUT_S = 12
@@ -1436,6 +1440,151 @@ async def wait_any_token(page, budget_s):
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Google reCAPTCHA v2 渠道（new.xinjianya.top 等）
+# ---------------------------------------------------------------------------
+
+
+async def detect_recaptcha(page):
+    """页面上有没有 reCAPTCHA 的痕迹，返回来源标记（'' 表示没有）。
+
+    判据刻意与 Turnstile 不同：Turnstile 拿到 sitekey 就能自挂组件解题，而
+    reCAPTCHA v2 的 token 与**渲染它的那个页面**强绑定（服务端校验 origin），
+    自挂 widget 拿到的 token 会被判低分。所以这里只做**识别**，真正的解法一律走
+    「驱动站点自己的 UI」（recaptcha_site_ui_checkin）。
+
+    判据必须**强**，否则会误伤既有渠道：大量站点为了登录/注册就会加载 reCAPTCHA 的
+    api.js 并挂出 window.grecaptcha 全局，但它们的**签到接口根本不需要** token。
+    实测踩过：早先用「有 window.grecaptcha / 有 api.js 脚本」当判据，一个完全不含
+    reCAPTCHA 的普通页面也被判成 reCAPTCHA 站（window.grecaptcha 在同文档替换后
+    依然残留），于是所有渠道都被带去 UI 驱动分支。
+
+    所以只认两条硬证据：
+      iframe     页面上真的**渲染出了**勾选框（api2/anchor）—— 这也正是
+                 click_recaptcha_checkbox 唯一能点的对象；
+      api/status 服务端自己声明了 recaptcha_site_key / recaptcha_check。
+    两者都拿不到就返回 ''，交给后面的流程（探针回话点名 recaptcha 时仍会兜底分流）。
+    """
+    hit = await page.evaluate(
+        """async () => {
+            if ([...document.querySelectorAll('iframe')].some(el => (el.src || '').includes('/recaptcha/api2/')))
+                return 'iframe';
+            try {
+                const r = await fetch('/api/status', { credentials: 'include' });
+                const j = await r.json().catch(() => null);
+                const d = (j && j.data) || {};
+                if (d.recaptcha_site_key || d.recaptcha_sitekey || d.recaptcha_check) return 'api/status';
+            } catch (e) {}
+            return '';
+        }"""
+    )
+    return hit or ""
+
+
+async def click_recaptcha_checkbox(page, x_offset=30, y_ratio=0.5):
+    """点 reCAPTCHA v2 的「我不是机器人」勾选框，返回是否点到。
+
+    勾选框在 api2/anchor 这个**跨域 iframe** 内部，主世界拿不到它的 DOM，只能取
+    frame_element() 的包围盒按坐标点（与 click_challenge 同一套路）。
+    x_offset=30：anchor iframe 宽约 304px，勾选框中心在左侧 ~28px 处。
+
+    异常一律忽略：站点前端可能随时重建 widget，这一轮拿不到是常态，下一轮重试。
+    """
+    hit = False
+    for f in page.frames:
+        if "/recaptcha/api2/anchor" not in (f.url or ""):
+            continue
+        try:
+            el = await f.frame_element()
+            box = await el.bounding_box()
+            if box and box["width"] > 0 and box["height"] > 0:
+                x, y = box["x"] + x_offset, box["y"] + box["height"] * y_ratio
+                await page.mouse.move(x, y, steps=5)
+                await page.mouse.click(x, y)
+                hit = True
+        except Exception:  # noqa: BLE001
+            pass
+    return hit
+
+
+async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai"):
+    """用站点自己的 UI 过 reCAPTCHA 完成签到。
+
+    为什么不照抄 Turnstile 那套「自挂组件 + 我们自己带 token POST」：星见雅这类站的
+    v2 勾选框由**它自己的前端**渲染在 /console/personal 上，token 由站点前端
+    grecaptcha.getResponse() 取走再放进 ?recaptcha= 提交。实测请求形态：
+        POST /api/user/checkin?recaptcha=<2574 字符 token>   content-length: 0（无 body）
+        头：new-api-user: <id> + Cookie，无 Authorization
+    我们自挂 widget 的话，token 的 origin 与站点预期不一致会被判低分，而且字段名、
+    提交时机全靠猜。所以全程不接触 token：
+
+        打开站点页面 → 点它自己的签到按钮 → 点勾选框 → 轮询权威状态
+
+    站点前端拿到 token 就自己 POST，签到由它完成。
+    """
+    wait_until, nav_ms = nav_opts(None)
+    personal = base + "/console/personal"
+    log(f"  🌐 {name}: 打开 {personal}（reCAPTCHA 流程）")
+    try:
+        await page.goto(personal, wait_until=wait_until, timeout=nav_ms)
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ {name}: 打开个人页失败 {str(e)[:120]}")
+    await page.wait_for_timeout(2500)
+
+    # 先问权威状态：可能今天早就签过了 —— 那就不该再点按钮（点了也只会回「已签到」）
+    done = await confirm_checked_in(page, token, name, tz)
+    if done:
+        await attach_quota(page, done, token)
+        return done
+
+    hit = await click_site_checkin(page)
+    if not hit.get("found"):
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": False,
+            "message": (
+                f"reCAPTCHA 站：{personal} 上没找到签到控件"
+                f"（{hit.get('why') or '页面上没有'}），无法驱动 UI 过验证。"
+                "多半是渠道 Cookie 失效被跳到登录页，请重新复制 Cookie 与 New-Api-User。"
+            )[:300],
+        }
+    log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」")
+
+    # 站点前端接着弹 reCAPTCHA 勾选框。勾选框可能延迟出现、也可能被前端重建，
+    # 所以整个预算内反复「找 anchor iframe → 点一下 → 问一次权威状态」。
+    deadline = time.monotonic() + RECAPTCHA_BUDGET_S
+    clicks = 0
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(1500)
+        if await click_recaptcha_checkbox(page):
+            clicks += 1
+            log(f"  ☑️ {name}: 已点 reCAPTCHA 勾选框（第 {clicks} 次）")
+        # 勾完框站点前端才会去 POST；先给它一点时间，别在它提交前就下结论
+        await page.wait_for_timeout(1500)
+        done = await confirm_checked_in(page, token, name, tz)
+        if done:
+            done["message"] = f"{done['message']}（reCAPTCHA：点站点按钮+勾选框完成）"[:300]
+            await attach_quota(page, done, token)
+            return done
+
+    diag = await page.evaluate(
+        """() => ({
+            g: typeof window.grecaptcha,
+            frames: [...document.querySelectorAll('iframe')].map(f => f.src).filter(s => s && s.includes('recaptcha')),
+            body: document.body ? document.body.innerText.slice(0, 160) : '',
+        })"""
+    )
+    return {
+        "name": name,
+        "ok": False,
+        "message": (
+            f"reCAPTCHA 勾选框 {RECAPTCHA_BUDGET_S}s 内未完成（共点了 {clicks} 次）；"
+            f"页面诊断 {json.dumps(diag, ensure_ascii=False)[:220]}"
+        )[:300],
+    }
+
+
 async def checkin_one(channel, proxy=None) -> dict:
     """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。
 
@@ -1444,6 +1593,9 @@ async def checkin_one(channel, proxy=None) -> dict:
     挂载 Turnstile widget，再带 token 重发。所以页面上平时看不到组件；也所以那句
     「为空」是站点对**空 token** 的固定话术，不能读成「我们的 token 无效」。
     同一现象在 HTTP 通道侧记录于 src/adapters/newapi.js 的 turnstileRejected()。
+    星见雅这类站走的是另一条分支：页面检出 Google reCAPTCHA v2 时分流到
+    recaptcha_site_ui_checkin（点站点自己的按钮 + 点勾选框），因为它的 token 与
+    渲染页面绑定、不能自挂组件代劳，详见那个函数的文档字符串。
 
     proxy: 住宅 SOCKS5 出口（socks5://host:port，不能带凭证）。传入时整个
     浏览器的流量都走它——Turnstile 校验的是浏览器出口 IP，只有这样 CF 才肯
@@ -1488,6 +1640,21 @@ async def checkin_one(channel, proxy=None) -> dict:
                    } catch(e) {} }""",
                 token,
             )
+
+        # 站点用 Google reCAPTCHA 时必须在这里分流。下面的 Turnstile 流程会先自挂
+        # 组件死等 TOKEN_WAIT_S(45s) 才去探针，而 reCAPTCHA 站上 Turnstile 组件永远
+        # 不出 token —— 不分流的话每次都要白烧 45s 才轮得到真正的解法。
+        # 渠道显式配了 recaptchaSiteKey 时直接采信，不再探测（探测只是兜底）。
+        rc_hint = (channel.get("options") or {}).get("recaptchaSiteKey") or ""
+        rc_seen = ""
+        if not rc_hint:
+            try:
+                rc_seen = await detect_recaptcha(page)
+            except Exception as e:  # noqa: BLE001
+                log(f"  ⚠️ {name}: reCAPTCHA 探测异常 {str(e)[:100]}")
+        if rc_hint or rc_seen:
+            log(f"  🧩 {name}: 判定为 reCAPTCHA 站（{rc_seen or '渠道选项 recaptchaSiteKey'}），走站点 UI 驱动")
+            return await recaptcha_site_ui_checkin(page, name, base, token, tz)
 
         # 顺序很重要：先取权威 sitekey，再挂载一次。
         # （旧写法先用 gorouter 默认 key 挂载、事后 reset —— 但 reset 引用的 box id
@@ -1613,6 +1780,13 @@ async def checkin_one(channel, proxy=None) -> dict:
                 await attach_quota(page, res, token)
                 return res
             log(f"  🧪 {name}: 空 token POST 被拒（{pmsg or str(pb)[:100]}）")
+            # 兜底：前面的 detect_recaptcha 没认出这个站（首页无组件、/api/status 也没
+            # 挂 key），但空 token POST 的回话点名了 recaptcha —— 仍然按 reCAPTCHA 站
+            # 处理。不加这句的话它会掉进下面「与 Turnstile 无关」的分支被判成不可重试，
+            # 当天直接漏签。
+            if re.search(r"recaptcha|g-recaptcha", pmsg + str(pb)[:200], re.I):
+                log(f"  🧩 {name}: 探针回话点名 reCAPTCHA，改走站点 UI 驱动")
+                return await recaptcha_site_ui_checkin(page, name, base, token, tz)
             if not re.search(r"turnstile|challenge|人机|校验|验证", pmsg + str(pb)[:200], re.I):
                 # 与 Turnstile 无关的失败：站点不会因此挂 widget，别再白等几十秒。
                 # 也显式标不可重试 —— 额度/凭证/风控类拒绝换出口没用，而每次尝试要烧

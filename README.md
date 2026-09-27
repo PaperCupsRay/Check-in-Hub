@@ -201,6 +201,12 @@ curl -X POST https://<your-worker>/api/cron/run \
   `needsBrowser`，Worker 直接把它降级到**浏览器通道**（不再浪费一次注定失败的 gha_api 运行）；
 - `gha_api` 侧同理：本次 run 没带 browser job 时，`scripts/gha-checkin.mjs` 会反向请求
   面板补触发一次浏览器通道，否则这类渠道当天就漏签。
+- **Google reCAPTCHA v2**（星见雅等）单独处理，**不能照搬 Turnstile 的自挂组件**：
+  reCAPTCHA v2 的 token 与渲染它的那个页面 origin 绑定，自挂 widget 拿到的 token 会被
+  判低分。所以浏览器通道对这类站改成**驱动站点自己的 UI** —— 打开 `/console/personal`
+  → 点站点自己的签到按钮 → 点 `api2/anchor` 里的勾选框 → 轮询权威状态确认，全程不接触
+  token（站点前端拿到 token 后自己 `POST /api/user/checkin?recaptcha=<token>`）。
+  渠道编辑弹窗里的「该站用 Google reCAPTCHA v2」可强制走这条分支，留空则自动探测。
 
 
 ---
