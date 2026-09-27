@@ -93,6 +93,9 @@ NATIVE_WIDGET_BUDGET_S = 40
 # 比 TOKEN_WAIT_S 长，因为 reCAPTCHA 要等站点前端把 widget 渲染出来（可能好几秒），
 # 而且勾选框还可能被前端重建，得反复点。
 RECAPTCHA_BUDGET_S = int(os.environ.get("CHECKIN_RECAPTCHA_BUDGET_S") or 90)
+# 轮询等站点自己的签到按钮出现。必须给得比 SPA 首屏+状态查询宽裕：按钮在状态
+# 查询返回前显示「加载中...」（见 recaptcha_site_ui_checkin 的注释）。
+SITE_BTN_WAIT_S = int(os.environ.get("CHECKIN_SITE_BTN_WAIT_S") or 30)
 # 权威状态查询（GET /api/user/checkin?month=）的单次上限。它只在「POST 说不清」时才跑，
 # 但悬挂会把一次很可能已经发奖的尝试拖成 ❌超时，所以和 attach_quota 一样要有上限。
 STATUS_QUERY_TIMEOUT_S = 12
@@ -1275,6 +1278,29 @@ async def attach_quota(page, result, token):
         log(f"  ⚠️ 取余额失败（不影响签到结果）: {str(e)[:80]}")
 
 
+async def page_diag(page, limit=400):
+    """抓一份页面快照，失败时写进 message。
+
+    没有它，「没找到签到控件」没法定位：可能是 Cookie 失效被跳登录页、可能 SPA
+    还没渲染完、也可能按钮文案变了，只能靠猜。2026-09-27 线上失败就是因为这句
+    日志什么信息都没有，才多绕了一轮。
+    """
+    try:
+        d = await page.evaluate(
+            """() => ({
+                title: document.title,
+                url: location.href,
+                buttons: [...document.querySelectorAll('button,[role=button],a')]
+                    .map(b => (b.innerText || b.textContent || '').trim())
+                    .filter(Boolean).slice(0, 20),
+                body: document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 240) : '',
+            })"""
+        )
+        return json.dumps(d, ensure_ascii=False)[:limit]
+    except Exception as e:  # noqa: BLE001
+        return f"诊断失败:{str(e)[:80]}"
+
+
 async def click_site_checkin(page):
     """点站点自己的签到控件，把「人点签到」这个动作原样重放一遍。
 
@@ -1537,17 +1563,33 @@ async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai")
         await attach_quota(page, done, token)
         return done
 
-    hit = await click_site_checkin(page)
+    # 必须**轮询**等按钮，不能固定睡一觉就去找。
+    # 星见雅（2026-09-27 实测 bundle）的签到按钮是 Semi 的 <Button>：
+    #     children: I ? (stats.checked_in_today ? "今日已签到" : "立即签到") : "加载中..."
+    #     loading:  f || !I
+    # I 是「签到状态查询」的返回，状态没回来之前 children 就是「加载中...」，
+    # 而 loading 态下 Semi 连 children 都不渲染 —— 按钮里根本没有「签到」两个字，
+    # click_site_checkin 必然匹配不到。旧实现固定等 2.5s 就找，在 GHA + 住宅代理
+    # 下 100% 扑空（2026-09-27 线上就是这么失败的）。
+    hit = {"found": False, "why": ""}
+    deadline = time.monotonic() + SITE_BTN_WAIT_S
+    while time.monotonic() < deadline:
+        hit = await click_site_checkin(page)
+        if hit.get("found"):
+            break
+        await page.wait_for_timeout(1500)
     if not hit.get("found"):
+        diag = await page_diag(page)
+        # Cookie 失效会被前端路由到登录页，那是这里最常见的原因，单独点出来。
+        if "/login" in diag or "登录" in diag:
+            why = "页面被跳到登录页 —— 渠道 Cookie 大概率已失效，请重新复制 session 与 New-Api-User"
+        else:
+            why = f"{hit.get('why') or '页面上没有匹配的签到控件'}（已轮询 {SITE_BTN_WAIT_S}s）"
         return {
             "name": name,
             "ok": False,
             "retryable": False,
-            "message": (
-                f"reCAPTCHA 站：{personal} 上没找到签到控件"
-                f"（{hit.get('why') or '页面上没有'}），无法驱动 UI 过验证。"
-                "多半是渠道 Cookie 失效被跳到登录页，请重新复制 Cookie 与 New-Api-User。"
-            )[:300],
+            "message": f"reCAPTCHA 站：{personal} 上没找到签到控件：{why}。页面诊断 {diag}"[:400],
         }
     log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」")
 
