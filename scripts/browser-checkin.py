@@ -1610,20 +1610,30 @@ async def detect_recaptcha(page):
     依然残留），于是所有渠道都被带去 UI 驱动分支。
 
     所以只认两条硬证据：
-      iframe     页面上真的**渲染出了**勾选框（api2/anchor）—— 这也正是
-                 click_recaptcha_checkbox 唯一能点的对象；
-      api/status 服务端自己声明了 recaptcha_site_key / recaptcha_check。
-    两者都拿不到就返回 ''，交给后面的流程（探针回话点名 recaptcha 时仍会兜底分流）。
+      iframe     页面上真的**渲染出了**勾选框（reCAPTCHA 的 api2/anchor，或 hCaptcha 的
+                 hcaptcha.html#frame=checkbox）—— 这也正是 click_captcha_checkbox
+                 唯一能点的对象；
+      api/status 服务端自己声明了对应的开关与 site_key。
+    两者都拿不到就返回空串，交给后面的流程（探针回话点名验证码时仍会兜底分流）。
+
+    2026-09-27 补 hCaptcha：星见雅当天把 checkin_recaptcha_check 关掉、
+    checkin_hcaptcha_check 打开（/api/status 可证），而站点的 recaptcha_site_key 与
+    /recaptcha/api.js **仍然留着**。所以判据里 hCaptcha 优先，且必须同时看开关
+    （*_site_key 常年留在配置里，不能当作「该站用它」的证据）。
     """
     hit = await page.evaluate(
         """async () => {
-            if ([...document.querySelectorAll('iframe')].some(el => (el.src || '').includes('/recaptcha/api2/')))
-                return 'iframe';
+            const frames = [...document.querySelectorAll('iframe')].map(el => el.src || '');
+            if (frames.some(s => s.includes('/recaptcha/api2/'))) return 'recaptcha-iframe';
+            if (frames.some(s => s.includes('hcaptcha.com') && s.includes('frame=checkbox')))
+                return 'hcaptcha-iframe';
             try {
                 const r = await fetch('/api/status', { credentials: 'include' });
                 const j = await r.json().catch(() => null);
                 const d = (j && j.data) || {};
-                if (d.recaptcha_site_key || d.recaptcha_sitekey || d.recaptcha_check) return 'api/status';
+                if (d.checkin_hcaptcha_check || d.hcaptcha_check) return 'hcaptcha';
+                if (d.checkin_recaptcha_check || d.recaptcha_check) return 'recaptcha';
+                if (d.recaptcha_site_key || d.recaptcha_sitekey) return 'api/status';
             } catch (e) {}
             return '';
         }"""
@@ -1631,50 +1641,77 @@ async def detect_recaptcha(page):
     return hit or ""
 
 
-async def click_recaptcha_checkbox(page, x_offset=30, y_ratio=0.5):
-    """点 reCAPTCHA v2 的「我不是机器人」勾选框，返回是否点到。
+async def click_captcha_checkbox(page):
+    """点验证码勾选框（reCAPTCHA v2 与 hCaptcha v2 都支持），返回点到的次数。
 
-    勾选框在 api2/anchor 这个**跨域 iframe** 内部，主世界拿不到它的 DOM，只能取
-    frame_element() 的包围盒按坐标点（与 click_challenge 同一套路）。
-    x_offset=30：anchor iframe 宽约 304px，勾选框中心在左侧 ~28px 处。
+    2026-09-27 之前这里只认 reCAPTCHA 的 api2/anchor。星见雅换成 hCaptcha 之后，
+    它的勾选框在 newassets.hcaptcha.com/.../hcaptcha.html#frame=checkbox 里，
+    于是这个循环一次都匹配不上 —— 线上表现就是「勾选框 90s 内未完成（共点了 0 次）」。
+
+    两种勾选框都在**跨域 iframe** 内，主世界拿不到 DOM，但 frame.evaluate() 可以在
+    iframe 自己的上下文里量到元素，比盲点偏移准。2026-09-27 用 hCaptcha 官方测试
+    密钥实测：checkbox iframe 302x76，内部 #checkbox 元素 {x:16, y:23, w:30, h:30}。
+    量不到时才退回按框尺寸估算（勾选框在左侧约 30px、垂直居中）。
 
     异常一律忽略：站点前端可能随时重建 widget，这一轮拿不到是常态，下一轮重试。
     """
-    hit = False
+    hits = 0
     for f in page.frames:
-        if "/recaptcha/api2/anchor" not in (f.url or ""):
+        url = f.url or ""
+        if "/recaptcha/api2/anchor" not in url and not (
+            "hcaptcha.com" in url and "frame=checkbox" in url
+        ):
             continue
         try:
+            inner = await f.evaluate(
+                """() => {
+                    const el = document.querySelector('#checkbox') || document.querySelector('.check');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return (r.width > 0 && r.height > 0)
+                        ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
+                }"""
+            )
             el = await f.frame_element()
             box = await el.bounding_box()
-            if box and box["width"] > 0 and box["height"] > 0:
-                x, y = box["x"] + x_offset, box["y"] + box["height"] * y_ratio
-                await page.mouse.move(x, y, steps=5)
-                await page.mouse.click(x, y)
-                hit = True
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                continue
+            if inner:
+                x, y = box["x"] + inner["x"], box["y"] + inner["y"]
+            else:
+                x, y = box["x"] + 30, box["y"] + box["height"] / 2
+            await page.mouse.move(x, y, steps=5)
+            await page.mouse.click(x, y)
+            hits += 1
         except Exception:  # noqa: BLE001
-            pass
-    return hit
+            continue
+    return hits
 
 
 async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai"):
-    """用站点自己的 UI 过 reCAPTCHA 完成签到。
+    """用站点自己的 UI 过**人机验证码**完成签到（reCAPTCHA v2 与 hCaptcha v2 通用）。
 
-    为什么不照抄 Turnstile 那套「自挂组件 + 我们自己带 token POST」：星见雅这类站的
-    v2 勾选框由**它自己的前端**渲染在 /console/personal 上，token 由站点前端
-    grecaptcha.getResponse() 取走再放进 ?recaptcha= 提交。实测请求形态：
+    为什么不照抄 Turnstile 那套「自挂组件 + 我们自己带 token POST」：这类站的
+    勾选框由**它自己的前端**渲染在 /console/personal 上，token 由站点前端取走
+    再放进 query 提交。实测请求形态：
         POST /api/user/checkin?recaptcha=<2574 字符 token>   content-length: 0（无 body）
+        POST /api/user/checkin?hcaptcha=<token>              hCaptcha 站是这个参数名
         头：new-api-user: <id> + Cookie，无 Authorization
-    我们自挂 widget 的话，token 的 origin 与站点预期不一致会被判低分，而且字段名、
+    我们自挂 widget 的话，token 的 origin 与站点预期不一致会被判低分，而且参数名、
     提交时机全靠猜。所以全程不接触 token：
 
         打开站点页面 → 点它自己的签到按钮 → 点勾选框 → 轮询权威状态
 
     站点前端拿到 token 就自己 POST，签到由它完成。
+
+    2026-09-27：星见雅从 reCAPTCHA 切到了 hCaptcha（/api/status 里
+    checkin_recaptcha_check=false 而 checkin_hcaptcha_check=true，recaptcha_site_key
+    却仍留着）。所以这里不能把「验证码」写死成某一家 —— 探测与点击都按页面实际
+    渲染出来的 iframe 走（见 detect_recaptcha / click_captcha_checkbox）。
     """
     wait_until, nav_ms = nav_opts(None)
     personal = base + "/console/personal"
-    log(f"  🌐 {name}: 打开 {personal}（reCAPTCHA 流程）")
+    log(f"  🌐 {name}: 打开 {personal}（站点 UI 驱动流程）")
     try:
         await page.goto(personal, wait_until=wait_until, timeout=nav_ms)
     except Exception as e:  # noqa: BLE001
@@ -1713,31 +1750,36 @@ async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai")
             "name": name,
             "ok": False,
             "retryable": False,
-            "message": f"reCAPTCHA 站：{personal} 上没找到签到控件：{why}。页面诊断 {diag}"[:400],
+            "message": f"验证码站：{personal} 上没找到签到控件：{why}。页面诊断 {diag}"[:400],
         }
     log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」")
 
-    # 站点前端接着弹 reCAPTCHA 勾选框。勾选框可能延迟出现、也可能被前端重建，
+    # 站点前端接着弹**验证码**勾选框（reCAPTCHA / hCaptcha 都可能是）。勾选框可能
+    # 延迟出现、也可能被前端重建，所以整个预算内反复「找勾选框 iframe → 点一下 →
+    # 问一次权威状态」。
     # 所以整个预算内反复「找 anchor iframe → 点一下 → 问一次权威状态」。
     deadline = time.monotonic() + RECAPTCHA_BUDGET_S
     clicks = 0
     while time.monotonic() < deadline:
         await page.wait_for_timeout(1500)
-        if await click_recaptcha_checkbox(page):
+        if await click_captcha_checkbox(page):
             clicks += 1
-            log(f"  ☑️ {name}: 已点 reCAPTCHA 勾选框（第 {clicks} 次）")
+            log(f"  ☑️ {name}: 已点验证码勾选框（第 {clicks} 次）")
         # 勾完框站点前端才会去 POST；先给它一点时间，别在它提交前就下结论
         await page.wait_for_timeout(1500)
         done = await confirm_checked_in(page, token, name, tz)
         if done:
-            done["message"] = f"{done['message']}（reCAPTCHA：点站点按钮+勾选框完成）"[:300]
+            done["message"] = f"{done['message']}（验证码：点站点按钮+勾选框完成）"[:300]
             await attach_quota(page, done, token)
             return done
 
     diag = await page.evaluate(
         """() => ({
-            g: typeof window.grecaptcha,
-            frames: [...document.querySelectorAll('iframe')].map(f => f.src).filter(s => s && s.includes('recaptcha')),
+            grecaptcha: typeof window.grecaptcha,
+            hcaptcha: typeof window.hcaptcha,
+            frames: [...document.querySelectorAll('iframe')]
+                .map(f => f.src)
+                .filter(s => s && (s.includes('recaptcha') || s.includes('hcaptcha'))),
             body: document.body ? document.body.innerText.slice(0, 160) : '',
         })"""
     )
@@ -1745,8 +1787,8 @@ async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai")
         "name": name,
         "ok": False,
         "message": (
-            f"reCAPTCHA 勾选框 {RECAPTCHA_BUDGET_S}s 内未完成（共点了 {clicks} 次）；"
-            f"页面诊断 {json.dumps(diag, ensure_ascii=False)[:220]}"
+            f"验证码勾选框 {RECAPTCHA_BUDGET_S}s 内未完成（共点了 {clicks} 次）；"
+            f"页面诊断 {json.dumps(diag, ensure_ascii=False)[:260]}"
         )[:300],
     }
 
@@ -1759,7 +1801,7 @@ async def checkin_one(channel, proxy=None) -> dict:
     挂载 Turnstile widget，再带 token 重发。所以页面上平时看不到组件；也所以那句
     「为空」是站点对**空 token** 的固定话术，不能读成「我们的 token 无效」。
     同一现象在 HTTP 通道侧记录于 src/adapters/newapi.js 的 turnstileRejected()。
-    星见雅这类站走的是另一条分支：页面检出 Google reCAPTCHA v2 时分流到
+    星见雅这类站走的是另一条分支：页面检出 reCAPTCHA v2 / hCaptcha v2 时分流到
     recaptcha_site_ui_checkin（点站点自己的按钮 + 点勾选框），因为它的 token 与
     渲染页面绑定、不能自挂组件代劳，详见那个函数的文档字符串。
 
