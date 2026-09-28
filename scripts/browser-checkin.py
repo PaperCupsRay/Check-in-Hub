@@ -1688,6 +1688,205 @@ async def click_captcha_checkbox(page):
     return hits
 
 
+async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai", why=""):
+    """站点 UI 点不到时的回退：自己挂一个验证码组件，拿到 token 自己提交签到。
+
+    什么时候会走到这里：站点的 /console/personal 挂了，签到按钮压根不渲染。
+    2026-09-27 实测星见雅就是这个形态 —— ErrorBoundary 把正文换成
+    「页面渲染出错，请刷新页面重试」（站点前端 TypeError 崩在渲染「每日签到」卡片时）。
+    但**接口是好的**：GET 状态查询正常、POST 签到只差一个验证码 token。所以页面崩
+    不影响我们走接口这条路 —— 这也正是不能一看到「没找到控件」就判死的原因。
+
+    与自挂 Turnstile 的差别（踩过的坑，别改回去）：
+    · sitekey 取 /api/status 的 hcaptcha_site_key / recaptcha_site_key，并按
+      checkin_hcaptcha_check / checkin_recaptcha_check 判断**用哪个**。不能只看
+      site_key 是否存在 —— 星见雅 recaptcha 已关但 recaptcha_site_key 仍留着。
+    · 提交的参数名跟着开关走：hCaptcha 站是 ?hcaptcha=，reCAPTCHA 站是 ?recaptcha=
+      （站点 bundle 拼 URLSearchParams 就是这么拼的）。
+    · 勾选框点法沿用 click_captcha_checkbox（它已同时认两家的 iframe）。
+    """
+    st = {}
+    try:
+        st = await page.evaluate(
+            """async () => {
+                const r = await fetch('/api/status', { credentials: 'include' });
+                const j = await r.json().catch(() => null);
+                return (j && j.data) || {};
+            }"""
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ {name}: 读 /api/status 失败 {str(e)[:80]}")
+
+    use_hc = bool(st.get("checkin_hcaptcha_check") or st.get("hcaptcha_check"))
+    sitekey = (st.get("hcaptcha_site_key") if use_hc else st.get("recaptcha_site_key")) or ""
+    param = "hcaptcha" if use_hc else "recaptcha"
+    vendor = "hCaptcha" if use_hc else "reCAPTCHA"
+    if not sitekey:
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": False,
+            "message": (
+                f"{vendor} 站但 /api/status 没给出 sitekey（why={why or '无'}）；"
+                "无法自挂组件，检查渠道选项或站点配置"
+            )[:300],
+        }
+    log(f"  🔑 {name}: 自挂 {vendor} 组件，sitekey={sitekey[:16]}… 提交参数 ?{param}=")
+
+    # 挂我们自己的 widget。#self-rc 与站点的分开，且 response-field 关掉 ——
+    # 否则我们注入的隐藏域会和站点自己的同名、抢 token。
+    RENDER_JS = """(sk, isHc) => {
+        const api = isHc ? window.hcaptcha : window.grecaptcha;
+        if (!api || typeof api.render !== 'function')
+            return { ok: false, why: (isHc ? 'window.hcaptcha' : 'window.grecaptcha') + ' 不可用' };
+        window.__capToken = null; window.__capErr = null;
+        let box = document.getElementById('self-rc');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'self-rc';
+            box.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;width:303px;height:78px';
+            document.body.appendChild(box);
+        }
+        try {
+            api.render(box, {
+                sitekey: sk,
+                callback: (t) => { window.__capToken = t; },
+                'error-callback': (e) => { window.__capErr = String(e); },
+                'response-field': false,
+            });
+            return { ok: true };
+        } catch (e) {
+            return { ok: false, why: 'render 抛错: ' + ((e && e.message) || e) };
+        }
+    }"""
+
+    # 动态注入 api.js。实测（2026-09-27）hCaptcha 对 createElement 注入的脚本**照样能用**，
+    # 所以不需要改成静态 <script> 标签 —— 那样反而可能因为 async/defer 时序拿不到 render。
+    INJECT_SDK_JS = """(isHc) => {
+        if (isHc) {
+            if (!document.querySelector('script[src*="hcaptcha.com/1/api.js"]')) {
+                const s = document.createElement('script');
+                s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
+                s.async = true; s.defer = true;
+                document.head.appendChild(s);
+            }
+        } else if (!document.querySelector('script[src*="recaptcha/api.js"]')) {
+            const s = document.createElement('script');
+            s.src = 'https://www.google.com/recaptcha/api.js?render=explicit';
+            s.async = true; s.defer = true;
+            document.head.appendChild(s);
+        }
+    }"""
+
+    mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
+    if not mounted.get("ok"):
+        # 组件 API 还没就绪（api.js 是异步加载的）：把脚本挂上再等一轮
+        await page.evaluate(INJECT_SDK_JS, [use_hc])
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(1000)
+            mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
+            if mounted.get("ok"):
+                break
+    if not mounted.get("ok"):
+        return {
+            "name": name,
+            "ok": False,
+            "message": f"自挂 {vendor} 组件失败：{mounted.get('why') or '未知'}（why={why or '无'}）"[:300],
+        }
+    log(f"  🧩 {name}: 自挂组件已渲染，开始点勾选框")
+
+    # 点勾选框 + 收 token。
+    # 每轮都要**重新确认组件还在** —— 2026-09-27 实测踩过：站点页面崩在 ErrorBoundary
+    # 上，SPA 会重渲染 / 换路由，我们挂上去的 div 与 script 标签**当场被清掉**（实测
+    # 一轮后 window.hcaptcha 已 undefined、#self-rc 不存在、script 列表为空）。只在
+    # 开头挂一次的话，后面几十秒全在点空气：点击次数照涨，token 永远不来。
+    deadline = time.monotonic() + RECAPTCHA_BUDGET_S
+    clicks = 0
+    cap = ""
+    rebuilds = 0
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(1500)
+        cap = await page.evaluate("() => window.__capToken || ''")
+        if cap:
+            break
+        # 判活必须用 **page.frames**（跨世界可见），不能用 evaluate 查 window.hcaptcha：
+        # Camoufox 的 evaluate 默认在隔离世界跑（见 patch_main_world / ev_script），
+        # 那里读不到主世界的 window.hcaptcha，也读不到我们挂的 #self-rc —— 会误判成
+        # 「一直活着」，于是永远不重建（2026-09-27 实测：重建 0 次但 div 其实已被清掉）。
+        alive = any(
+            ("hcaptcha.com" in (f.url or "") and "frame=checkbox" in (f.url or ""))
+            or "/recaptcha/api2/anchor" in (f.url or "")
+            for f in page.frames
+        )
+        if not alive:
+            rebuilds += 1
+            if rebuilds <= 3:
+                log(f"  ♻️ 组件被页面重渲染清掉了，重新挂（第 {rebuilds} 次）")
+            mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
+            if not mounted.get("ok"):
+                # api.js 标签也一起没了，先补脚本再等一轮
+                await page.evaluate(INJECT_SDK_JS, [use_hc])
+                await page.wait_for_timeout(2500)
+                mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
+            if not mounted.get("ok"):
+                continue
+        if await click_captcha_checkbox(page):
+            clicks += 1
+    if not cap:
+        cap = await page.evaluate("() => window.__capToken || ''")
+    if not cap:
+        err = await page.evaluate("() => window.__capErr")
+        return {
+            "name": name,
+            "ok": False,
+            "message": (
+                f"自挂 {vendor} 组件 {RECAPTCHA_BUDGET_S}s 内没出 token（点了 {clicks} 次、"
+                f"重建 {rebuilds} 次，组件报错={err}）。若弹了图片题，"
+                "说明该出口 IP 被判高风险，需要住宅代理"
+            )[:300],
+        }
+    log(f"  🔑 {name}: 拿到 {vendor} token（{len(cap)} 字符），自己提交签到")
+
+    # 我们自己带 token POST，参数名跟着站点开关走
+    res = await page.evaluate(
+        """async ([p, tk, headersJs]) => {
+            const __h = JSON.parse(headersJs || '{}');
+            try {
+                const u = JSON.parse(localStorage.getItem('user') || 'null');
+                if (u && u.id != null) __h['New-Api-User'] = String(u.id);
+            } catch (e) {}
+            const r = await fetch('/api/user/checkin?' + p + '=' + encodeURIComponent(tk), {
+                method: 'POST', credentials: 'include', headers: __h,
+            });
+            let b = null; try { b = await r.json(); } catch (e) {}
+            return { status: r.status, body: b };
+        }""",
+        [param, cap, auth_headers_js(token)],
+    )
+    body = res.get("body") if isinstance(res.get("body"), dict) else {}
+    ok = checkin_ok(body, res.get("status"))
+    if not ok:
+        # token 一次性，可能站点前端已经抢先签了 —— 状态查询才是权威
+        done = await confirm_checked_in(page, token, name, tz)
+        if done:
+            done["message"] = f"{done['message']}（{vendor}：自挂组件提交）"[:300]
+            await attach_quota(page, done, token)
+            return done
+        return {
+            "name": name,
+            "ok": False,
+            "message": f"{checkin_message(ok, body, res.get('status'))}（{vendor}：自挂组件提交）"[:300],
+        }
+    result = {
+        "name": name,
+        "ok": True,
+        "message": f"{checkin_message(ok, body, res.get('status'))}（{vendor}：自挂组件提交）"[:300],
+    }
+    await attach_quota(page, result, token)
+    return result
+
+
 async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai"):
     """用站点自己的 UI 过**人机验证码**完成签到（reCAPTCHA v2 与 hCaptcha v2 通用）。
 
@@ -1740,18 +1939,27 @@ async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai")
             break
         await page.wait_for_timeout(1500)
     if not hit.get("found"):
+        # 站点自己的按钮点不到时，**不要直接判死**。2026-09-27 实测：星见雅的
+        # /console/personal 被 ErrorBoundary 接管，正文只剩「页面渲染出错，请刷新页面重试」
+        # （站点前端 TypeError: Cannot read properties of undefined (reading 'length')，
+        #  崩在渲染「每日签到」卡片时），于是按钮压根不存在。但**签到接口本身是好的**
+        # ——只要我们自己挂一个验证码组件、拿到 token 自己提交就行，页面崩不崩无所谓。
+        # 所以这里回退到自挂组件那条路。
         diag = await page_diag(page)
-        # Cookie 失效会被前端路由到登录页，那是这里最常见的原因，单独点出来。
         if "/login" in diag or "登录" in diag:
-            why = "页面被跳到登录页 —— 渠道 Cookie 大概率已失效，请重新复制 session 与 New-Api-User"
-        else:
-            why = f"{hit.get('why') or '页面上没有匹配的签到控件'}（已轮询 {SITE_BTN_WAIT_S}s）"
-        return {
-            "name": name,
-            "ok": False,
-            "retryable": False,
-            "message": f"验证码站：{personal} 上没找到签到控件：{why}。页面诊断 {diag}"[:400],
-        }
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"验证码站：{personal} 被跳到登录页 —— 渠道 session 失效。"
+                    "请确认渠道配了账密（会自动换 30 天有效的 session）。页面诊断 " + diag
+                )[:400],
+            }
+        log(f"  ↩️ {name}: 点不到站点按钮（{hit.get('why') or '无匹配控件'}），改走自挂组件")
+        return await selfmounted_captcha_checkin(page, name, base, token, tz, diag)
+
+    log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」")
     log(f"  🖱️ {name}: 已点站点自身签到按钮「{hit.get('text')}」")
 
     # 站点前端接着弹**验证码**勾选框（reCAPTCHA / hCaptcha 都可能是）。勾选框可能
