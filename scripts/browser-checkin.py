@@ -1705,17 +1705,45 @@ async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai
       （站点 bundle 拼 URLSearchParams 就是这么拼的）。
     · 勾选框点法沿用 click_captcha_checkbox（它已同时认两家的 iframe）。
     """
-    st = {}
+    # 读 /api/status 时**必须区分三种结果**：拿到配置 / 站点不可达（5xx、521、
+    # 非 JSON）/ 拿到了但没有验证码字段。2026-09-27 线上报的「reCAPTCHA 站但
+    # /api/status 没给出 sitekey」就是把这三种混成了第一种：当时整站 521/502，
+    # fetch 回来的不是 JSON，于是 st 变成 {}，被误报成「站点没配置验证码」——
+    # 而真相是站点宕机，重试和改配置都没用。
+    st = None
+    st_err = ""
     try:
         st = await page.evaluate(
             """async () => {
-                const r = await fetch('/api/status', { credentials: 'include' });
-                const j = await r.json().catch(() => null);
-                return (j && j.data) || {};
+                try {
+                    const r = await fetch('/api/status', { credentials: 'include' });
+                    const txt = await r.text();
+                    if (!r.ok) return { __err: 'HTTP ' + r.status, __head: txt.slice(0, 60) };
+                    const j = JSON.parse(txt);
+                    if (!j || !j.data) return { __err: '响应里没有 data 字段' };
+                    return j.data;
+                } catch (e) { return { __err: String(e).slice(0, 80) }; }
             }"""
         )
+        if isinstance(st, dict) and st.get("__err"):
+            st_err = str(st.get("__err") or "")
+            st = None
     except Exception as e:  # noqa: BLE001
-        log(f"  ⚠️ {name}: 读 /api/status 失败 {str(e)[:80]}")
+        st_err = str(e)[:80]
+
+    if st is None:
+        # 站点侧不可达。标成可重试 —— 宕机是暂时的，换出口/改配置都无意义。
+        log(f"  ⚠️ {name}: /api/status 读不出来（{st_err}），站点可能不可达")
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": True,
+            "message": (
+                f"站点不可达：/api/status 返回异常（{st_err}）。"
+                "这是站点自身宕机或网络不通，与验证码配置无关，等站点恢复即可。"
+                f"（why={why or '无'}）"
+            )[:300],
+        }
 
     use_hc = bool(st.get("checkin_hcaptcha_check") or st.get("hcaptcha_check"))
     sitekey = (st.get("hcaptcha_site_key") if use_hc else st.get("recaptcha_site_key")) or ""
@@ -1727,8 +1755,9 @@ async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai
             "ok": False,
             "retryable": False,
             "message": (
-                f"{vendor} 站但 /api/status 没给出 sitekey（why={why or '无'}）；"
-                "无法自挂组件，检查渠道选项或站点配置"
+                f"/api/status 可达但没有验证码 sitekey（{vendor} 开关="
+                f"{use_hc}，why={why or '无'}）。可能站点刚关掉了该校验，"
+                "或改用了别家验证码；可直接再点一次签到验证"
             )[:300],
         }
     log(f"  🔑 {name}: 自挂 {vendor} 组件，sitekey={sitekey[:16]}… 提交参数 ?{param}=")
@@ -1842,8 +1871,9 @@ async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai
             "ok": False,
             "message": (
                 f"自挂 {vendor} 组件 {RECAPTCHA_BUDGET_S}s 内没出 token（点了 {clicks} 次、"
-                f"重建 {rebuilds} 次，组件报错={err}）。若弹了图片题，"
-                "说明该出口 IP 被判高风险，需要住宅代理"
+                f"重建 {rebuilds} 次，组件报错={err}）。重建次数>0 多半是站点页面在"
+                "重渲染（ErrorBoundary）把组件清掉了；重建 0 次仍失败则多半是弹了"
+                "图片题（该出口 IP 被判高风险，需要住宅代理）"
             )[:300],
         }
     log(f"  🔑 {name}: 拿到 {vendor} token（{len(cap)} 字符），自己提交签到")
