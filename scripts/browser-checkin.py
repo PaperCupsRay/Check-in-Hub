@@ -1273,6 +1273,76 @@ async def seed_localstorage_auth(page, token, user_id):
         [token, user_id],
     )
 
+async def login_for_session(page, name, base, username, password, user_id=""):
+    """在页面内用账密登录，换一个真正的 NewAPI session cookie。
+
+    为什么走**页面内 fetch** 而不是 Python 侧发请求：session 是 HttpOnly 的，
+    服务端在登录响应里下发、由浏览器 cookie jar 接住。Python 侧拿到 Set-Cookie
+    还要手工 add_cookies 回去，中间漏一个属性就可能又一轮 401（2026-09-27 实测：
+    同一份 session 手工拼头一次 401、一次 200，差别只在 cookie 处理方式）。
+    交给页面内 fetch 就没有这类差异。
+
+    顺带取回 userId：登录响应的 data.id 就是它，而 New-Api-User 头在部分接口是
+    强制的（new.xinjianya.top 实测缺头会 401）。
+
+    返回 {"session": bool, "cookie": str, "userId": str, "why": str}。
+    失败不抛异常 —— 由调用方决定继续用原 cookie 还是报错。
+    """
+    try:
+        got = await page.evaluate(
+            """async ([u, p, uid]) => {
+                const hdr = uid ? { 'New-Api-User': String(uid) } : {};
+                const send = async (body) => {
+                    const r = await fetch('/api/user/login', {
+                        method: 'POST', credentials: 'include',
+                        headers: { 'Content-Type': 'application/json', ...hdr },
+                        body: JSON.stringify(body),
+                    });
+                    let b = null; try { b = await r.json(); } catch (e) {}
+                    return { status: r.status, body: b };
+                };
+                // 与 src/adapters/newapi.js 的 login() 同一组尝试顺序：
+                // 多数分支只认 username，少数只认 email。
+                let r = await send({ username: u, password: p });
+                if (r.status >= 400 || !(r.body && (r.body.success === true || r.body.data))) {
+                    r = await send({ email: u, password: p });
+                }
+                const d = (r.body && r.body.data) || {};
+                return {
+                    ok: r.status < 400 && !!(r.body && (r.body.success === true || r.body.data)),
+                    message: (r.body && r.body.message) || ('HTTP ' + r.status),
+                    id: d.id || null,
+                };
+            }""",
+            [username, password, user_id],
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"session": False, "why": f"页面内登录异常 {str(e)[:80]}"}
+
+    if not got.get("ok"):
+        return {"session": False, "why": f"登录被拒：{got.get('message') or '未知'}"}
+
+    try:
+        jar = await page.context.cookies()
+    except Exception:  # noqa: BLE001
+        jar = []
+    host = base.split("//", 1)[1].split("/", 1)[0].split(":", 1)[0]
+    bare = host[4:] if host.startswith("www.") else host
+    mine = [c for c in jar if c.get("domain", "").lstrip(".") in (host, bare)]
+    names = [c["name"] for c in mine]
+    session = [c for c in mine if c["name"] == "session" and c.get("value")]
+    if not session:
+        return {"session": False, "why": f"登录成功但未收到 session cookie（现有：{names or '无'}）"}
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in mine)
+    log(f"  🔑 {name}: 账密登录换到 session（{len(session[0]['value'])} 字符），cookie 栏现有 {names}")
+    return {
+        "session": True,
+        "cookie": cookie_str,
+        "userId": str(got.get("id") or user_id or ""),
+        "why": "",
+    }
+
+
 
 async def inpage_checkin(page, token, ts_token):
     """页面内 fetch /api/user/checkin，返回 {status, body}。
@@ -1703,6 +1773,8 @@ async def checkin_one(channel, proxy=None) -> dict:
     auth = channel.get("auth") or {}
     cookie_raw = auth.get("cookie") or ""
     token = auth.get("token") or ""
+    username = auth.get("username") or auth.get("email") or ""
+    password = auth.get("password") or ""
     # New-Api-User 是 NewAPI 系的**强制**头：只带 Bearer 会 401
     # 「Unauthorized, New-Api-User header not provided」（new.xinjianya.top 实测）。
     # 页内 fetch 的头一律从 localStorage.user.id 取，见 auth_headers_js。
@@ -1720,6 +1792,22 @@ async def checkin_one(channel, proxy=None) -> dict:
         wait_until, nav_ms = nav_opts(proxy)
         await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
         await page.wait_for_timeout(PROXY_SETTLE_MS if proxy else 2000)
+        # cookie 栏里若已经有真正的 NewAPI session（有 session=），直接用；
+        # 否则**用账密换一个**。这不是多余的兜底：多租户托管面板常会下发
+        # server_name_session 这种**租户路由** cookie（名字里 server_name 还是
+        # 未替换的模板占位符），它连匿名请求都发、每次值都一样、不携带用户身份，
+        # 带着它 /console/personal 会被甩到登录页（2026-09-27 星见雅线上实测）。
+        # NewAPI 登录接口不需要人机验证（实测连登三次稳定拿到 360 字符 session，
+        # Max-Age 30 天；错密码会明确拒绝），所以这是可靠的自动续期路径。
+        if username and password and not re.search(r"(^|;\s*)session=", cookie_raw or "", re.I):
+            fresh = await login_for_session(page, name, base, username, password, user_id)
+            if fresh.get("session"):
+                cookie_raw = fresh["cookie"] or cookie_raw
+                user_id = user_id or fresh.get("userId") or ""
+                if fresh.get("userId") and not user_id:
+                    user_id = str(fresh["userId"])
+            else:
+                log(f"  ⚠️ {name}: 账密登录未换到 session（{fresh.get('why') or '未知'}），继续用原 cookie")
         pairs = parse_cookie_pairs(cookie_raw)
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]

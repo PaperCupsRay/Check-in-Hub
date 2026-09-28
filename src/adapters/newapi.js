@@ -602,6 +602,30 @@ export const newapiAdapter = {
 
   async ensureSession(channel) {
     const auth = pickAuth(channel);
+    // 「有 cookie」不等于「cookie 能鉴权」。多租户/白标托管面板会额外下发
+    // server_name_session 之类的**租户路由** cookie（名字里的 server_name 往往
+    // 还是没被替换的模板占位符），它连匿名请求都发、每次值都一样、**不携带用户
+    // 身份**。2026-09-27 星见雅线上就是这么失败的：cookie 栏看着有值，实则
+    // /api/user/self 直接 401，而 access token 一直有效。
+    //
+    // 所以判断标准收紧为「真的含 NewAPI 的 session cookie」，据此决定要不要用账密
+    // 去换一个。NewAPI 登录接口**不需要**人机验证（实测星见雅连登三次稳定拿到
+    // 360 字符的 session，Max-Age 30 天；错密码会明确拒绝），所以这是一条可靠的
+    // 自动续期路径 —— 浏览器通道要的是 session，光有 token 顶不上去。
+    const hasSessionCookie = /(^|;\s*)session=/i.test(auth.cookie || "");
+    if (auth.username && auth.password && !hasSessionCookie) {
+      const login = await this.login(channel);
+      if (login.ok) {
+        return {
+          ok: true,
+          cookie: login.tokens.cookie,
+          tokens: login.tokens,
+          user: login.user,
+        };
+      }
+      // 登录失败不直接判死：OAuth-only 站、密码已改、或登录接口被人机验证拦了 ——
+      // 这时原有的 cookie / token 仍可能可用，往下走让请求自己说话。
+    }
     // Cookie 与访问令牌都是有效凭证：站点前端本身就靠 Cookie 签到，
     // 服务端解不出 session 时才回退看 Authorization。任一存在即视为有会话。
     if (auth.token || auth.cookie) {

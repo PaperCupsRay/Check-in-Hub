@@ -235,5 +235,43 @@ await scenario(
   }
 );
 
+// 10) cookie 栏有值但不含 session（多租户面板的 server_name_session 之类）+ 配了账密
+//     → ensureSession 必须用账密换一个，而不是直接信任那个无效 cookie。
+//     线上踩过：星见雅的 cookie 看着有值，实则 /api/user/self 直接 401。
+const RC_CRED_CH = {
+  id: "ch_rc_cred",
+  name: "星见雅(账密)",
+  type: "newapi",
+  baseUrl: "https://new.xinjianya.top",
+  enabled: true,
+  auth: {
+    cookie: "server_name_session=58154d6bd6b2030bcec1e50cfe3a9a77",
+    token: "faketoken",
+    userId: "1829",
+    username: "PaperCupsRay",
+    password: "correct-horse",
+  },
+  options: { recaptchaSiteKey: "1" },
+};
+await scenario(
+  "cookie 不含 session + 有账密 → 登录换 session",
+  {
+    channel: RC_CRED_CH,
+    fetch: {
+      login: () => json(200, { success: true, message: "", data: { id: 1829, username: "PaperCupsRay" } }),
+      self: () => json(200, { success: true, data: { id: 1829, username: "PaperCupsRay", quota: 1000 } }),
+      // 状态查询必须回「今天还没签」：若回已签，适配器在 POST 之前就判定成功、
+      // 根本不会发起签到请求，也就不会出现 recaptcha 拒绝 —— 那样测的就不是
+      // 「换了 session 之后仍然需要浏览器通道」这件事了。
+      checkinStatusNewapi: () => json(200, { success: true, data: { enabled: true, stats: { checked_in_today: false, checkin_count: 26, records: [] } } }),
+      checkinNewapi: () => json(200, { success: false, message: "recaptcha verification failed" }),
+    },
+  },
+  ({ result, via, calls }) => {
+    check("打过了 /api/user/login", calls.some((c) => c.url.includes("/api/user/login")), JSON.stringify(calls.map((c) => c.url)));
+    check("仍标 needsBrowser 走浏览器通道", result.needsBrowser === true && via === "gha_browser", `via=${via}`);
+  }
+);
+
 console.log(`\n失败断言: ${failures}`);
 process.exit(failures ? 1 : 0);
