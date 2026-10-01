@@ -2,7 +2,7 @@
 
 多渠道自动签到面板，一键部署到 **Cloudflare Workers**。
 
-在浏览器里管理 Sub2API / NewAPI / AgentRouter 等站点渠道，支持签到、状态查询、用户信息、批量并发签到，以及导入导出配置。
+在浏览器里管理 Sub2API / NewAPI / AgentRouter 等 API 站点，以及 NodeSeek / linux.sb / NodeLoc 等社区论坛的签到，支持签到、状态查询、用户信息、批量并发签到，以及导入导出配置。
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
@@ -11,7 +11,7 @@
 
 ## ✨ 功能特性
 
-- **多渠道适配**：内置 `sub2api` / `newapi` / `agentrouter`，可继续扩展
+- **多渠道适配**：内置 `sub2api` / `newapi` / `agentrouter` / `nodeseek` / `linux.sb` / `nodeloc`，可继续扩展
 - **卡片式首页**：所有渠道直接展示，支持按类型筛选与多种排序
 - **弹窗编辑**：新增 / 编辑渠道使用模态框，不打断列表浏览
 - **并发签到**：全部签到使用 `Promise.allSettled` 并发执行
@@ -84,6 +84,9 @@ cp .dev.vars.example .dev.vars
 | `sub2api` | Sub2API 系站点 | Bearer JWT | `POST /api/v1/check-in` |
 | `newapi` | NewAPI / OneAPI 系 | Cookie + `New-Api-User` | `POST /api/user/checkin` |
 | `agentrouter` | AgentRouter 等同系 | Cookie / 账密（登录前先 logout） | 查询用户信息自动签到，兼容 `sign_in` / `checkin` |
+| `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | `POST /api/attendance?random=true`（收益=鸡腿） |
+| `linuxsb` | linux.sb（烧饼社区） | Cookie | 打开页面即自动签到；另有「抽称号」动作 |
+| `nodeloc` | NodeLoc（www.nodeloc.com，Discourse） | Cookie + CSRF | `POST /checkin`（form 编码 + `X-Checkin-Nonce`） |
 
 ### 填写建议
 
@@ -101,6 +104,26 @@ cp .dev.vars.example .dev.vars
 
 - 用户名 + 密码（会先清理脏 session）
 - 或完整 Cookie；建议填写 `New-Api-User`
+
+**NodeSeek / linux.sb / NodeLoc（社区论坛）**
+
+- 三站都**只认浏览器 Cookie**，没有账密登录，也没有 API 令牌
+- 复制方式：浏览器登录后 F12 → Application → Cookies → 复制整站 Cookie
+  （NodeLoc 至少要含 `_t`；被 Cloudflare 挑战过的话把 `cf_clearance` 也带上）
+- **NodeSeek**：签到单位是「鸡腿」不是美元，面板按积分展示，不会折算成金额。
+  站点没有独立状态接口，渠道里填上「论坛用户名」后，「状态」按钮会用当日签到排行榜
+  判断今天是否已签。失败时若回 `high risk action`，那是站点风控（不是接口写错），
+  换 Cookie / 带 `cf_clearance` / 把通道改成 `gha_api` 依次试
+- **linux.sb**：签到是**自动的** —— 打开任意页面时服务端顺手完成，提示写进页面的
+  `window.__pageFlash`。所以「签到」= 拉一次首页：有「已帮您完成自动签到」= 刚签上，
+  为空 = 今日已签过。卡片上另有 **抽称号** 按钮（`POST /gacha_pull`，每日免费一抽，
+  不花积分）；想在每天签到后自动抽，把渠道的 `options.autoGacha` 填 `true`
+- **NodeLoc（Discourse）**：会自动用 Cookie 换 `/session/csrf.json` 的会话级 CSRF token，
+  通常不用手填；`CSRF Token` 字段只在自动获取失败时用。注意请求体是表单编码
+  （`nonce=…&timestamp=…`），不是 JSON
+- **NodeSeek 整站挂在 Cloudflare 托管挑战后面**，Workers / Actions 的机房 IP 经常
+  被拦。解法：Cookie 里带 `cf_clearance`，或把该渠道的签到通道改成 `gha_api`
+  （GitHub Actions 的 Azure 出口 IP）
 
 ---
 
@@ -257,7 +280,12 @@ checkin-hub/
         ├── index.js
         ├── sub2api.js
         ├── newapi.js
-        └── agentrouter.js
+        ├── agentrouter.js
+        ├── anyrouter.js
+        ├── forum.js         # NodeSeek / linux.sb 共用的签到工厂
+        ├── nodeseek.js
+        ├── linuxsb.js
+        └── nodeloc.js       # Discourse discourse-checkin
 ```
 
 ---
@@ -278,7 +306,8 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
-| `npm test` | 鉴权回退 / 降级路由的离线回归测试（mock fetch，不联网） |
+| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 |
+| `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
 
 ---
 

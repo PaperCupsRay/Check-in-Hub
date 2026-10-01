@@ -1209,13 +1209,32 @@
     }
 
     function actionLabel(action) {
-      return ({
+      const fixed = {
         checkin: "签到",
         status: "状态",
         me: "用户",
         login: "登录",
         refresh: "刷新",
-      })[action] || action;
+      }[action];
+      // 其余动作由适配器自报（见 adapters/index.js 的 listAdapters.actions）
+      return fixed || extraActionLabel(action) || action;
+    }
+
+    /** 查适配器自报的额外动作标签，如 linux.sb 的 gacha → 抽称号 */
+    function extraActionLabel(action) {
+      for (const a of adapters) {
+        const hit = (a.actions || []).find((x) => x.action === action);
+        if (hit) return hit.label || action;
+      }
+      return "";
+    }
+
+    /** 该渠道类型可用的额外按钮（目前只有 linux.sb 的「抽称号」） */
+    function extraButtons(type) {
+      const a = adapterOf(type);
+      return (a?.actions || []).map((x) =>
+        `<button data-act="${escapeHtml(x.action)}" class="secondary" title="${escapeHtml(x.title || x.label || "")}">${escapeHtml(x.label || x.action)}</button>`
+      ).join("");
     }
 
     function buildSummary(action, data = {}) {
@@ -1398,6 +1417,7 @@
             </div>
             <div class="actions">
               <button data-act="checkin" class="success">签到</button>
+              ${extraButtons(ch.type)}
               <button data-act="me" class="secondary">余额</button>
               <button data-act="log" class="secondary" title="查看该渠道最近一次结果与日志">日志</button>
               <button data-act="edit" class="secondary" title="编辑 / 状态 / 登录校验">编辑</button>
@@ -1516,6 +1536,11 @@
       const runner = ["worker", "gha_api", "gha_browser"].includes(ch.options?.runner)
         ? ch.options.runner
         : "worker";
+      // 额外动作（如 linux.sb 抽称号）没有对应的 GHA 流程，会直接在 Worker 跑；
+      // 渠道配了别的通道时说明一句，免得「为什么这个动作出口不一样」变成玄学。
+      if (runner !== "worker" && !["checkin", "me"].includes(action)) {
+        log(`${ch.name}：${actionLabel(action)} 只在 Worker 直连执行（该渠道通道为 ${runner}）`, "info");
+      }
       if ((action === "checkin" || action === "me") && runner !== "worker") {
         return runViaGha(ch, runner, action);
       }
@@ -1645,6 +1670,16 @@
         if (ch.type === "anyrouter" && ch.auth?.cookie && !ch.auth?.userId && !ch.auth?.token) {
           if (!confirm("AnyRouter 强烈建议填写 New-Api-User（用户 ID）。未填时余额/签到可能失败，仍要继续？")) return;
         }
+      }
+      // 论坛系三站（NodeSeek / linux.sb / NodeLoc）只认浏览器 Cookie，
+      // 缺 Cookie 时 me() 只能给出「无用户信息接口」的说明，测不出真假，
+      // 所以在发请求前先拦下来，别让人以为测过了。
+      if (["nodeseek", "linuxsb", "nodeloc"].includes(ch.type) && !ch.auth?.cookie) {
+        return showToast(
+          "请先填写 Cookie",
+          "这些社区站只支持浏览器 Cookie 鉴权（F12 → Application → Cookies 复制）",
+          "warn"
+        );
       }
       // 临时跑当前表单，不强制写入列表
       const tempId = ch.id || uid();
