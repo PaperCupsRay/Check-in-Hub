@@ -318,6 +318,7 @@ checkin-hub/
 | `npm run tail` | 查看线上日志 |
 | `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
+| `npm run test:browser` | 只跑浏览器通道社区站流程的纯函数判据（`python scripts/test-forum-browser.py`，不联网、不开浏览器） |
 
 ---
 

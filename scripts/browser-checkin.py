@@ -2526,17 +2526,50 @@ def checkin_record_evidence(html, ymd, span=200):
     return ""
 
 
-async def read_stats_cookie(page):
-    """读站点自己记的签到统计 cookie：__daily_checkin_stats=<uid>.<date>.<count>.<points>.<rank>。
+
+
+def today_signed_evidence(body_text):
+    """linux.sb 的「今天已签到」措辞（站点用相对日期，不写具体日期）。
+
+    2026-10-13 线上实测的 /daily_checkin 正文片段：
+        `每日签到 今天已签到 19 连续天数 46 累计签到 已完成 PaperCups 积分 1309`
+    所以判据是「相对日期 + 已签到」这个词组；裸「已签到」太松（页面别处也有），
+    要求附近有具体日期又太紧（这一页根本不写日期）。返回原文片段供面板展示与核对。
+    """
+    m = re.search(r"(?:今天|今日)已签(?:到)?[^一-龥]{0,12}", body_text or "")
+    return m.group(0).strip() if m else ""
+
+
+def parse_stats_cookie(raw):
+    """从 document.cookie 原文里解出签到统计：__daily_checkin_stats=<uid>.<date>.<count>.<points>.<rank>。
 
     date 是站点侧最后一次签到的日期，比「页面里有没有那个词」硬得多：它只在服务端
-    真的处理完签到之后才会被改写。字段数不对时返回 {}（不改判据，只是少一条证据）。
+    真的处理完签到之后才会被改写。抽成同步函数是为了能离线跑
+    scripts/test-forum-browser.py；字段数不对时只返回 raw（少一条证据，不改判据）。
     """
+    m = re.search(r"__daily_checkin_stats=([^;]+)", str(raw or ""))
+    if not m:
+        return {"raw": None}
+    parts = [p.strip() for p in m.group(1).split(".")]
+    out = {"raw": m.group(1)}
+    if len(parts) >= 2:
+        out["uid"] = parts[0]
+        out["date"] = parts[1]
+    if len(parts) >= 4:
+        try:
+            out["points"] = float(parts[3])
+        except ValueError:
+            pass
+    return out
+
+
+async def read_stats_cookie(page):
+    """读站点自己记的签到统计 cookie（解析见 parse_stats_cookie）。"""
     try:
         raw = await page.evaluate("() => document.cookie")
     except Exception:  # noqa: BLE001
-        return {}
-    m = re.search(r"__daily_checkin_stats=([^;]+)", str(raw or ""))
+        return {"raw": None}
+    return parse_stats_cookie(raw)
     if not m:
         return {"raw": None}
     parts = [p.strip() for p in m.group(1).split(".")]
@@ -2639,26 +2672,18 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                         "再重抄整站 Cookie 到渠道里（换出口解决不了会话失效）。"
                     )[:300],
                 }
-            # 「今天签没签」要两个硬证据之一，不能只看页面上有没有「已签到」这个词：
-            #   ① __daily_checkin_stats 这个 cookie 的日期 = 今天（服务端真处理完才会改写）；
-            #   ② 「已签到」附近出现今天的日期。
-            # 顺带把两个值都写进日志 —— 判据万一还是太紧/太松，日志里有原文可查。
-            ymd = site_today()
-            stats = await read_stats_cookie(page)
             # 「今天签没签」的判据（2026-10-13 第四轮线上日志定的，别再放宽/收紧）：
             #   ① __daily_checkin_stats cookie 的日期 = 今天（服务端处理完签到才会改写；
-            #      实测这一页也可能根本没有这个 cookie，所以只能当加分项）；
+            #      实测这一页也可能没有这个 cookie，所以只能当加分项）；
             #   ② 页面正文里出现**相对日期**措辞「今天/今日已签到」——
             #      站点就是这么写的（实测原文：`今天已签到 19 连续天数 46 累计签到 已完成`），
             #      它压根不写具体日期，所以「要求附近有日期」的判据太紧；
             #   ③ 兜底：正文/HTML 里「已签到」附近出现今天的日期（有的页面会写日期）。
             # 只认裸「已签到」太松：第一版因此从 HTML 里抓到「已签到 <div class」这种
-            # 片段就算签过了 —— 那个词页面别处也有。所以必须带日期限定词。
+            # 片段就算签过了 —— 那个词页面别处也有，等于把「页面有这个词」当成了「签过了」。
             ymd = site_today()
             stats = await read_stats_cookie(page)
-            body_text = str(detail.get("body") or "")
-            m_rel = re.search(r"(?:今天|今日)已签(?:到)?[^一-龥]{0,12}", body_text)
-            evidence = (m_rel.group(0).strip() if m_rel else "") or checkin_record_evidence(html, ymd)
+            evidence = today_signed_evidence(detail.get("body")) or checkin_record_evidence(html, ymd)
             log(
                 f"  🔎 {name}: 今日 {ymd}｜__daily_checkin_stats={stats.get('raw') or '(无)'}"
                 f"｜记录证据={evidence or '(无)'}"
@@ -2668,6 +2693,12 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                 if evidence:
                     message = f"{message} · 站点原文：{evidence}"
                 result = {"name": name, "ok": True, "message": message[:300]}
+            elif not (forum_logged_in(snap) or detail.get("userCard") or detail.get("hasDailyCheckin")):
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
                         "Cookie 已失效：首页与 /daily_checkin 都拿不到登录态线索"
                         "（没有用户卡片 /「每日签到」入口）。请在浏览器里重新登录 "
                         "https://linux.sb 后重抄整站 Cookie 到渠道里。"
