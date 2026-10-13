@@ -3115,15 +3115,24 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         await click_captcha_checkbox(page)
 
     host = base.split("//", 1)[1].split("/", 1)[0]
-    suffix = host[4:] if host.startswith("www.") else host
-    # 提交前先记下 jar 里的会话值：判「登录成功」要拿它做对比（见函数文档字符串）
-    before = session_value(cookies_to_header(await page.context.cookies(), suffix))
-    before_url = page.url or ""
-
-    await page.fill(input_selector(user_el), username)
-    await page.fill(input_selector(pw_el), password)
-    log(f"  🔑 {name}: 已填账号（{input_selector(user_el)}）与密码，提交")
-    submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+    snap = await page_snapshot(page)
+    why = []
+    if not token_ready:
+        why.append("登录页的 Turnstile 没签发 token（challenge 没过，机房出口常见）")
+    if session_value(cookie) == before:
+        why.append("会话 Cookie 没变（多半账号/密码不对，或站点拒绝了这次提交）")
+    return {
+        "ok": False,
+        "cookie": cookie,
+        # 只有「Turnstile 没签发 token」这一类才值得换住宅代理重试（换出口正是它的解法）；
+        # 账密不对换出口白搭，标不可重试，别把 job 预算烧在三次代理重试上。
+        "retryable": not token_ready,
+        "message": (
+            "账密登录没成功"
+            + ("：" + "；".join(why) if why else "")
+            + f"。页面：{json.dumps(snap, ensure_ascii=False)[:180]}"
+        )[:300],
+    }
     if not submitted.get("clicked"):
         await page.press(input_selector(pw_el), "Enter")
         submitted = {"clicked": True, "label": "Enter"}
@@ -3264,14 +3273,16 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 or "signin" in url.lower()
             )
 
-        async def do_login(reason):
-            """登录一次并把新 Cookie 记进 fresh；失败返回要直接回给面板的结果。"""
-            nonlocal fresh, login_rounds, snap
-            login_rounds += 1
-            log(f"  🔑 {name}: {reason} → 用账密登录（第 {login_rounds} 次）")
-            login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
-            log(f"  🔑 {name}: 登录结果 {login.get('message')}")
             if not login.get("ok"):
+                out = {
+                    "name": name,
+                    "ok": False,
+                    "message": f"账密登录失败：{login.get('message')}"[:300],
+                }
+                # 登录失败是否值得换出口重试，由登录函数判断（Turnstile 没签发 token 才值得）
+                if login.get("retryable") is not None:
+                    out["retryable"] = bool(login["retryable"])
+                return out
                 return {
                     "name": name,
                     "ok": False,
