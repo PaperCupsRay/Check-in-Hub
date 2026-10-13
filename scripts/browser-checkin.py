@@ -3122,6 +3122,28 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         """把当前页的 CF 挑战处理掉（等待 + 拟人点勾选框）。"""
         return await wait_cloudflare(page)
 
+    # 抓登录相关的网络响应：站点把「为什么不让登」写在接口回话里（例如要邮箱动态验证、
+    # 密码错误），只靠页面跳转猜不出来 —— 2026-10-13 就是靠这份日志定位到点错按钮的。
+    net = []
+
+    async def on_response(resp):
+        try:
+            u = resp.url or ""
+            if not re.search(r"signin|sign-in|login|/api/|auth", u, re.I):
+                return
+            if len(net) >= 12:
+                return
+            body = ""
+            try:
+                body = (await resp.text())[:300]
+            except Exception:  # noqa: BLE001
+                body = "(读取响应体失败)"
+            net.append({"status": resp.status, "method": resp.request.method, "url": u[:90], "body": body})
+        except Exception:  # noqa: BLE001
+            pass
+
+    page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+
     async def form_with_password(budget_s=12):
         """等登录页把表单渲染出来，返回结构。
 
@@ -3239,6 +3261,11 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                 await page.press(target, "Enter")
             submitted = {"clicked": True, "how": "Enter"}
         log(f"  🔑 {name}: 第 {steps} 步提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+        # 等一小会儿让登录接口的响应落地，再把抓到的网络日志打出来（含服务端回话）
+        await page.wait_for_timeout(1500)
+        if net:
+            log(f"  🛰️ {name}: 第 {steps} 步登录相关响应 {json.dumps(net[-4:], ensure_ascii=False)[:700]}")
+            net.clear()
 
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
