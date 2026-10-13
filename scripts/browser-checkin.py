@@ -3352,7 +3352,10 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
     # emailSignIn.html?email=…（邮箱动态验证：发送验证码 → 填验证码）。所以这里最多走三步：
     # 每步读表单 → 填空 → 提交 → 等会话变化或离开登录流程。
     steps = 0
-    while steps < 3:
+    # 最多两轮：第一次点按钮，被甩到邮箱动态验证后回登录页换 Enter 再试一次。
+    # 别再多试 —— 站点对密码登录有**账号维度的每日限流**（RATE_LIMITED，2026-10-13 实测），
+    # 我们自己反复重试就会把用户当天的密码登录额度耗光。
+    while steps < 2:
         steps += 1
         if use_enter:
             # 上一轮点按钮被甩到邮箱验证：回登录页，换「在密码框按 Enter」再提交一次
@@ -3455,6 +3458,7 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         log(f"  🔑 {name}: 第 {steps} 步提交方式 {json.dumps(submitted, ensure_ascii=False)}")
         # 等一小会儿让登录接口的响应落地，再把**页面内钩子**抓到的响应体打出来（含服务端回话）
         await page.wait_for_timeout(1500)
+        hooked = {}
         try:
             hooked = await page.evaluate(JS_NET_READ)
             log(f"  🛰️ {name}: 第 {steps} 步登录接口回话 {json.dumps(hooked, ensure_ascii=False)[:700]}")
@@ -3463,6 +3467,29 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         if net:
             log(f"  🛰️ {name}: 第 {steps} 步页面级响应 {json.dumps(net[-3:], ensure_ascii=False)[:500]}")
             net.clear()
+
+        # 服务端回话要透出来 —— 2026-10-13 线上实测：账号被限流时 /api/account/signIn 回
+        # {"success":false,"error":"RATE_LIMITED","message":"该账户操作过于频繁，请明天再尝试
+        # 密码登录，或者改用邮箱验证登录"}。这正是「填了正确账密也登不上、还被甩去邮箱验证」
+        # 的原因，而旧文案只会说「会话 Cookie 没变」，把用户引向「密码错了」。
+        # 限流是**账号维度、按天**的，继续重试只会更糟 —— 立刻停并标不可重试。
+        for item in (hooked or {}).get("net") or []:
+            body = str(item.get("body") or "")
+            if "RATE_LIMITED" in body or "过于频繁" in body:
+                server_msg = ""
+                try:
+                    server_msg = str(json.loads(body).get("message") or "")
+                except Exception:  # noqa: BLE001
+                    server_msg = body[:120]
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        f"站点限流（RATE_LIMITED）：{server_msg or '该账户操作过于频繁'}"
+                        "。这是账号维度的每日限制，今天再试也不会成功：明天再试密码登录，"
+                        "或改用 Cookie 方式（浏览器里手动登录一次即可）。"
+                    )[:300],
+                }
 
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -3512,16 +3539,28 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         why.append("登录页的 Turnstile 没签发 token（challenge 没过，机房出口常见）")
     if session_value(cookie) == before:
         why.append("会话 Cookie 没变")
+    # 服务端最后一次回话（可能点明限流 / 密码错 / 需要邮箱验证）优先展示，别让用户只看
+    # 「会话 Cookie 没变」去猜。
+    server_said = ""
+    for item in (hooked or {}).get("net") or []:
+        body = str(item.get("body") or "")
+        if not body:
+            continue
+        try:
+            server_said = str(json.loads(body).get("message") or body)[:120]
+        except Exception:  # noqa: BLE001
+            server_said = body[:120]
     return {
         "ok": False,
         "cookie": cookie,
         # 只有「Turnstile 没签发 token」这一类才值得换住宅代理重试（换出口正是它的解法）；
-        # 账密不对换出口白搭，标不可重试，别把 job 预算烧在三次代理重试上。
+        # 账密不对 / 账号限流换出口白搭，标不可重试，别把 job 预算和账号配额都烧掉。
         "retryable": not token_ready,
         "message": (
             "账密登录没成功"
             + ("：" + "；".join(why) if why else "")
-            + f"。站点提示：{str(snap.get('body') or '')[:110]}"
+            + (f"。服务端回话：{server_said}" if server_said else "")
+            + (f"。页面提示：{str(snap.get('body') or '')[:90]}" if not server_said else "")
         )[:300],
     }
 

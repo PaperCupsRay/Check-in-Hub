@@ -220,6 +220,14 @@ for _fn in (
 ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
 ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
 
+print("\n[14] 服务端回话要透出（RATE_LIMITED 这类必须原样告诉用户，别只说「Cookie 没变」）")
+_src2 = open(os.path.join(HERE, "browser-checkin.py"), encoding="utf-8").read()
+ok("RATE_LIMITED" in _src2, "识别账号限流（该账户操作过于频繁）")
+ok("账号维度的每日限制" in _src2, "限流文案说明是每日限制、今天再试也没用")
+ok("服务端回话：" in _src2, "失败文案带上服务端原话")
+ok("while steps < 2:" in _src2, "每轮最多两次登录尝试（别把账号配额烧光）")
+ok("JS_NET_HOOK" in _src2 and "JS_NET_READ" in _src2, "页面内钩子抓登录接口响应体")
+
 print("\n[13] 登录输入用真实按键 + 提交失败换 Enter 再试（站点按 keydown 判空时会走错分支）")
 ok(callable(getattr(mod, "type_like_human", None)), "type_like_human 可调用")
 ok("JS_LOGIN_DIAG" in dir(mod) and "pwFormIndex" in mod.JS_LOGIN_DIAG, "表单结构诊断可用")
