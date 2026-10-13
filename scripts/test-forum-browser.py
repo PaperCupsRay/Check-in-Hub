@@ -220,6 +220,14 @@ for _fn in (
 ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
 ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
 
+print("\n[13] 登录输入用真实按键 + 提交失败换 Enter 再试（站点按 keydown 判空时会走错分支）")
+ok(callable(getattr(mod, "type_like_human", None)), "type_like_human 可调用")
+ok("JS_LOGIN_DIAG" in dir(mod) and "pwFormIndex" in mod.JS_LOGIN_DIAG, "表单结构诊断可用")
+_src = open(os.path.join(HERE, "browser-checkin.py"), encoding="utf-8").read()
+ok("await type_like_human(page, sel, username)" in _src, "账号用真实按键输入")
+ok("await type_like_human(page, sel, password)" in _src, "密码用真实按键输入")
+ok("use_enter = True" in _src, "被甩到邮箱验证后会换 Enter 提交再试一次")
+
 print("\n[12] 登录提交按钮必须锚定在密码表单里（别点顶栏/邮箱验证那一栏的「登录」）")
 ok("JS_PICK_LOGIN_SUBMIT" in dir(mod), "JS_PICK_LOGIN_SUBMIT 存在")
 ok("__hub_login_submit" in mod.JS_PICK_LOGIN_SUBMIT, "会给表单提交按钮打标记 id")

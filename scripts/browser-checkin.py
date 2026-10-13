@@ -3018,6 +3018,40 @@ JS_LOGIN_DIAG = """() => {
     };
 }"""
 
+
+async def type_like_human(page, selector, value):
+    """用**真实按键**输入，而不是直接设 value。
+
+    为什么非这样不可：有些站点前端靠 keydown/keyup 判断「用户真的填了」，直接 fill 设值
+    在它的状态里仍是空 —— 于是点提交时它按「没填」处理，走错分支（2026-10-13 NodeSeek
+    的密码登录疑似如此：填了正确账密点登录，站点直接跳邮箱动态验证）。
+
+    顺序：先聚焦并清空，再逐字输入；page.type 不可用时退到 press_sequentially，最后才 fill。
+    """
+    try:
+        await page.click(selector, timeout=5000)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await page.fill(selector, "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await page.type(selector, value, delay=60)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await page.locator(selector).press_sequentially(value, delay=60)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await page.fill(selector, value)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
 # 站点前端 JS 里的登录判定逻辑（为什么跳到 emailSignIn）：从 performance 资源里找 JS 再 grep
 JS_LOGIN_JS_PROBE = """async () => {
     const urls = performance.getEntriesByType('resource')
@@ -3152,10 +3186,10 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
     的真实登录页）与 /login，都不行就回首页点「登录」入口，然后把账密填进它自己的表单提交
     —— 与「人手动登录」等价，CF 放行 cookie、站点自己那套前端逻辑都在场。
 
-    **登录是分步的**（2026-10-13 线上实测）：signIn.html 先收账号，提交后跳到
-    `emailSignIn.html?email=…` 再收密码 —— 只提交一次会停在第二步，看起来像「登录失败」。
+    **登录是分步的**：signIn.html 是密码表单（账号 + 密码 + 它自己的 Turnstile），
+    提交后站点可能跳到 `emailSignIn.html?email=…`（邮箱动态验证：发送验证码 → 填验证码）。
     所以下面是一个最多三步的循环：每步读表单 → 填空（只填空框，别覆盖站点预填的邮箱）→
-    提交 → 等会话变化或离开登录流程。
+    提交 → 等会话变化或离开登录流程。邮箱动态验证那一步需要收邮件，脚本做不到，会如实报出来。
 
     **登录页同样有 CF 挑战**（用户确认，实测 /signIn.html 上挂着 Turnstile）：每一步都先过
     挑战；表单里的 Turnstile 等它签发 token（机房直连出口拿不到，住宅代理 7s 就拿到）；
@@ -3259,13 +3293,18 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
     token_ready = True
     cookie = ""
     snap = {}
-    # NodeSeek 的登录是**分步**的：signIn.html 先收账号，提交后跳到
-    # emailSignIn.html?email=… 再收密码。2026-10-13 线上实测：只提交一次会停在第二步，
-    # 于是被判成「登录失败」（用户填的账号密码其实是对的）。所以这里最多走三步：
+    use_enter = False
+    # NodeSeek 的登录是**分步**的：signIn.html 是密码表单，提交后站点可能跳到
+    # emailSignIn.html?email=…（邮箱动态验证：发送验证码 → 填验证码）。所以这里最多走三步：
     # 每步读表单 → 填空 → 提交 → 等会话变化或离开登录流程。
     steps = 0
     while steps < 3:
         steps += 1
+        if use_enter:
+            # 上一轮点按钮被甩到邮箱验证：回登录页，换「在密码框按 Enter」再提交一次
+            log(f"  🔑 {name}: 回 /signIn.html 改用 Enter 提交再试一次")
+            await page.goto(base + "/signIn.html", wait_until=wait_until, timeout=nav_ms)
+            await settle()
         form = await form_with_password(budget_s=8)
         log(f"  🔑 {name}: 第 {steps} 步表单 {json.dumps(form, ensure_ascii=False)[:700]}")
         user_el, pw_el = pick_login_fields(form.get("inputs"))
@@ -3288,11 +3327,44 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
             await click_captcha_checkbox(page)
 
         filled = []
-        if user_el and await fill_if_empty(input_selector(user_el), username, "账号"):
-            filled.append("账号")
-        if pw_el and await fill_if_empty(input_selector(pw_el), password, "密码"):
-            filled.append("密码")
+        if user_el:
+            sel = input_selector(user_el)
+            try:
+                cur = (await page.input_value(sel)) or ""
+            except Exception:  # noqa: BLE001
+                cur = ""
+            if cur.strip():
+                log(f"  🔑 {name}: 账号框已有值（{cur[:3]}…），不覆盖")
+            elif await type_like_human(page, sel, username):
+                filled.append("账号（真实按键）")
+        if pw_el:
+            sel = input_selector(pw_el)
+            try:
+                cur = (await page.input_value(sel)) or ""
+            except Exception:  # noqa: BLE001
+                cur = ""
+            if cur.strip():
+                log(f"  🔑 {name}: 密码框已有值，不覆盖")
+            elif await type_like_human(page, sel, password):
+                filled.append("密码（真实按键）")
         log(f"  🔑 {name}: 第 {steps} 步填写 {('、'.join(filled) or '（无，沿用站点已有值）')}")
+        # 输入后回读一次：确认站点前端真的收到了这两个值（直接设 value 时它可能仍是空）
+        try:
+            echo = await page.evaluate(
+                """() => {
+                    const pw = document.querySelector('input[type=password]');
+                    const em = document.querySelector('#stacked-email')
+                        || document.querySelector('input[type=email]')
+                        || document.querySelector('input[placeholder=Email]');
+                    return {
+                        emailLen: em ? (em.value || '').length : -1,
+                        pwLen: pw ? (pw.value || '').length : -1,
+                    };
+                }"""
+            )
+            log(f"  🔑 {name}: 第 {steps} 步输入回读 {json.dumps(echo, ensure_ascii=False)}")
+        except Exception:  # noqa: BLE001
+            pass
         # 提交前把页面所有表单结构打出来：站点把「密码登录」与「邮箱/短信动态验证」放在同一页，
         # 只看按钮文案分不清归属（2026-10-13 排查点错入口时就卡在这里）。
         diag = await page.evaluate(JS_LOGIN_DIAG)
@@ -3300,22 +3372,27 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
 
         # 提交：先挑「密码框那个表单里的提交按钮」（页面别处也有「登录」元素，见
         # JS_PICK_LOGIN_SUBMIT 的说明），再用**真鼠标**点它；点不到才退回页面内提交。
-        picked = await page.evaluate(JS_PICK_LOGIN_SUBMIT)
-        log(f"  🔑 {name}: 第 {steps} 步登录按钮候选 {json.dumps(picked, ensure_ascii=False)[:420]}")
-        submitted = None
-        if picked.get("found"):
-            try:
-                await page.click("#__hub_login_submit", timeout=6000)
-                submitted = {"clicked": True, "how": "mouse", "label": picked.get("label")}
-            except Exception as e:  # noqa: BLE001
-                log(f"  🔑 {name}: 真鼠标点击失败（{str(e)[:70]}），改用页面内提交")
-        if not submitted:
-            submitted = await page.evaluate(JS_SUBMIT_LOGIN)
-        if not submitted.get("clicked"):
-            target = input_selector(pw_el) or input_selector(user_el)
-            if target:
-                await page.press(target, "Enter")
+        # use_enter 为真时改用「在密码框按 Enter」——被站点甩到邮箱动态验证后换一种提交方式再试。
+        if use_enter and pw_el:
+            await page.press(input_selector(pw_el), "Enter")
             submitted = {"clicked": True, "how": "Enter"}
+        else:
+            picked = await page.evaluate(JS_PICK_LOGIN_SUBMIT)
+            log(f"  🔑 {name}: 第 {steps} 步登录按钮候选 {json.dumps(picked, ensure_ascii=False)[:420]}")
+            submitted = None
+            if picked.get("found"):
+                try:
+                    await page.click("#__hub_login_submit", timeout=6000)
+                    submitted = {"clicked": True, "how": "mouse", "label": picked.get("label")}
+                except Exception as e:  # noqa: BLE001
+                    log(f"  🔑 {name}: 真鼠标点击失败（{str(e)[:70]}），改用页面内提交")
+            if not submitted:
+                submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+            if not submitted.get("clicked"):
+                target = input_selector(pw_el) or input_selector(user_el)
+                if target:
+                    await page.press(target, "Enter")
+                submitted = {"clicked": True, "how": "Enter"}
         log(f"  🔑 {name}: 第 {steps} 步提交方式 {json.dumps(submitted, ensure_ascii=False)}")
         # 等一小会儿让登录接口的响应落地，再把抓到的网络日志打出来（含服务端回话）
         await page.wait_for_timeout(1500)
@@ -3342,14 +3419,18 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                 # 真伪由调用方用签到接口验证（USER NOT FOUND 会再报回来），这里不拦。
                 log(f"  🔑 {name}: 已离开登录流程（落地 {snap.get('url')}），按成功处理")
                 return {"ok": True, "cookie": cookie, "message": "已用账密登录（站点未换会话 Cookie）"}
-            # 被转到「邮箱动态验证」页（emailSignIn.html）：先把这一页的结构和站点前端 JS 里
-            # 的判定逻辑抓下来 —— 只有知道「它凭什么跳到这儿」，才能判断是站点策略（要验证码，
-            # 脚本代收不了邮件）还是我们漏了什么（例如某个字段没填、某个 cookie 才是设备信任）。
+            # 被转到「邮箱动态验证」页（emailSignIn.html）：先换一种提交方式再试一次
+            # （在密码框按 Enter —— 有些站点对「点按钮」与「回车提交」走不同分支），
+            # 仍不行就把这一页的结构与站点前端 JS 判定逻辑抓下来如实报出。
             if "emailsignin" in str(snap.get("url") or "").lower():
                 diag = await page.evaluate(JS_LOGIN_DIAG)
-                log(f"  🔎 {name}: emailSignIn 表单结构 {json.dumps(diag, ensure_ascii=False)[:900]}")
+                log(f"  🔎 {name}: emailSignIn 表单结构 {json.dumps(diag, ensure_ascii=False)[:700]}")
+                if not use_enter:
+                    use_enter = True
+                    log(f"  🔑 {name}: 改用 Enter 提交再试一次")
+                    continue
                 probe = await page.evaluate(JS_LOGIN_JS_PROBE)
-                log(f"  🔎 {name}: 前端 JS 判定逻辑 {json.dumps(probe, ensure_ascii=False)[:900]}")
+                log(f"  🔎 {name}: 前端 JS 判定逻辑 {json.dumps(probe, ensure_ascii=False)[:500]}")
                 return {
                     "ok": False,
                     "retryable": False,
@@ -3357,7 +3438,6 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                         "站点把这次登录转到了「邮箱动态验证」（emailSignIn.html）："
                         "要往账号邮箱发验证码再填回来，脚本代收不了邮件。"
                         "请在浏览器里手动登录一次并重抄整站 Cookie（或继续用 Cookie 方式）。"
-                        f"页面结构：{json.dumps(diag.get('forms') or [], ensure_ascii=False)[:110]}"
                     )[:300],
                 }
         log(f"  🔑 {name}: 第 {steps} 步提交后仍在登录流程（{snap.get('url')}），继续下一步")
