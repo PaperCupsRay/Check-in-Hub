@@ -3273,6 +3273,13 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 or "signin" in url.lower()
             )
 
+        async def do_login(reason):
+            """登录一次并把新 Cookie 记进 fresh；失败返回要直接回给面板的结果。"""
+            nonlocal fresh, login_rounds, snap
+            login_rounds += 1
+            log(f"  🔑 {name}: {reason} → 用账密登录（第 {login_rounds} 次）")
+            login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
+            log(f"  🔑 {name}: 登录结果 {login.get('message')}")
             if not login.get("ok"):
                 out = {
                     "name": name,
@@ -3283,12 +3290,6 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 if login.get("retryable") is not None:
                     out["retryable"] = bool(login["retryable"])
                 return out
-                return {
-                    "name": name,
-                    "ok": False,
-                    "retryable": False,
-                    "message": f"账密登录失败：{login.get('message')}"[:300],
-                }
             fresh = login.get("cookie") or ""
             snap = await open_board()
             return None
