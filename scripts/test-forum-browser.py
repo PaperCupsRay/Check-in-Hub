@@ -217,8 +217,16 @@ for _fn in (
     "parse_gacha_titles",
 ):
     ok(callable(getattr(mod, _fn, None)), f"{_fn} 可调用")
-ok("nearPassword" in mod.JS_SUBMIT_LOGIN, "提交按钮选择器带「靠近密码框」优先级（别点错邮箱验证那一栏）")
-ok("inVerifyBlock" in mod.JS_SUBMIT_LOGIN, "提交按钮选择器排除「验证码/动态验证」区块")
+ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
+ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
+
+print("\n[12] 登录提交按钮必须锚定在密码表单里（别点顶栏/邮箱验证那一栏的「登录」）")
+ok("JS_PICK_LOGIN_SUBMIT" in dir(mod), "JS_PICK_LOGIN_SUBMIT 存在")
+ok("__hub_login_submit" in mod.JS_PICK_LOGIN_SUBMIT, "会给表单提交按钮打标记 id")
+ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内")
+ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围")
+ok("requestSubmit" in mod.JS_SUBMIT_LOGIN, "页面内兜底优先 requestSubmit（触发站点自己的 submit 处理）")
+ok("emailSignIn" not in mod.JS_PICK_LOGIN_SUBMIT, "挑按钮时不把邮箱验证入口当目标")
 
 print(f"\n{'❌' if failures else '✅'} {checks - failures}/{checks} 通过")
 raise SystemExit(1 if failures else 0)

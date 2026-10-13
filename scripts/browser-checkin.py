@@ -2945,47 +2945,63 @@ JS_LOGIN_FORM = """() => {
     };
 }"""
 
-# 提交登录表单：**必须点对「密码登录」那个按钮**。
-# 2026-10-13 线上实测：signIn.html 上「密码登录」与「邮箱动态验证」两个区块的按钮文案
-# 都叫「登录」，而邮箱那一栏的按钮在 DOM 里更靠前且是隐藏的 —— 旧实现取第一个匹配项，
-# 于是点进了邮箱动态验证流程（站点跳到 emailSignIn.html?email=… 要验证码），
-# 看起来像「账号密码不对」。这里按可靠性排序：与密码框共享最近容器 > 可见且不在
-# 「验证码/动态验证」区块内 > 第一个可见 > 兜底。
-JS_SUBMIT_LOGIN = """() => {
+# 挑「真正的登录按钮」：**必须锚定在密码框所属的那个表单/容器里**。
+#
+# 2026-10-13 线上实测（用户截图确认）：signIn.html 上除了密码表单里那个提交按钮（用户圈出来的
+# 那个），页面上还有别的「登录」元素 —— 顶栏的登录入口、以及「邮箱动态验证 / 短信动态验证」
+# 那一栏。旧实现只按文案找第一个匹配项，点中的不是表单提交按钮，于是站点把这次「登录」
+# 当成邮箱动态验证的入口，跳到 emailSignIn.html?email=… 要验证码，看起来像「账号密码不对」。
+#
+# 这里只做「挑 + 打标记 + 把候选结构回报」：真正点击交给 Playwright 的真鼠标点击
+# （见 nodeseek_browser_login），因为站点可能挂 mousedown/mouseup 或挡了 el.click()。
+JS_PICK_LOGIN_SUBMIT = """() => {
     const vis = el => !!(el.offsetWidth || el.offsetHeight);
-    const label = el => (el.innerText || el.value || '').trim();
+    const label = el => (el.innerText || el.value || el.getAttribute('value') || '').trim();
+    const isLogin = el => /登录|登入|login|sign\\s*in/i.test(label(el));
     const pw = document.querySelector('input[type=password]');
-    const cands = [...document.querySelectorAll('button,input[type=submit]')]
-        .filter(b => /登录|登入|login|sign\\s*in/i.test(label(b)));
-    const visible = cands.filter(vis);
-    const pool = visible.length ? visible : cands;
-    const inVerifyBlock = el => {
-        let a = el.parentElement, depth = 0;
-        while (a && depth < 3) {
-            if (/验证码|动态验证/.test(a.innerText || '')) return true;
-            a = a.parentElement; depth++;
-        }
-        return false;
+    const form = pw && pw.closest ? pw.closest('form') : null;
+    const scope = form || (pw && pw.closest ? pw.closest('div,section,main') : null) || document;
+    // 候选清单：页面上所有「登录」元素的结构，含是否在密码表单内 —— 选择器再出问题时靠它定位
+    const dump = [...document.querySelectorAll('button,input[type=submit],a')]
+        .filter(isLogin)
+        .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            text: label(el).slice(0, 12),
+            type: el.getAttribute('type') || '',
+            visible: vis(el),
+            inPasswordForm: !!(form && form.contains(el)),
+            href: (el.getAttribute('href') || '').slice(0, 48),
+        }))
+        .slice(0, 10);
+    const inScope = [...scope.querySelectorAll('button,input[type=submit]')].filter(isLogin);
+    const pick = inScope.filter(vis)[0] || inScope[0] || null;
+    const old = document.getElementById('__hub_login_submit');
+    if (old) old.removeAttribute('id');
+    if (pick) pick.id = '__hub_login_submit';
+    return {
+        found: !!pick,
+        label: pick ? label(pick).slice(0, 16) : '',
+        type: pick ? (pick.getAttribute('type') || pick.tagName.toLowerCase()) : '',
+        hasForm: !!form,
+        candidates: dump,
     };
-    const nearPassword = el => {
-        if (!pw) return false;
-        let a = el.parentElement, depth = 0;
-        while (a && depth < 4) {
-            if (a.contains(pw)) return true;
-            a = a.parentElement; depth++;
-        }
-        return false;
-    };
-    let pick = pool.find(nearPassword) || pool.find(b => !inVerifyBlock(b)) || pool[0] || null;
-    const dump = cands.map(b => label(b).slice(0, 10) + (vis(b) ? '' : '(hidden)')).slice(0, 8);
-    if (!pick) {
-        const pw2 = document.querySelector('input[type=password]');
-        const form = pw2 && pw2.closest ? pw2.closest('form') : null;
-        if (form) { form.submit(); return {clicked: true, label: 'form.submit', candidates: dump}; }
-        return {clicked: false, candidates: dump};
+}"""
+
+# 页面内提交兜底（真鼠标点击失败时用）：优先 requestSubmit（会触发站点自己的 submit 处理），
+# 退到点标记元素，再退到 form.submit()。
+JS_SUBMIT_LOGIN = """() => {
+    const pw = document.querySelector('input[type=password]');
+    const form = pw && pw.closest ? pw.closest('form') : null;
+    const tagged = document.getElementById('__hub_login_submit');
+    if (form && typeof form.requestSubmit === 'function') {
+        try {
+            form.requestSubmit(tagged && tagged.tagName !== 'A' ? tagged : undefined);
+            return {clicked: true, how: 'requestSubmit', label: tagged ? (tagged.innerText || '').trim().slice(0, 16) : ''};
+        } catch (e) {}
     }
-    pick.click();
-    return {clicked: true, label: label(pick).slice(0, 16), candidates: dump};
+    if (tagged) { tagged.click(); return {clicked: true, how: 'click', label: (tagged.innerText || '').trim().slice(0, 16)}; }
+    if (form) { form.submit(); return {clicked: true, how: 'form.submit'}; }
+    return {clicked: false, how: 'none'};
 }"""
 
 
@@ -3202,14 +3218,27 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
             filled.append("账号")
         if pw_el and await fill_if_empty(input_selector(pw_el), password, "密码"):
             filled.append("密码")
-        log(f"  🔑 {name}: 第 {steps} 步填写 {('、'.join(filled) or '（无，沿用站点已有值）')}，提交")
-        submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+        log(f"  🔑 {name}: 第 {steps} 步填写 {('、'.join(filled) or '（无，沿用站点已有值）')}")
+
+        # 提交：先挑「密码框那个表单里的提交按钮」（页面别处也有「登录」元素，见
+        # JS_PICK_LOGIN_SUBMIT 的说明），再用**真鼠标**点它；点不到才退回页面内提交。
+        picked = await page.evaluate(JS_PICK_LOGIN_SUBMIT)
+        log(f"  🔑 {name}: 第 {steps} 步登录按钮候选 {json.dumps(picked, ensure_ascii=False)[:420]}")
+        submitted = None
+        if picked.get("found"):
+            try:
+                await page.click("#__hub_login_submit", timeout=6000)
+                submitted = {"clicked": True, "how": "mouse", "label": picked.get("label")}
+            except Exception as e:  # noqa: BLE001
+                log(f"  🔑 {name}: 真鼠标点击失败（{str(e)[:70]}），改用页面内提交")
+        if not submitted:
+            submitted = await page.evaluate(JS_SUBMIT_LOGIN)
         if not submitted.get("clicked"):
             target = input_selector(pw_el) or input_selector(user_el)
             if target:
                 await page.press(target, "Enter")
-            submitted = {"clicked": True, "label": "Enter"}
-        log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+            submitted = {"clicked": True, "how": "Enter"}
+        log(f"  🔑 {name}: 第 {steps} 步提交方式 {json.dumps(submitted, ensure_ascii=False)}")
 
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
