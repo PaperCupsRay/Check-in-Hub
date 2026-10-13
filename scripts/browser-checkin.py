@@ -2603,14 +2603,38 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             await page.goto(base + "/daily_checkin", wait_until=wait_until, timeout=nav_ms)
             await wait_cloudflare(page)
             final_url = page.url or ""
+            # 诊断：把 /daily_checkin 的真实内容抓一份下来。这一页的形态决定了
+            # 「今天签没签」该怎么判 —— 2026-10-13 前几轮的猜测都太乐观（页面里
+            # 出现「已签到」就当签过了，实测那个词来自别处），所以先把原文摆在日志里。
+            detail = {}
+            try:
+                detail = await page.evaluate(
+                    """() => {
+                        const body = document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '';
+                        const html = document.documentElement ? document.documentElement.outerHTML : '';
+                        return {
+                            url: location.href,
+                            title: document.title,
+                            body: body.slice(0, 600),
+                            cookies: (document.cookie || '').split(';')
+                                .map(s => s.split('=')[0].trim()).filter(Boolean),
+                            hasLoginForm: !!document.querySelector('input[type=password]'),
+                            hasDailyCheckin: !!document.querySelector('a[href="/daily_checkin"]'),
+                            userCard: /class="user-avatar-big"\\s+href="\\/user\\/\\d+"/.test(html),
+                        };
+                    }"""
+                )
+            except Exception as e:  # noqa: BLE001
+                detail = {"error": str(e)[:100]}
+            log(f"  🔎 {name}: /daily_checkin 详情 {json.dumps(detail, ensure_ascii=False)[:700]}")
             html = await page.content()
-            if "/login" in final_url:
+            if "/login" in final_url or detail.get("hasLoginForm"):
                 return {
                     "name": name,
                     "ok": False,
                     "retryable": False,
                     "message": (
-                        "Cookie 已失效：/daily_checkin 把浏览器通道甩到了登录页"
+                        "Cookie 已失效：/daily_checkin 拿到的是登录页"
                         f"（{final_url}）。请在浏览器里重新登录 https://linux.sb，"
                         "再重抄整站 Cookie 到渠道里（换出口解决不了会话失效）。"
                     )[:300],
@@ -2638,7 +2662,7 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                 if evidence:
                     message = f"{message} · 站点原文：{evidence}"
                 result = {"name": name, "ok": True, "message": message[:300]}
-            elif not forum_logged_in(snap):
+            elif not (forum_logged_in(snap) or detail.get("userCard") or detail.get("hasDailyCheckin")):
                 return {
                     "name": name,
                     "ok": False,
