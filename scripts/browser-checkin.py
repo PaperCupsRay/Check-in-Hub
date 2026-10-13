@@ -2988,6 +2988,58 @@ JS_PICK_LOGIN_SUBMIT = """() => {
 }"""
 
 # 页面内提交兜底（真鼠标点击失败时用）：优先 requestSubmit（会触发站点自己的 submit 处理），
+
+# 结构诊断：把页面上**所有表单**连同各自的输入/按钮/可见文本列出来，并标出「密码框属于哪个
+# 表单」。2026-10-13 排查「点了登录却跳到邮箱动态验证」时靠它定位 —— 只看单个按钮的文案
+# 分不清它属于哪个区块（密码登录 / 邮箱动态验证 / 短信动态验证）。
+JS_LOGIN_DIAG = """() => {
+    const vis = el => !!(el.offsetWidth || el.offsetHeight);
+    const txt = el => (el.innerText || el.value || el.getAttribute('value') || '').trim().slice(0, 18);
+    const allForms = [...document.querySelectorAll('form')];
+    const pw = document.querySelector('input[type=password]');
+    const pwForm = pw && pw.closest ? pw.closest('form') : null;
+    const forms = allForms.slice(0, 5).map((f, i) => ({
+        i,
+        action: (f.getAttribute('action') || '').slice(0, 36),
+        method: (f.getAttribute('method') || 'get').toLowerCase(),
+        inputs: [...f.querySelectorAll('input')].slice(0, 8)
+            .map(el => `${el.getAttribute('type') || 'text'}:${el.getAttribute('name') || el.id || ''}${vis(el) ? '' : '(h)'}`),
+        buttons: [...f.querySelectorAll('button,input[type=submit]')].slice(0, 6)
+            .map(el => `${el.tagName.toLowerCase()}:${txt(el)}${vis(el) ? '' : '(h)'}`),
+        text: (f.innerText || '').replace(/\\s+/g, ' ').slice(0, 60),
+    }));
+    return {
+        url: location.href,
+        formsCount: allForms.length,
+        pwFormIndex: pwForm ? allForms.indexOf(pwForm) : -1,
+        pwVisible: pw ? vis(pw) : false,
+        forms,
+        body: (document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '').slice(0, 260),
+    };
+}"""
+
+# 站点前端 JS 里的登录判定逻辑（为什么跳到 emailSignIn）：从 performance 资源里找 JS 再 grep
+JS_LOGIN_JS_PROBE = """async () => {
+    const urls = performance.getEntriesByType('resource')
+        .map(r => r.name)
+        .filter(n => /\\.js(\\?|$)/i.test(n) && /prelogin|postlogin|signin|login|index/i.test(n))
+        .slice(0, 4);
+    const out = {urls, hits: []};
+    for (const u of urls) {
+        try {
+            const r = await fetch(u, {credentials: 'include'});
+            const t = await r.text();
+            for (const kw of ['emailSignIn', 'needEmail', 'emailVerify', 'verifyType', 'smsSignIn', 'password']) {
+                const i = t.indexOf(kw);
+                if (i >= 0) out.hits.push({kw, ctx: t.slice(Math.max(0, i - 130), i + 130)});
+                if (out.hits.length >= 6) break;
+            }
+        } catch (e) { out.hits.push({err: u.slice(-30) + ':' + String(e).slice(0, 40)}); }
+        if (out.hits.length >= 6) break;
+    }
+    return out;
+}"""
+
 # 退到点标记元素，再退到 form.submit()。
 JS_SUBMIT_LOGIN = """() => {
     const pw = document.querySelector('input[type=password]');
@@ -3241,6 +3293,10 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         if pw_el and await fill_if_empty(input_selector(pw_el), password, "密码"):
             filled.append("密码")
         log(f"  🔑 {name}: 第 {steps} 步填写 {('、'.join(filled) or '（无，沿用站点已有值）')}")
+        # 提交前把页面所有表单结构打出来：站点把「密码登录」与「邮箱/短信动态验证」放在同一页，
+        # 只看按钮文案分不清归属（2026-10-13 排查点错入口时就卡在这里）。
+        diag = await page.evaluate(JS_LOGIN_DIAG)
+        log(f"  🔎 {name}: 第 {steps} 步表单结构 {json.dumps(diag, ensure_ascii=False)[:800]}")
 
         # 提交：先挑「密码框那个表单里的提交按钮」（页面别处也有「登录」元素，见
         # JS_PICK_LOGIN_SUBMIT 的说明），再用**真鼠标**点它；点不到才退回页面内提交。
@@ -3290,28 +3346,9 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
             # 的判定逻辑抓下来 —— 只有知道「它凭什么跳到这儿」，才能判断是站点策略（要验证码，
             # 脚本代收不了邮件）还是我们漏了什么（例如某个字段没填、某个 cookie 才是设备信任）。
             if "emailsignin" in str(snap.get("url") or "").lower():
-                detail = await page.evaluate(JS_LOGIN_FORM)
-                log(f"  🔎 {name}: emailSignIn 结构 {json.dumps(detail, ensure_ascii=False)[:700]}")
-                probe = await page.evaluate(
-                    """async () => {
-                        const out = {scripts: [], hits: []};
-                        const srcs = [...document.querySelectorAll('script[src]')]
-                            .map(s => s.getAttribute('src'))
-                            .filter(s => /preLogin|postLogin|signIn|login/i.test(s)).slice(0, 3);
-                        for (const src of srcs) {
-                            try {
-                                const r = await fetch(src, {credentials: 'include'});
-                                const t = await r.text();
-                                out.scripts.push({src, len: t.length});
-                                for (const kw of ['emailSignIn', 'needEmail', 'emailVerify', 'verify_type', 'dynamic']) {
-                                    const i = t.indexOf(kw);
-                                    if (i >= 0) out.hits.push({src, kw, ctx: t.slice(Math.max(0, i - 160), i + 160)});
-                                }
-                            } catch (e) { out.scripts.push({src, err: String(e).slice(0, 60)}); }
-                        }
-                        return out;
-                    }"""
-                )
+                diag = await page.evaluate(JS_LOGIN_DIAG)
+                log(f"  🔎 {name}: emailSignIn 表单结构 {json.dumps(diag, ensure_ascii=False)[:900]}")
+                probe = await page.evaluate(JS_LOGIN_JS_PROBE)
                 log(f"  🔎 {name}: 前端 JS 判定逻辑 {json.dumps(probe, ensure_ascii=False)[:900]}")
                 return {
                     "ok": False,
@@ -3320,7 +3357,7 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                         "站点把这次登录转到了「邮箱动态验证」（emailSignIn.html）："
                         "要往账号邮箱发验证码再填回来，脚本代收不了邮件。"
                         "请在浏览器里手动登录一次并重抄整站 Cookie（或继续用 Cookie 方式）。"
-                        f"页面结构：{json.dumps(detail, ensure_ascii=False)[:110]}"
+                        f"页面结构：{json.dumps(diag.get('forms') or [], ensure_ascii=False)[:110]}"
                     )[:300],
                 }
         log(f"  🔑 {name}: 第 {steps} 步提交后仍在登录流程（{snap.get('url')}），继续下一步")
