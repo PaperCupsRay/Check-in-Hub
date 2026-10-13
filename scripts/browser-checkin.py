@@ -3286,9 +3286,33 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                 # 真伪由调用方用签到接口验证（USER NOT FOUND 会再报回来），这里不拦。
                 log(f"  🔑 {name}: 已离开登录流程（落地 {snap.get('url')}），按成功处理")
                 return {"ok": True, "cookie": cookie, "message": "已用账密登录（站点未换会话 Cookie）"}
-            # 被转到「邮箱动态验证」页（emailSignIn.html）：站点要往账号邮箱发验证码再填回来，
-            # 脚本没法代收邮件，继续点下去只是白烧预算 —— 直接如实报出来。
+            # 被转到「邮箱动态验证」页（emailSignIn.html）：先把这一页的结构和站点前端 JS 里
+            # 的判定逻辑抓下来 —— 只有知道「它凭什么跳到这儿」，才能判断是站点策略（要验证码，
+            # 脚本代收不了邮件）还是我们漏了什么（例如某个字段没填、某个 cookie 才是设备信任）。
             if "emailsignin" in str(snap.get("url") or "").lower():
+                detail = await page.evaluate(JS_LOGIN_FORM)
+                log(f"  🔎 {name}: emailSignIn 结构 {json.dumps(detail, ensure_ascii=False)[:700]}")
+                probe = await page.evaluate(
+                    """async () => {
+                        const out = {scripts: [], hits: []};
+                        const srcs = [...document.querySelectorAll('script[src]')]
+                            .map(s => s.getAttribute('src'))
+                            .filter(s => /preLogin|postLogin|signIn|login/i.test(s)).slice(0, 3);
+                        for (const src of srcs) {
+                            try {
+                                const r = await fetch(src, {credentials: 'include'});
+                                const t = await r.text();
+                                out.scripts.push({src, len: t.length});
+                                for (const kw of ['emailSignIn', 'needEmail', 'emailVerify', 'verify_type', 'dynamic']) {
+                                    const i = t.indexOf(kw);
+                                    if (i >= 0) out.hits.push({src, kw, ctx: t.slice(Math.max(0, i - 160), i + 160)});
+                                }
+                            } catch (e) { out.scripts.push({src, err: String(e).slice(0, 60)}); }
+                        }
+                        return out;
+                    }"""
+                )
+                log(f"  🔎 {name}: 前端 JS 判定逻辑 {json.dumps(probe, ensure_ascii=False)[:900]}")
                 return {
                     "ok": False,
                     "retryable": False,
@@ -3296,7 +3320,7 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                         "站点把这次登录转到了「邮箱动态验证」（emailSignIn.html）："
                         "要往账号邮箱发验证码再填回来，脚本代收不了邮件。"
                         "请在浏览器里手动登录一次并重抄整站 Cookie（或继续用 Cookie 方式）。"
-                        f"页面提示：{str(snap.get('body') or '')[:90]}"
+                        f"页面结构：{json.dumps(detail, ensure_ascii=False)[:110]}"
                     )[:300],
                 }
         log(f"  🔑 {name}: 第 {steps} 步提交后仍在登录流程（{snap.get('url')}），继续下一步")
