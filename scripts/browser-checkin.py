@@ -3055,16 +3055,22 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
     的真实登录页）与 /login，都不行就回首页点「登录」入口，然后把账密填进它自己的表单提交
     —— 与「人手动登录」等价，CF 放行 cookie、站点自己那套前端逻辑都在场。
 
-    **登录页同样有 CF 挑战**（用户 2026-10-13 确认，实测 /signIn.html 上确实挂了 Turnstile）：
-    每一步都先过挑战；表单里的 Turnstile 等它签发 token；提交后又被挑战继续解。
+    **登录是分步的**（2026-10-13 线上实测）：signIn.html 先收账号，提交后跳到
+    `emailSignIn.html?email=…` 再收密码 —— 只提交一次会停在第二步，看起来像「登录失败」。
+    所以下面是一个最多三步的循环：每步读表单 → 填空（只填空框，别覆盖站点预填的邮箱）→
+    提交 → 等会话变化或离开登录流程。
+
+    **登录页同样有 CF 挑战**（用户确认，实测 /signIn.html 上挂着 Turnstile）：每一步都先过
+    挑战；表单里的 Turnstile 等它签发 token（机房直连出口拿不到，住宅代理 7s 就拿到）；
+    提交后又被挑战继续解。
 
     「登录成功」的判据必须**排掉注入的那份旧 Cookie**：渠道里的旧 session 本来就在 jar 里，
-    只查「有没有 session」会把一次注定失败的登录（密码错/验证码没过）判成成功
-    —— 2026-10-13 线上实测踩过：错密码提交后 1 秒就报「登录成功」，随后签到仍 USER NOT FOUND。
-    所以要求：会话值**变了**，或页面已经离开登录页（站点登录成功会跳走），且页面不再是游客态。
+    只查「有没有 session」会把一次注定失败的登录判成成功（2026-10-13 实测踩过：错密码提交后
+    1 秒就报「登录成功」，随后签到仍 USER NOT FOUND）。所以要求会话值**变了**，或已离开登录
+    流程；而「到底有没有真的登上」由调用方用签到接口定论（USER NOT FOUND 会再报回来）。
 
-    返回 {ok, cookie?, message}。失败时 message 里带上页面结构，并带上 Turnstile/challenge
-    字样 —— 后者是 main() 换住宅代理重试的触发词（机房 IP 拿不到 token 是已知问题）。
+    返回 {ok, cookie?, message}。失败时 message 里带上站点提示与页面结构，并带上
+    Turnstile/challenge 字样 —— 后者是 main() 换住宅代理重试的触发词。
     """
 
     async def settle():
@@ -3108,68 +3114,101 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         form = await form_with_password()
         log(f"  🔑 {name}: 登录页结构 {json.dumps(form, ensure_ascii=False)[:520]}")
 
-    user_el, pw_el = pick_login_fields(form.get("inputs"))
-    if not (user_el and pw_el):
-        return {
-            "ok": False,
-            "message": (
-                "没能在登录页找到账号/密码输入框（站点可能改了登录页，或该站只走 OAuth）。"
-                f"页面结构：{json.dumps(form, ensure_ascii=False)[:200]}"
-            )[:300],
-        }
-
-    # 登录表单自己挂的验证码：Turnstile 要等它签发 token（站点前端提交时会带上），
-    # reCAPTCHA/hCaptcha 点一次勾选框。挑战页那种「Just a moment」由 settle() 处理。
-    token_ready = True
-    if form.get("hasTurnstile"):
-        log(f"  🔑 {name}: 登录页带 Turnstile，等它签发 token（拟人点勾选框）")
-        tok, src = await wait_any_token(page, TOKEN_WAIT_S)
-        token_ready = bool(tok)
-        log(f"  🔑 {name}: Turnstile token {'已就绪（' + str(src) + '）' if tok else '没等到，仍尝试提交'}")
-    if form.get("hasRecaptcha"):
-        log(f"  🔑 {name}: 登录页带 reCAPTCHA，点勾选框")
-        await click_captcha_checkbox(page)
-
     host = base.split("//", 1)[1].split("/", 1)[0]
     suffix = host[4:] if host.startswith("www.") else host
     # 提交前先记下 jar 里的会话值：判「登录成功」要拿它做对比（见函数文档字符串）
     before = session_value(cookies_to_header(await page.context.cookies(), suffix))
 
-    await page.fill(input_selector(user_el), username)
-    await page.fill(input_selector(pw_el), password)
-    log(f"  🔑 {name}: 已填账号（{input_selector(user_el)}）与密码，提交")
-    submitted = await page.evaluate(JS_SUBMIT_LOGIN)
-    if not submitted.get("clicked"):
-        await page.press(input_selector(pw_el), "Enter")
-        submitted = {"clicked": True, "label": "Enter"}
-    log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+    async def fill_if_empty(selector, value, label):
+        """只填空框：站点会把邮箱预填进第二步的表单，覆盖掉反而破坏流程。"""
+        if not selector:
+            return False
+        try:
+            cur = (await page.input_value(selector)) or ""
+        except Exception:  # noqa: BLE001
+            cur = ""
+        if cur.strip():
+            log(f"  🔑 {name}: {label}框已有值（{cur[:3]}…），不覆盖")
+            return False
+        await page.fill(selector, value)
+        return True
 
+    def in_login_flow(s):
+        url = str(s.get("url") or "").lower()
+        return "signin" in url or "/login" in url or "signup" in url
+
+    token_ready = True
     cookie = ""
     snap = {}
-    for _ in range(15):
-        await page.wait_for_timeout(1000)
-        # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
-        await settle()
-        cookie = cookies_to_header(await page.context.cookies(), suffix)
-        snap = await page_snapshot(page)
-        after = session_value(cookie)
-        changed = bool(after) and after != before
-        left_login = (
-            "signin" not in str(snap.get("url") or "").lower()
-            and "/login" not in str(snap.get("url") or "")
-        )
-        if (changed or left_login) and not snap.get("guestHint"):
-            log(
-                f"  🔑 {name}: 登录成功（会话值{'已更新' if changed else '未变但已离开登录页'}，"
-                f"落地 {snap.get('url')}，Cookie {len(cookie)} 字符）"
-            )
-            return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
+    # NodeSeek 的登录是**分步**的：signIn.html 先收账号，提交后跳到
+    # emailSignIn.html?email=… 再收密码。2026-10-13 线上实测：只提交一次会停在第二步，
+    # 于是被判成「登录失败」（用户填的账号密码其实是对的）。所以这里最多走三步：
+    # 每步读表单 → 填空 → 提交 → 等会话变化或离开登录流程。
+    steps = 0
+    while steps < 3:
+        steps += 1
+        form = await form_with_password(budget_s=8)
+        log(f"  🔑 {name}: 第 {steps} 步表单 {json.dumps(form, ensure_ascii=False)[:700]}")
+        user_el, pw_el = pick_login_fields(form.get("inputs"))
+        if not (user_el or pw_el):
+            return {
+                "ok": False,
+                "message": (
+                    f"登录第 {steps} 步没找到可填的输入框（站点可能改了登录页）。"
+                    f"页面结构：{json.dumps(form, ensure_ascii=False)[:200]}"
+                )[:300],
+            }
+        # 验证码：Turnstile 只在第一步等一次（每步都等会白烧 45s）；reCAPTCHA 每步点一下
+        if steps == 1 and form.get("hasTurnstile"):
+            log(f"  🔑 {name}: 登录页带 Turnstile，等它签发 token（拟人点勾选框）")
+            tok, src = await wait_any_token(page, TOKEN_WAIT_S)
+            token_ready = bool(tok)
+            log(f"  🔑 {name}: Turnstile token {'已就绪（' + str(src) + '）' if tok else '没等到，仍尝试提交'}")
+        if form.get("hasRecaptcha"):
+            log(f"  🔑 {name}: 登录页带 reCAPTCHA，点勾选框")
+            await click_captcha_checkbox(page)
+
+        filled = []
+        if user_el and await fill_if_empty(input_selector(user_el), username, "账号"):
+            filled.append("账号")
+        if pw_el and await fill_if_empty(input_selector(pw_el), password, "密码"):
+            filled.append("密码")
+        log(f"  🔑 {name}: 第 {steps} 步填写 {('、'.join(filled) or '（无，沿用站点已有值）')}，提交")
+        submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+        if not submitted.get("clicked"):
+            target = input_selector(pw_el) or input_selector(user_el)
+            if target:
+                await page.press(target, "Enter")
+            submitted = {"clicked": True, "label": "Enter"}
+        log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(1000)
+            # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
+            await settle()
+            cookie = cookies_to_header(await page.context.cookies(), suffix)
+            snap = await page_snapshot(page)
+            after = session_value(cookie)
+            if after and after != before:
+                log(
+                    f"  🔑 {name}: 登录成功（会话值已更新，落地 {snap.get('url')}，"
+                    f"Cookie {len(cookie)} 字符）"
+                )
+                return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
+            if not in_login_flow(snap):
+                # 已离开登录流程但会话值没变：站点可能沿用同一份 session 放行。
+                # 真伪由调用方用签到接口验证（USER NOT FOUND 会再报回来），这里不拦。
+                log(f"  🔑 {name}: 已离开登录流程（落地 {snap.get('url')}），按成功处理")
+                return {"ok": True, "cookie": cookie, "message": "已用账密登录（站点未换会话 Cookie）"}
+        log(f"  🔑 {name}: 第 {steps} 步提交后仍在登录流程（{snap.get('url')}），继续下一步")
+
     snap = await page_snapshot(page)
     why = []
     if not token_ready:
         why.append("登录页的 Turnstile 没签发 token（challenge 没过，机房出口常见）")
     if session_value(cookie) == before:
-        why.append("会话 Cookie 没变（多半账号/密码不对，或站点拒绝了这次提交）")
+        why.append("会话 Cookie 没变")
     return {
         "ok": False,
         "cookie": cookie,
@@ -3179,7 +3218,7 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         "message": (
             "账密登录没成功"
             + ("：" + "；".join(why) if why else "")
-            + f"。页面：{json.dumps(snap, ensure_ascii=False)[:180]}"
+            + f"。站点提示：{str(snap.get('body') or '')[:110]}"
         )[:300],
     }
 
