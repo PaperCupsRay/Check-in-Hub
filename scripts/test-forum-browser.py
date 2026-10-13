@@ -110,6 +110,20 @@ ok(
     is True,
     "gain=0 = 今日已签（判据与 worker 侧一致）",
 )
+
+print("\n[9b] 真实登录页结构（线上实测 /signIn.html：搜索框是陷阱，账号框是 #stacked-email）")
+SIGNIN_INPUTS = [
+    {"name": "q", "type": "text", "id": "search-site", "placeholder": "", "autocomplete": "", "visible": False},
+    {"name": "q", "type": "text", "id": "search-site2", "placeholder": "Search", "autocomplete": "", "visible": True},
+    {"name": "", "type": "submit", "id": "", "placeholder": "", "autocomplete": "", "visible": False},
+    {"name": "", "type": "text", "id": "stacked-email", "placeholder": "Email", "autocomplete": "", "visible": True},
+    {"name": "", "type": "password", "id": "stacked-password", "placeholder": "Password", "autocomplete": "", "visible": True},
+]
+su, sp = mod.pick_login_fields(SIGNIN_INPUTS)
+ok(su and su["id"] == "stacked-email", "账号框挑的是 Email 那个，不是顶部搜索框", str(su))
+ok(sp and sp["id"] == "stacked-password", "密码框挑对", str(sp))
+ok(mod.input_selector(su) == "#stacked-email", "没有 name 时用 id 选择器", mod.input_selector(su))
+
 ok(
     mod.attendance_result(
         "NodeSeek", {"status": 500, "body": {"message": "USER NOT FOUND", "status": 404, "success": False}}

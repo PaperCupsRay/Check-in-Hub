@@ -3038,30 +3038,50 @@ def has_session_cookie(cookie_header):
     return bool(re.search(r"(^|;\s*)(session|pjwt)=", cookie_header or ""))
 
 
+def session_value(cookie_header):
+    """从 Cookie 头里取出会话 cookie 的值（session / pjwt 各取一个），用于「换没换到新的」。"""
+    out = {}
+    for name in ("session", "pjwt"):
+        m = re.search(r"(?:^|;\s*)" + name + r"=([^;]*)", cookie_header or "")
+        if m:
+            out[name] = m.group(1)
+    return out
+
+
 async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password):
     """用渠道里的账密登录 NodeSeek，换一份新会话 Cookie。
 
-    站点没有公开的登录 API，所以这里**驱动它自己的登录页**：打开 /login（那儿没有密码框
-    就回首页点「登录」），把账密填进它自己的表单再提交 —— 与「人手动登录」等价，CF 放行
-    cookie、站点自己那套前端逻辑都在场。
+    站点没有公开的登录 API，所以这里**驱动它自己的登录页**：依次试 /signIn.html（线上实测
+    的真实登录页）与 /login，都不行就回首页点「登录」入口，然后把账密填进它自己的表单提交
+    —— 与「人手动登录」等价，CF 放行 cookie、站点自己那套前端逻辑都在场。
 
-    **登录页同样有 CF 挑战**（用户 2026-10-13 确认）：所以每一步都先过挑战；表单里若挂了
-    Turnstile 还要等它签发 token 再提交；提交后如果又被挑战，继续解，而不是当成登录失败。
+    **登录页同样有 CF 挑战**（用户 2026-10-13 确认，实测 /signIn.html 上确实挂了 Turnstile）：
+    每一步都先过挑战；表单里的 Turnstile 等它签发 token；提交后又被挑战继续解。
 
-    返回 {ok, cookie?, message}。失败时 message 里带上页面结构（inputs/forms/buttons）：
-    选择器一旦对不上，只有这份结构能说明站点改成了什么。
+    「登录成功」的判据必须**排掉注入的那份旧 Cookie**：渠道里的旧 session 本来就在 jar 里，
+    只查「有没有 session」会把一次注定失败的登录（密码错/验证码没过）判成成功
+    —— 2026-10-13 线上实测踩过：错密码提交后 1 秒就报「登录成功」，随后签到仍 USER NOT FOUND。
+    所以要求：会话值**变了**，或页面已经离开登录页（站点登录成功会跳走），且页面不再是游客态。
+
+    返回 {ok, cookie?, message}。失败时 message 里带上页面结构，并带上 Turnstile/challenge
+    字样 —— 后者是 main() 换住宅代理重试的触发词（机房 IP 拿不到 token 是已知问题）。
     """
 
     async def settle():
-        """把当前页的 CF 挑战处理掉（等待 + 拟人点勾选框），返回是否已过。"""
+        """把当前页的 CF 挑战处理掉（等待 + 拟人点勾选框）。"""
         return await wait_cloudflare(page)
 
-    await page.goto(base + "/login", wait_until=wait_until, timeout=nav_ms)
-    await settle()
-    form = await page.evaluate(JS_LOGIN_FORM)
-    log(f"  🔑 {name}: /login 结构 {json.dumps(form, ensure_ascii=False)[:520]}")
+    form = {}
+    for path in ("/signIn.html", "/login"):
+        await page.goto(base + path, wait_until=wait_until, timeout=nav_ms)
+        await settle()
+        form = await page.evaluate(JS_LOGIN_FORM)
+        log(f"  🔑 {name}: {path} 结构 {json.dumps(form, ensure_ascii=False)[:520]}")
+        if any(str(i.get("type")) == "password" for i in form.get("inputs") or []):
+            break
+        log(f"  🔑 {name}: {path} 上没有密码框，换下一个入口")
     if not any(str(i.get("type")) == "password" for i in form.get("inputs") or []):
-        log(f"  🔑 {name}: /login 上没有密码框，回首页找登录入口")
+        log(f"  🔑 {name}: 两个登录地址都没有密码框，回首页找登录入口")
         await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
         await settle()
         clicked = await page.evaluate(JS_CLICK_LOGIN_ENTRY)
@@ -3084,13 +3104,21 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
 
     # 登录表单自己挂的验证码：Turnstile 要等它签发 token（站点前端提交时会带上），
     # reCAPTCHA/hCaptcha 点一次勾选框。挑战页那种「Just a moment」由 settle() 处理。
+    token_ready = True
     if form.get("hasTurnstile"):
         log(f"  🔑 {name}: 登录页带 Turnstile，等它签发 token（拟人点勾选框）")
         tok, src = await wait_any_token(page, TOKEN_WAIT_S)
+        token_ready = bool(tok)
         log(f"  🔑 {name}: Turnstile token {'已就绪（' + str(src) + '）' if tok else '没等到，仍尝试提交'}")
     if form.get("hasRecaptcha"):
         log(f"  🔑 {name}: 登录页带 reCAPTCHA，点勾选框")
         await click_captcha_checkbox(page)
+
+    host = base.split("//", 1)[1].split("/", 1)[0]
+    suffix = host[4:] if host.startswith("www.") else host
+    # 提交前先记下 jar 里的会话值：判「登录成功」要拿它做对比（见函数文档字符串）
+    before = session_value(cookies_to_header(await page.context.cookies(), suffix))
+    before_url = page.url or ""
 
     await page.fill(input_selector(user_el), username)
     await page.fill(input_selector(pw_el), password)
@@ -3101,26 +3129,36 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         submitted = {"clicked": True, "label": "Enter"}
     log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
 
-    host = base.split("//", 1)[1].split("/", 1)[0]
-    suffix = host[4:] if host.startswith("www.") else host
     cookie = ""
+    snap = {}
     for _ in range(15):
         await page.wait_for_timeout(1000)
         # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
         await settle()
         cookie = cookies_to_header(await page.context.cookies(), suffix)
         snap = await page_snapshot(page)
-        if has_session_cookie(cookie) and not snap.get("guestHint"):
-            log(f"  🔑 {name}: 登录成功（Cookie {len(cookie)} 字符，落地 {snap.get('url')}）")
+        after = session_value(cookie)
+        changed = bool(after) and after != before
+        left_login = "signin" not in str(snap.get("url") or "").lower() and "/login" not in str(snap.get("url") or "")
+        if (changed or left_login) and not snap.get("guestHint"):
+            log(
+                f"  🔑 {name}: 登录成功（会话值{'已更新' if changed else '未变但已离开登录页'}，"
+                f"落地 {snap.get('url')}，Cookie {len(cookie)} 字符）"
+            )
             return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
     snap = await page_snapshot(page)
+    why = []
+    if not token_ready:
+        why.append("登录页的 Turnstile 没签发 token（challenge 没过，机房出口常见）")
+    if session_value(cookie) == before:
+        why.append("会话 Cookie 没变（多半账号/密码不对，或站点拒绝了这次提交）")
     return {
         "ok": False,
         "cookie": cookie,
         "message": (
-            "账密登录没成功：页面仍是游客态或没下发会话 Cookie。可能是账号/密码不对、"
-            "验证码没过，或登录页结构变了。"
-            f"页面：{json.dumps(snap, ensure_ascii=False)[:200]}"
+            "账密登录没成功"
+            + ("：" + "；".join(why) if why else "")
+            + f"。页面：{json.dumps(snap, ensure_ascii=False)[:180]}"
         )[:300],
     }
 async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
@@ -3212,11 +3250,25 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
         log(f"  🔍 {name}: 页面 {json.dumps(snap, ensure_ascii=False)[:320]}")
 
         fresh = ""
-        logged_in_now = False
-        # 没 Cookie、或页面明显是游客态（签到入口写着「登录后签到」）时先登录再谈签到：
-        # 否则那一枪必然 USER NOT FOUND，白等一轮。
-        if has_creds and (not has_cookie or snap.get("guestHint")):
-            log(f"  🔑 {name}: {'没有 Cookie' if not has_cookie else '页面是游客态'} → 先用账密登录")
+        login_rounds = 0
+
+        def session_dead(res, snap):
+            """这一枪是不是「会话失效」形态（USER NOT FOUND / 游客页 / 被甩到登录页）。"""
+            body = (res or {}).get("body") if isinstance((res or {}).get("body"), dict) else {}
+            probe = str(body.get("message") or "") + str((res or {}).get("text") or "")
+            url = str((res or {}).get("url") or "")
+            return (
+                "user not found" in probe.lower()
+                or bool(snap.get("guestHint"))
+                or "/login" in url
+                or "signin" in url.lower()
+            )
+
+        async def do_login(reason):
+            """登录一次并把新 Cookie 记进 fresh；失败返回要直接回给面板的结果。"""
+            nonlocal fresh, login_rounds, snap
+            login_rounds += 1
+            log(f"  🔑 {name}: {reason} → 用账密登录（第 {login_rounds} 次）")
             login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
             log(f"  🔑 {name}: 登录结果 {login.get('message')}")
             if not login.get("ok"):
@@ -3227,37 +3279,29 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                     "message": f"账密登录失败：{login.get('message')}"[:300],
                 }
             fresh = login.get("cookie") or ""
-            logged_in_now = True
             snap = await open_board()
+            return None
+
+        # 没 Cookie、或页面明显是游客态（签到入口写着「登录后签到」）时先登录再谈签到：
+        # 否则那一枪必然 USER NOT FOUND，白等一轮。
+        if has_creds and (not has_cookie or snap.get("guestHint")):
+            failed = await do_login("没有 Cookie" if not has_cookie else "页面是游客态")
+            if failed:
+                return failed
 
         result, res = await attempt()
 
-        # 会话失效（USER NOT FOUND / 被甩到登录页 / 页面转成游客态）且填了账密：
-        # 登录换新的再跑一遍 —— 这就是「填账密不用手抄 Cookie」的兑现点。
-        if result is None and has_creds and not logged_in_now:
-            res_body = (res or {}).get("body") if isinstance((res or {}).get("body"), dict) else {}
-            probe = str(res_body.get("message") or "") + str((res or {}).get("text") or "")
-            session_dead = (
-                "user not found" in probe.lower()
-                or snap.get("guestHint")
-                or "/login" in str((res or {}).get("url") or "")
-            )
-            if session_dead:
-                log(f"  🔑 {name}: 会话已失效 → 用账密登录换新 Cookie 后重试")
-                login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
-                log(f"  🔑 {name}: 登录结果 {login.get('message')}")
-                if login.get("ok"):
-                    fresh = login.get("cookie") or ""
-                    logged_in_now = True
-                    snap = await open_board()
-                    result, res = await attempt()
-                else:
-                    return {
-                        "name": name,
-                        "ok": False,
-                        "retryable": False,
-                        "message": f"Cookie 已失效，且账密登录失败：{login.get('message')}"[:300],
-                    }
+        # 会话失效（USER NOT FOUND / 被甩到登录页 / 页面转成游客态）且填了账密：登录换新的
+        # 再跑一遍 —— 这就是「填账密不用手抄 Cookie」的兑现点。
+        #
+        # 这里**不信任**登录自报的成功：2026-10-13 线上实测，错密码提交后 1 秒就被判成
+        # 「登录成功」（旧 jar 里的 session 还在），于是重试一次仍是 USER NOT FOUND。
+        # 所以循环条件看的是「签到这一枪仍然说会话失效」，最多两轮，避免死循环。
+        while result is None and has_creds and login_rounds < 2 and session_dead(res, snap):
+            failed = await do_login("会话已失效")
+            if failed:
+                return failed
+            result, res = await attempt()
 
         if result is not None:
             if fresh:
@@ -3265,6 +3309,20 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 # 面板（/api/gh/result）会把它写回 KV，省掉手抄；cf_clearance 之类会被剔除
                 result["newTokens"] = {"cookie": fresh}
             return result
+
+        # 登录过、签到这一枪却仍说会话失效：说明登录没真正换到有效会话（密码不对 /
+        # 登录页 Turnstile 没过）。这句要单独说清楚，否则用户会以为「填了账密也没用」。
+        if login_rounds and session_dead(res, snap):
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"账密登录没能换到有效会话（已试 {login_rounds} 次）：签到接口仍回 "
+                    "USER NOT FOUND。常见原因：账号/密码不对，或登录页的 Cloudflare "
+                    "Turnstile challenge 没通过（机房出口常见，可换住宅代理再试）。"
+                )[:300],
+            }
 
         # 判定不了：把几种真实原因分开说，别笼统报「签到失败」
         body = res.get("body") if isinstance(res.get("body"), dict) else {}
@@ -3279,14 +3337,14 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 "message": (
                     f"站点风控回话 high risk action（HTTP {status}，浏览器通道同样被拦）。"
                     f"这不是接口写错：多为会话失效或站点要求浏览器指纹签名。"
-                    f"{'账密登录已试过；' if logged_in_now else ''}"
+                    f"{'账密登录已试过；' if login_rounds else ''}"
                     f"页面：{json.dumps(snap, ensure_ascii=False)[:160]}"
                 )[:300],
             }
         # 「USER NOT FOUND」= 站点按这份 Cookie 查不到用户：会话已失效（2026-10-13 实测形态：
         # HTTP 500 + {"message":"USER NOT FOUND","status":404}）。走到这里说明没填账密
         # （填了的话上面已经登录重试过），所以只能让用户补凭证。
-        if "user not found" in (msg + text).lower() or snap.get("guestHint"):
+        if session_dead(res, snap):
             return {
                 "name": name,
                 "ok": False,
