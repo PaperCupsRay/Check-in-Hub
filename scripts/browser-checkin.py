@@ -3071,11 +3071,27 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         """把当前页的 CF 挑战处理掉（等待 + 拟人点勾选框）。"""
         return await wait_cloudflare(page)
 
+    async def form_with_password(budget_s=12):
+        """等登录页把表单渲染出来，返回结构。
+
+        必须等：线上实测 /signIn.html 的账号/密码框是**前端 JS 后渲染**的，刚导航完
+        页面上只有顶部搜索框（一个 name="q" 的输入），立刻判定「没有密码框」会误判，
+        接着白跑一趟 /login（Express 回 Cannot GET /login）。
+        """
+        deadline = time.monotonic() + budget_s
+        f = {}
+        while time.monotonic() < deadline:
+            f = await page.evaluate(JS_LOGIN_FORM)
+            if any(str(i.get("type")) == "password" for i in f.get("inputs") or []):
+                return f
+            await page.wait_for_timeout(1000)
+        return f
+
     form = {}
     for path in ("/signIn.html", "/login"):
         await page.goto(base + path, wait_until=wait_until, timeout=nav_ms)
         await settle()
-        form = await page.evaluate(JS_LOGIN_FORM)
+        form = await form_with_password()
         log(f"  🔑 {name}: {path} 结构 {json.dumps(form, ensure_ascii=False)[:520]}")
         if any(str(i.get("type")) == "password" for i in form.get("inputs") or []):
             break
@@ -3089,7 +3105,7 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         if clicked.get("found"):
             await page.wait_for_timeout(2500)
             await settle()
-        form = await page.evaluate(JS_LOGIN_FORM)
+        form = await form_with_password()
         log(f"  🔑 {name}: 登录页结构 {json.dumps(form, ensure_ascii=False)[:520]}")
 
     user_el, pw_el = pick_login_fields(form.get("inputs"))
@@ -3115,6 +3131,39 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         await click_captcha_checkbox(page)
 
     host = base.split("//", 1)[1].split("/", 1)[0]
+    suffix = host[4:] if host.startswith("www.") else host
+    # 提交前先记下 jar 里的会话值：判「登录成功」要拿它做对比（见函数文档字符串）
+    before = session_value(cookies_to_header(await page.context.cookies(), suffix))
+
+    await page.fill(input_selector(user_el), username)
+    await page.fill(input_selector(pw_el), password)
+    log(f"  🔑 {name}: 已填账号（{input_selector(user_el)}）与密码，提交")
+    submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+    if not submitted.get("clicked"):
+        await page.press(input_selector(pw_el), "Enter")
+        submitted = {"clicked": True, "label": "Enter"}
+    log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+
+    cookie = ""
+    snap = {}
+    for _ in range(15):
+        await page.wait_for_timeout(1000)
+        # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
+        await settle()
+        cookie = cookies_to_header(await page.context.cookies(), suffix)
+        snap = await page_snapshot(page)
+        after = session_value(cookie)
+        changed = bool(after) and after != before
+        left_login = (
+            "signin" not in str(snap.get("url") or "").lower()
+            and "/login" not in str(snap.get("url") or "")
+        )
+        if (changed or left_login) and not snap.get("guestHint"):
+            log(
+                f"  🔑 {name}: 登录成功（会话值{'已更新' if changed else '未变但已离开登录页'}，"
+                f"落地 {snap.get('url')}，Cookie {len(cookie)} 字符）"
+            )
+            return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
     snap = await page_snapshot(page)
     why = []
     if not token_ready:
@@ -3133,43 +3182,8 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
             + f"。页面：{json.dumps(snap, ensure_ascii=False)[:180]}"
         )[:300],
     }
-    if not submitted.get("clicked"):
-        await page.press(input_selector(pw_el), "Enter")
-        submitted = {"clicked": True, "label": "Enter"}
-    log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
 
-    cookie = ""
-    snap = {}
-    for _ in range(15):
-        await page.wait_for_timeout(1000)
-        # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
-        await settle()
-        cookie = cookies_to_header(await page.context.cookies(), suffix)
-        snap = await page_snapshot(page)
-        after = session_value(cookie)
-        changed = bool(after) and after != before
-        left_login = "signin" not in str(snap.get("url") or "").lower() and "/login" not in str(snap.get("url") or "")
-        if (changed or left_login) and not snap.get("guestHint"):
-            log(
-                f"  🔑 {name}: 登录成功（会话值{'已更新' if changed else '未变但已离开登录页'}，"
-                f"落地 {snap.get('url')}，Cookie {len(cookie)} 字符）"
-            )
-            return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
-    snap = await page_snapshot(page)
-    why = []
-    if not token_ready:
-        why.append("登录页的 Turnstile 没签发 token（challenge 没过，机房出口常见）")
-    if session_value(cookie) == before:
-        why.append("会话 Cookie 没变（多半账号/密码不对，或站点拒绝了这次提交）")
-    return {
-        "ok": False,
-        "cookie": cookie,
-        "message": (
-            "账密登录没成功"
-            + ("：" + "；".join(why) if why else "")
-            + f"。页面：{json.dumps(snap, ensure_ascii=False)[:180]}"
-        )[:300],
-    }
+
 async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
     """NodeSeek：真浏览器过 CF → 页面内 POST /api/attendance?random=true。
 
