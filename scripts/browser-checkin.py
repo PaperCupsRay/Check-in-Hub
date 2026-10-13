@@ -2444,18 +2444,6 @@ async def wait_cloudflare(page, budget_s=30):
     return None
 
 
-def cf_failure(name, snap, action):
-    return {
-        "name": name,
-        "ok": False,
-        "message": (
-            f"{action}被 Cloudflare challenge 拦住（浏览器通道也没过）："
-            f"停在挑战页 {snap.get('title') or '?'} @ {snap.get('url') or '?'}。"
-            "换一条住宅代理出口再试；若每条出口都一样，说明站点把挑战升级到了浏览器过不去的地步。"
-        )[:300],
-    }
-
-
 async def page_snapshot(page):
     """页面快照：标题 / URL / 登录线索 / 正文头部。
 
@@ -2477,8 +2465,10 @@ async def page_snapshot(page):
                     hasDailyCheckin: !!document.querySelector('a[href="/daily_checkin"]'),
                     userCard: /class="user-avatar-big"\\s+href="\\/user\\/\\d+"/.test(html),
                     userNameLink: /class="user-name"\\s+href="\\/user\\/\\d+"/.test(html),
-                    // NodeSeek：游客页的签到入口写着「登录后签到」
-                    guestHint: /登录后签到|登录后可见|请先登录/.test(html),
+                    // NodeSeek：游客页的签到入口写着「登录后签到」。必须查 innerText，
+                    // 不能查 outerHTML —— 站点把「登录」和「后签到」分在两个标签里，
+                    // 原始 HTML 里连不成一个词（2026-10-13 实测 guestHint 因此漏报）
+                    guestHint: /登录后签到|登录后可见|请先登录/.test(body),
                     hasUserName: !!document.querySelector('.user-name'),
                     body: body.slice(0, 300),
                 };
@@ -2576,11 +2566,17 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             if rec:
                 # 只在命中词后面那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
                 # 对整页跑 flash_points 会把总分当成今日奖励。
-                pts = flash_points(html[rec.start(): rec.start() + 140])
+                seg = html[rec.start(): rec.start() + 140]
+                pts = flash_points(seg)
+                # 把站点原文一并给出来：这条结论是「页面里出现了今日签到记录」推出来的，
+                # 留一句原文，事后能核对是真记录还是页面别处的词（可审计，别只给结论）。
+                snippet = re.sub(r"<[^>]+>", " ", seg)
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:60]
                 message = "今日已签过（linux.sb 打开页面即自动签到，__pageFlash 为空即当日已完成）"
                 if pts is not None:
                     message = f"{message} · {pts:g} 积分"
-                result = {"name": name, "ok": True, "message": message[:300]}
+                log(f"  🔎 {name}: /daily_checkin 记录原文：{snippet}")
+                result = {"name": name, "ok": True, "message": f"{message} · 站点原文：{snippet}"[:300]}
             elif not forum_logged_in(snap):
                 return {
                     "name": name,
@@ -2610,16 +2606,21 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             result["message"] = f"{result['message']} · 抽称号：{g['message']}"[:300]
             if g.get("titles"):
                 result["titles"] = g["titles"]
-        log(f"  ✅ {name}: {result['message']}")
+        # 结果由 main() 统一打印（这里再打一遍日志里会出现两条 ✅，读起来像签了两回）
         return result
 
 
 async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
-    """抽称号（免费一抽）：优先点站点自己的按钮，点不到就退回页面内表单 POST。
+    """抽称号（**只抽免费那一发**）：点站点自己的免费按钮，送结果页解析称号。
 
     与 src/adapters/linuxsb.js 的 gacha() 是同一套流程（_csrf → POST /gacha_pull →
-    302 → 解析结果页），区别只在这一枪从真浏览器里发出，所以 CF 放行 cookie 和
-    站点自己的 _csrf 都是现成的。
+    302 → 解析结果页），区别只在这一枪从真浏览器里发出，CF 放行 cookie 与站点自己的
+    _csrf 都是现成的。
+
+    **绝不点带价格的按钮**：站点在「今日免费一抽」用完之后会把按钮文案改成
+    「抽一次 (10 积分)」，照点就是替用户花积分 —— 2026-10-13 线上实测踩到过这一下，
+    白扣 10 积分。所以这里只认「免费」或 data-cost="0" 且文案无价格的按钮，找不到
+    就直接跳过并说明（宁可漏抽，不可乱花）。
     """
     try:
         await page.goto(base + "/gacha", wait_until=wait_until, timeout=nav_ms)
@@ -2627,15 +2628,31 @@ async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
         html = ""
         clicked = await page.evaluate(
             """() => {
-                const free = document.querySelector('[data-cost="0"]')
-                    || document.querySelector('form[action="/gacha_pull"] button, form[action="/gacha_pull"] input[type=submit]')
-                    || [...document.querySelectorAll('button,input[type=submit],a')]
-                        .find(el => /免费|一抽/.test((el.innerText || el.value || '')));
-                if (!free) return {found: false};
-                const label = (free.innerText || free.value || free.getAttribute('value') || '').trim().slice(0, 20);
-                if (free.tagName === 'FORM') { free.submit(); return {found: true, label: 'form'}; }
-                free.click();
-                return {found: true, label};
+                const label = el => (el.innerText || el.value || el.getAttribute('value') || '').trim();
+                const price = el => {
+                    const m = /(\\d+(?:\\.\\d+)?)\\s*积分/.exec(label(el));
+                    return m ? Number(m[1]) : null;
+                };
+                const desc = el => {
+                    const cost = el.getAttribute ? el.getAttribute('data-cost') : null;
+                    return el.tagName.toLowerCase() + '「' + label(el).slice(0, 18) + '」'
+                        + (cost !== null ? '[data-cost=' + cost + ']' : '');
+                };
+                const all = [...document.querySelectorAll('button,input[type=submit],a')];
+                const free = all.filter(el => {
+                    const cost = el.getAttribute ? el.getAttribute('data-cost') : null;
+                    return (cost === '0' || /免费/.test(label(el))) && price(el) === null;
+                });
+                if (!free.length) {
+                    return {
+                        found: false,
+                        candidates: all.filter(el => /抽/.test(label(el))).map(desc).slice(0, 8),
+                    };
+                }
+                const el = free[0];
+                if (el.tagName === 'FORM') { el.submit(); return {found: true, label: 'form'}; }
+                el.click();
+                return {found: true, label: label(el).slice(0, 20)};
             }"""
         )
         if clicked.get("found"):
@@ -2646,25 +2663,16 @@ async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
                     break
             html = await page.content()
         else:
-            log(f"  🎁 {name}: 页面上没有可点的抽称号按钮，退回页面内表单 POST")
-            r = await page.evaluate(
-                """async () => {
-                    const el = document.querySelector('input[name="_csrf"]');
-                    const csrf = el ? el.value : '';
-                    if (!csrf) return {csrf: false, status: 0, url: location.href, text: ''};
-                    const res = await fetch('/gacha_pull', {
-                        method: 'POST', credentials: 'include',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: '_csrf=' + encodeURIComponent(csrf),
-                    });
-                    let text = '';
-                    try { text = await res.text(); } catch (e) {}
-                    return {csrf: true, status: res.status, url: res.url, text: text.slice(0, 60000)};
-                }"""
-            )
-            if not r.get("csrf"):
-                return {"ok": False, "message": "页面里没有 _csrf 令牌（多半是 Cookie 失效拿到未登录页）"}
-            html = r.get("text") or ""
+            cands = clicked.get("candidates") or []
+            log(f"  🎁 {name}: 没找到免费一抽按钮，候选 = {'、'.join(cands) or '(无)'}")
+            return {
+                "ok": False,
+                "message": (
+                    "没找到「免费一抽」按钮（今日免费抽多半已用完，页面按钮都标了价格），"
+                    "跳过以免消耗积分。"
+                    + (f"页面候选：{'、'.join(cands)}" if cands else "")
+                )[:300],
+            }
 
         titles = parse_gacha_titles(html)
         if not titles:
