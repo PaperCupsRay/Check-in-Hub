@@ -2370,13 +2370,34 @@ async def checkin_one(channel, proxy=None) -> dict:
 
 FORUM_TYPES = {"nodeseek", "linuxsb"}
 
-# CF 挑战页标题（Just a moment... / Attention Required! / 中文变体）
+# CF 挑战页的标题。必须多语言：2026-10-13 线上实测某条代理出口拿到的是葡萄牙语
+# 「Um momento…」，而只认英文 Just a moment 时会被判成「挑战已过」，紧接着的签到
+# 请求就挨一记 403 挑战页 —— 现象看起来像「站点突然翻脸」，其实是识别漏了。
 CF_TITLE_RE = re.compile(
-    r"just a moment|attention required|verify you are human|请稍候|检查您的浏览器", re.I
+    r"just a moment|attention required|verify you are human|checking your browser"
+    r"|um momento|un momento|einen moment|einen augenblick|un instant|momento"
+    r"|请稍候|检查您的浏览器|安全验证|正在验证",
+    re.I,
 )
+# 挑战页的 DOM 特征（标题语种太多，靠 markup 兜底更稳）：CF 挑战页必定加载
+# challenge-platform 那套脚本。别用裸 "cdn-cgi" 当判据 —— 正常页面上的
+# Rocket Loader 也走 /cdn-cgi/scripts/…，那样会把好页面误判成挑战页。
+CF_MARKUP_RE = re.compile(r"challenge-platform|cf_chl_|cdn-cgi/challenge", re.I)
+CF_WAIT_JS = """() => {
+    const title = document.title || '';
+    const html = document.documentElement ? document.documentElement.innerHTML : '';
+    return { title, url: location.href, markup: html.slice(0, 30000) };
+}"""
 # 与 src/adapters/forum.js 的 ALREADY_RE 同一套词（两处判据必须一致，否则同一个
 # 渠道在 worker 通道说「已签到」、在浏览器通道说「失败」）
 ALREADY_SIGNED_RE = re.compile(r"已经?签到|已签过|重复签到|重复领取|重复打卡|already", re.I)
+
+
+def looks_challenged(st):
+    """页面是不是还停在 CF 挑战页上（多语言标题 + markup 兜底）。"""
+    if CF_TITLE_RE.search(str(st.get("title") or "")):
+        return True
+    return bool(CF_MARKUP_RE.search(str(st.get("markup") or "")))
 
 
 def forum_cookie_pairs(channel):
@@ -2402,21 +2423,21 @@ async def apply_channel_cookies(page, channel):
 
 
 async def wait_cloudflare(page, budget_s=30):
-    """等 CF 挑战自己过去（标题不再是 Just a moment…），必要时拟人点一下勾选框。
+    """等 CF 挑战自己过去，必要时拟人点一下勾选框；挑战没过返回 None。
 
-    挑战没过返回 None。调用方据此报一条**可换出口重试**的失败：消息里必须带
-    "Cloudflare" 与 "challenge" 字样，否则 main() 的 RETRYABLE_VIA_PROXY 匹配
-    不上，住宅代理那一轮重试根本不触发。
+    调用方据此报一条**可换出口重试**的失败：消息里必须带 "Cloudflare" 与
+    "challenge" 字样，否则 main() 的 RETRYABLE_VIA_PROXY 匹配不上，住宅代理
+    那一轮重试根本不触发。
     """
     deadline = time.monotonic() + budget_s
-    st = {"title": "", "url": ""}
+    st = {"title": "", "url": "", "markup": ""}
     while time.monotonic() < deadline:
         try:
-            st = await page.evaluate("() => ({title: document.title, url: location.href})")
+            st = await page.evaluate(CF_WAIT_JS)
         except Exception:  # noqa: BLE001
-            st = {"title": "", "url": ""}
-        title = str(st.get("title") or "")
-        if title and not CF_TITLE_RE.search(title):
+            st = {"title": "", "url": "", "markup": ""}
+        # 标题为空 = 页面还没起来，继续等；有标题且不像挑战页才算过了
+        if st.get("title") and not looks_challenged(st):
             return st
         await click_challenge(page)
         await page.wait_for_timeout(1000)
@@ -2429,7 +2450,8 @@ def cf_failure(name, snap, action):
         "ok": False,
         "message": (
             f"{action}被 Cloudflare challenge 拦住（浏览器通道也没过）："
-            f"{json.dumps(snap, ensure_ascii=False)[:220]}"
+            f"停在挑战页 {snap.get('title') or '?'} @ {snap.get('url') or '?'}。"
+            "换一条住宅代理出口再试；若每条出口都一样，说明站点把挑战升级到了浏览器过不去的地步。"
         )[:300],
     }
 
@@ -2438,25 +2460,37 @@ async def page_snapshot(page):
     """页面快照：标题 / URL / 登录线索 / 正文头部。
 
     失败时写进 message 才有得查 —— 否则「没签到」到底是 Cookie 失效被甩到登录页、
-    还是页面结构变了，只能靠猜（这个坑 page_diag 的文档字符串里已经记过一次）。
+    还是页面结构变了，只能靠猜（page_diag 的文档字符串里已经记过一次这个坑）。
+
+    登录线索必须给**完整的标签对**，不能只查类名：linux.sb 首页的「用户榜单」里也有
+    .user-name，只匹配类名会把游客页认成登录页（2026-10-13 实测踩到）。
     """
     try:
         return await page.evaluate(
             """() => {
                 const body = document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '';
-                const head = document.documentElement ? document.documentElement.outerHTML.slice(0, 60000) : '';
+                const html = document.documentElement ? document.documentElement.outerHTML : '';
                 return {
                     title: document.title,
                     url: location.href,
+                    // linux.sb：登录态才有的「每日签到」入口 + 侧栏用户卡片（完整标签对）
                     hasDailyCheckin: !!document.querySelector('a[href="/daily_checkin"]'),
+                    userCard: /class="user-avatar-big"\\s+href="\\/user\\/\\d+"/.test(html),
+                    userNameLink: /class="user-name"\\s+href="\\/user\\/\\d+"/.test(html),
+                    // NodeSeek：游客页的签到入口写着「登录后签到」
+                    guestHint: /登录后签到|登录后可见|请先登录/.test(html),
                     hasUserName: !!document.querySelector('.user-name'),
-                    hasLoginLink: /href="\\/login"|>\\s*登录\\s*<|sign\\s*in/i.test(head),
                     body: body.slice(0, 300),
                 };
             }"""
         )
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)[:120]}
+
+
+def forum_logged_in(snap):
+    """linux.sb 的登录态判据：用户卡片或「每日签到」入口（完整标签对，见 page_snapshot）。"""
+    return bool(snap.get("userCard") or snap.get("userNameLink") or snap.get("hasDailyCheckin"))
 
 
 async def read_page_flash(page):
@@ -2503,31 +2537,42 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             return cf_failure(name, snap, "签到")
         log(f"  🔍 {name}: 首页 {json.dumps(snap, ensure_ascii=False)[:320]}")
 
-        # 等页面脚本落地：走代理时 goto 只等 commit，__pageFlash 可能还没写出来
+        # 等 __pageFlash 落地：走代理时 goto 只等 commit，脚本可能还没跑完。
+        # 它没出现也没关系 —— 下面用 /daily_checkin 定论，不靠「首页看着像登录态」猜。
         flash = ""
-        for _ in range(20):
+        for _ in range(10):
             flash = await read_page_flash(page)
             if flash:
                 break
-            if snap.get("hasDailyCheckin") or snap.get("hasUserName") or snap.get("hasLoginLink"):
-                break
             await page.wait_for_timeout(1000)
-            snap = await page_snapshot(page)
 
-        logged = bool(snap.get("hasDailyCheckin")) and bool(snap.get("hasUserName"))
         if "已帮您完成自动签到" in flash:
             pts = flash_points(flash)
             message = flash
             if pts is not None:
                 message = f"{message} · +{pts:g} 积分"
             result = {"name": name, "ok": True, "message": message[:300]}
-        elif logged:
-            # 登录态 + 无 flash：按站点机制就是「今天已经签过」。但结论不能只靠一句
-            # 推断（推错了用户当天就漏签），再去 /daily_checkin 核对今日记录。
+        else:
+            # 没有 flash 时不能凭首页的线索下结论：游客页和登录页长得很像
+            # （2026-10-13 线上就误判过一次 —— 首页「用户榜单」里的 .user-name
+            #  骗过了判据）。去 /daily_checkin 定论：游客会被甩到登录页，
+            # 登录态则能看到今日记录。
             await page.goto(base + "/daily_checkin", wait_until=wait_until, timeout=nav_ms)
             await wait_cloudflare(page)
+            final_url = page.url or ""
             html = await page.content()
             rec = re.search(r"(?:已签到|今日已签|签到完成|已获得)", html)
+            if "/login" in final_url:
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        "Cookie 已失效：/daily_checkin 把浏览器通道甩到了登录页"
+                        f"（{final_url}）。请在浏览器里重新登录 https://linux.sb，"
+                        "再重抄整站 Cookie 到渠道里（换出口解决不了会话失效）。"
+                    )[:300],
+                }
             if rec:
                 # 只在命中词后面那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
                 # 对整页跑 flash_points 会把总分当成今日奖励。
@@ -2536,26 +2581,27 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                 if pts is not None:
                     message = f"{message} · {pts:g} 积分"
                 result = {"name": name, "ok": True, "message": message[:300]}
+            elif not forum_logged_in(snap):
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        "Cookie 已失效：首页与 /daily_checkin 都拿不到登录态线索"
+                        "（没有用户卡片 /「每日签到」入口）。请在浏览器里重新登录 "
+                        "https://linux.sb 后重抄整站 Cookie 到渠道里。"
+                        f"页面快照：{json.dumps(snap, ensure_ascii=False)[:160]}"
+                    )[:300],
+                }
             else:
                 return {
                     "name": name,
                     "ok": False,
                     "message": (
                         "登录态正常，但打开首页与 /daily_checkin 都没看到今日签到记录，"
-                        f"服务端这次没有完成自动签到。页面快照：{json.dumps(snap, ensure_ascii=False)[:200]}"
+                        f"服务端这次没有完成自动签到。页面快照：{json.dumps(snap, ensure_ascii=False)[:180]}"
                     )[:300],
                 }
-        else:
-            return {
-                "name": name,
-                "ok": False,
-                "retryable": False,
-                "message": (
-                    "拿到的首页不是登录态（没有「每日签到」入口 / 用户卡片），Cookie 已失效："
-                    "请在浏览器里重新登录 https://linux.sb 后重抄整站 Cookie 到渠道里。"
-                    f"页面快照：{json.dumps(snap, ensure_ascii=False)[:200]}"
-                )[:300],
-            }
 
         # 签到后自动抽称号（渠道选项 autoGacha）：失败不推翻签到结论，只追加说明
         if auto_gacha and result["ok"]:
@@ -2791,12 +2837,13 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 return done2
             res = res2
 
-        # ④ 判定不了：把三种真实原因分开说，别笼统报「签到失败」
+        # ④ 判定不了：把几种真实原因分开说，别笼统报「签到失败」
         body = res.get("body") if isinstance(res.get("body"), dict) else {}
         msg = str(body.get("message") or "").strip()
+        text = str(res.get("text") or "")
         status = res.get("status")
         where = str(res.get("url") or "")
-        if "high risk action" in msg.lower() or "high risk action" in str(res.get("text") or "").lower():
+        if "high risk action" in (msg + text).lower():
             return {
                 "name": name,
                 "ok": False,
@@ -2806,7 +2853,22 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                     f"页面：{json.dumps(snap, ensure_ascii=False)[:160]}"
                 )[:300],
             }
-        if "/login" in where or ("登录" in str(res.get("text") or "") and not msg):
+        # 「USER NOT FOUND」= 站点按这份 Cookie 查不到用户：会话已失效。2026-10-13 线上
+        # 实测就是这个形态（HTTP 500 + {"message":"USER NOT FOUND","status":404}），
+        # 而游客页还有第二个信号：签到入口写着「登录后签到」。两者都指向重抄 Cookie，
+        # 换出口/补 cf_clearance 都解决不了会话失效，所以标不可重试。
+        if "user not found" in (msg + text).lower() or snap.get("guestHint"):
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"Cookie 已失效：站点回 USER NOT FOUND（HTTP {status}）"
+                    f"{'，页面上的签到入口也是「登录后签到」' if snap.get('guestHint') else ''}。"
+                    "请在浏览器里重新登录 https://www.nodeseek.com 后重抄整站 Cookie 到渠道里。"
+                )[:300],
+            }
+        if "/login" in where or ("登录" in text and not msg):
             return {
                 "name": name,
                 "ok": False,
