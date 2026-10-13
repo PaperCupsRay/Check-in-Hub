@@ -27,6 +27,8 @@
 
 import asyncio
 import contextlib
+import contextlib
+import datetime
 import json
 import os
 import re
@@ -2499,6 +2501,57 @@ def flash_points(text):
     return float(m.group(1)) if m else None
 
 
+def site_today(offset_hours=8):
+    """站点时区的今天（YYYY-MM-DD）。linux.sb / NodeSeek 都是国内站点，按 UTC+8 算。"""
+    return (datetime.datetime.utcnow() + datetime.timedelta(hours=offset_hours)).strftime("%Y-%m-%d")
+
+
+def today_patterns(ymd):
+    y, m, d = ymd.split("-")
+    return [ymd, f"{y}/{m}/{d}", f"{int(m)}月{int(d)}日", f"{m}-{d}", f"{m}/{d}"]
+
+
+def checkin_record_evidence(html, ymd, span=200):
+    """在「已签到 / 今日已签 / 已获得」附近找**今天的日期**；找到才算今日签到记录。
+
+    不能只认关键词：2026-10-13 线上第一版就是只 match 关键词，结果从 /daily_checkin
+    抓到「已签到 <div class」这么个片段 —— 页面别处也出现这个词，于是把「页面上有这
+    个词」当成了「今天签过了」。要求命中处附近出现今天的日期，才有资格算证据；
+    返回原文片段，写进 message 供事后核对（结论要能自证）。
+    """
+    for mark in re.finditer(r"(?:已签到|今日已签|签到完成|已获得)", html or ""):
+        seg = html[max(0, mark.start() - span): mark.start() + span]
+        if any(pat in seg for pat in today_patterns(ymd)):
+            return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", seg)).strip()[:70]
+    return ""
+
+
+async def read_stats_cookie(page):
+    """读站点自己记的签到统计 cookie：__daily_checkin_stats=<uid>.<date>.<count>.<points>.<rank>。
+
+    date 是站点侧最后一次签到的日期，比「页面里有没有那个词」硬得多：它只在服务端
+    真的处理完签到之后才会被改写。字段数不对时返回 {}（不改判据，只是少一条证据）。
+    """
+    try:
+        raw = await page.evaluate("() => document.cookie")
+    except Exception:  # noqa: BLE001
+        return {}
+    m = re.search(r"__daily_checkin_stats=([^;]+)", str(raw or ""))
+    if not m:
+        return {"raw": None}
+    parts = [p.strip() for p in m.group(1).split(".")]
+    out = {"raw": m.group(1)}
+    if len(parts) >= 2:
+        out["uid"] = parts[0]
+        out["date"] = parts[1]
+    if len(parts) >= 4:
+        try:
+            out["points"] = float(parts[3])
+        except ValueError:
+            pass
+    return out
+
+
 async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
     """linux.sb：真浏览器过 CF → 打开首页（服务端顺手签到）→ 读 window.__pageFlash。
 
@@ -2551,7 +2604,6 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             await wait_cloudflare(page)
             final_url = page.url or ""
             html = await page.content()
-            rec = re.search(r"(?:已签到|今日已签|签到完成|已获得)", html)
             if "/login" in final_url:
                 return {
                     "name": name,
@@ -2563,20 +2615,29 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                         "再重抄整站 Cookie 到渠道里（换出口解决不了会话失效）。"
                     )[:300],
                 }
-            if rec:
-                # 只在命中词后面那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
-                # 对整页跑 flash_points 会把总分当成今日奖励。
-                seg = html[rec.start(): rec.start() + 140]
-                pts = flash_points(seg)
-                # 把站点原文一并给出来：这条结论是「页面里出现了今日签到记录」推出来的，
-                # 留一句原文，事后能核对是真记录还是页面别处的词（可审计，别只给结论）。
-                snippet = re.sub(r"<[^>]+>", " ", seg)
-                snippet = re.sub(r"\s+", " ", snippet).strip()[:60]
+            # 「今天签没签」要两个硬证据之一，不能只看页面上有没有「已签到」这个词：
+            #   ① __daily_checkin_stats 这个 cookie 的日期 = 今天（服务端真处理完才会改写）；
+            #   ② 「已签到」附近出现今天的日期。
+            # 顺带把两个值都写进日志 —— 判据万一还是太紧/太松，日志里有原文可查。
+            ymd = site_today()
+            stats = await read_stats_cookie(page)
+            evidence = checkin_record_evidence(html, ymd)
+            log(
+                f"  🔎 {name}: 今日 {ymd}｜__daily_checkin_stats={stats.get('raw') or '(无)'}"
+                f"｜记录证据={evidence or '(无)'}"
+            )
+            if (stats.get("date") == ymd) or evidence:
+                pts = stats.get("points")
+                if pts is None and evidence:
+                    # 只在命中词附近那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
+                    # 对整页跑 flash_points 会把总分当成今日奖励。
+                    pts = flash_points(evidence)
                 message = "今日已签过（linux.sb 打开页面即自动签到，__pageFlash 为空即当日已完成）"
                 if pts is not None:
                     message = f"{message} · {pts:g} 积分"
-                log(f"  🔎 {name}: /daily_checkin 记录原文：{snippet}")
-                result = {"name": name, "ok": True, "message": f"{message} · 站点原文：{snippet}"[:300]}
+                if evidence:
+                    message = f"{message} · 站点原文：{evidence}"
+                result = {"name": name, "ok": True, "message": message[:300]}
             elif not forum_logged_in(snap):
                 return {
                     "name": name,
@@ -2590,12 +2651,16 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
                     )[:300],
                 }
             else:
+                # 登录态正常、但两条证据都没拿到：报「未能确认」而不是「已签到」——
+                # 宁可让用户去站点看一眼，也不能把「没签」说成「签了」让他漏签。
                 return {
                     "name": name,
                     "ok": False,
                     "message": (
-                        "登录态正常，但打开首页与 /daily_checkin 都没看到今日签到记录，"
-                        f"服务端这次没有完成自动签到。页面快照：{json.dumps(snap, ensure_ascii=False)[:180]}"
+                        "未能确认今日签到：登录态正常，但 /daily_checkin 既没有今日日期附近的"
+                        "签到记录，__daily_checkin_stats 也没更新到今天（服务端这次可能没完成"
+                        "自动签到）。请到站点确认；若站点显示已签，把这条日志发我收紧判据。"
+                        f"页面快照：{json.dumps(snap, ensure_ascii=False)[:140]}"
                     )[:300],
                 }
 
@@ -2611,16 +2676,16 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
 
 
 async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
-    """抽称号（**只抽免费那一发**）：点站点自己的免费按钮，送结果页解析称号。
+    """免费一抽称号：点 /gacha_pull 表单里的免费按钮，再从结果页解析称号。
 
     与 src/adapters/linuxsb.js 的 gacha() 是同一套流程（_csrf → POST /gacha_pull →
     302 → 解析结果页），区别只在这一枪从真浏览器里发出，CF 放行 cookie 与站点自己的
     _csrf 都是现成的。
 
     **绝不点带价格的按钮**：站点在「今日免费一抽」用完之后会把按钮文案改成
-    「抽一次 (10 积分)」，照点就是替用户花积分 —— 2026-10-13 线上实测踩到过这一下，
-    白扣 10 积分。所以这里只认「免费」或 data-cost="0" 且文案无价格的按钮，找不到
-    就直接跳过并说明（宁可漏抽，不可乱花）。
+    「抽一次 (10 积分)」，照点就是替用户花积分 —— 2026-10-13 线上实测踩到过，
+    白扣 10 积分。所以这里只认「落在 /gacha_pull 表单里 + 文案不标价」的按钮，
+    找不到就直接跳过并说明（宁可漏抽，不可乱花）。
     """
     try:
         await page.goto(base + "/gacha", wait_until=wait_until, timeout=nav_ms)
@@ -2638,21 +2703,33 @@ async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
                     return el.tagName.toLowerCase() + '「' + label(el).slice(0, 18) + '」'
                         + (cost !== null ? '[data-cost=' + cost + ']' : '');
                 };
-                const all = [...document.querySelectorAll('button,input[type=submit],a')];
+                const all = [...document.querySelectorAll('button,input[type=submit],a,form')];
+                const forms = [...document.querySelectorAll('form[action]')]
+                    .map(f => f.getAttribute('action')).slice(0, 10);
+                const inPullForm = el => {
+                    if (el.tagName === 'FORM') return /\\/gacha_pull(\\?|$)/.test(el.getAttribute('action') || '');
+                    const f = el.closest ? el.closest('form') : null;
+                    return !!f && /\\/gacha_pull(\\?|$)/.test(f.getAttribute('action') || '');
+                };
+                // 免费一抽必须落在 /gacha_pull 表单里（或显式 data-cost="0"）且文案不标价。
+                // 只按「免费」两个字找会点到导航里的「免费SSL证书」（2026-10-13 实测）。
                 const free = all.filter(el => {
                     const cost = el.getAttribute ? el.getAttribute('data-cost') : null;
-                    return (cost === '0' || /免费/.test(label(el))) && price(el) === null;
+                    const looksFree = (cost === '0' || /免费/.test(label(el))) && price(el) === null;
+                    return looksFree && inPullForm(el);
                 });
                 if (!free.length) {
                     return {
                         found: false,
+                        forms,
                         candidates: all.filter(el => /抽/.test(label(el))).map(desc).slice(0, 8),
                     };
                 }
                 const el = free[0];
-                if (el.tagName === 'FORM') { el.submit(); return {found: true, label: 'form'}; }
+                const labelText = el.tagName === 'FORM' ? 'form' : label(el).slice(0, 20);
+                if (el.tagName === 'FORM') { el.submit(); return {found: true, label: labelText}; }
                 el.click();
-                return {found: true, label: label(el).slice(0, 20)};
+                return {found: true, label: labelText};
             }"""
         )
         if clicked.get("found"):
@@ -2664,13 +2741,17 @@ async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
             html = await page.content()
         else:
             cands = clicked.get("candidates") or []
-            log(f"  🎁 {name}: 没找到免费一抽按钮，候选 = {'、'.join(cands) or '(无)'}")
+            forms = clicked.get("forms") or []
+            log(
+                f"  🎁 {name}: 没找到免费一抽按钮｜候选 = {'、'.join(cands) or '(无)'}"
+                f"｜表单 = {'、'.join(forms) or '(无)'}"
+            )
             return {
                 "ok": False,
                 "message": (
                     "没找到「免费一抽」按钮（今日免费抽多半已用完，页面按钮都标了价格），"
                     "跳过以免消耗积分。"
-                    + (f"页面候选：{'、'.join(cands)}" if cands else "")
+                    + (f"页面候选：{'、'.join(cands)}" if cands else f"页面表单：{'、'.join(forms)}" if forms else "")
                 )[:300],
             }
 
