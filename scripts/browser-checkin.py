@@ -2352,6 +2352,487 @@ async def checkin_one(channel, proxy=None) -> dict:
         await stack.aclose()
 
 
+# ---------------- 社区站：NodeSeek / linux.sb ----------------
+#
+# 这两站（连同 cookie 鉴权）全站挂在 Cloudflare 后面，而「把 cf_clearance 拷进渠道
+# Cookie」这条常规解法对它们**无效**：cf_clearance 与签发它的出口 IP + UA 绑定，
+# 用户浏览器里那一份拷到 Worker / GHA 的机房出口上直接判无效。2026-10-13 线上实测
+# 两条出口全灭（三条事实，别再把 gha_api 当成这两站的解法）：
+#   · NodeSeek：Worker 出口 302（CF 边缘的重定向）、Azure 出口 403 Just a moment
+#   · linux.sb：Worker 出口 403 拦截页、Azure 出口 403 Just a moment
+# 剩下的唯一路子就是真浏览器自己过挑战，再在**页面上下文里**完成签到：同源 fetch
+# 天然带上 CF 放行 cookie，站点自己那套签名头（NodeSeek 的 refract-* 由 sw.js 生成）
+# 也归它自己的前端管 —— 这正是 Turnstile 站已经在用的思路。
+#
+# 两站签到机制不同，各一支流程：
+#   nodeseek：POST /api/attendance?random=true（JSON 信封，收益单位=鸡腿）
+#   linuxsb ：打开页面时服务端顺手签到，提示写在 window.__pageFlash
+
+FORUM_TYPES = {"nodeseek", "linuxsb"}
+
+# CF 挑战页标题（Just a moment... / Attention Required! / 中文变体）
+CF_TITLE_RE = re.compile(
+    r"just a moment|attention required|verify you are human|请稍候|检查您的浏览器", re.I
+)
+# 与 src/adapters/forum.js 的 ALREADY_RE 同一套词（两处判据必须一致，否则同一个
+# 渠道在 worker 通道说「已签到」、在浏览器通道说「失败」）
+ALREADY_SIGNED_RE = re.compile(r"已经?签到|已签过|重复签到|重复领取|重复打卡|already", re.I)
+
+
+def forum_cookie_pairs(channel):
+    return parse_cookie_pairs((channel.get("auth") or {}).get("cookie") or "")
+
+
+async def apply_channel_cookies(page, channel):
+    """把渠道 Cookie 注入浏览器，返回注入条数。
+
+    必须在**首次导航之前**调用：linux.sb 的签到是「打开页面时服务端顺手做掉」，
+    Cookie 晚一步就等于让站点按未登录处理，白跑一趟。checkin_one 那支是在两次
+    导航之间注入的，顺序不能照抄。
+    """
+    pairs = forum_cookie_pairs(channel)
+    if not pairs:
+        return 0
+    host = channel["baseUrl"].split("//", 1)[1].split("/", 1)[0]
+    domain = host[4:] if host.startswith("www.") else host
+    await page.context.add_cookies(
+        [{"name": n, "value": v, "domain": domain, "path": "/"} for n, v in pairs]
+    )
+    return len(pairs)
+
+
+async def wait_cloudflare(page, budget_s=30):
+    """等 CF 挑战自己过去（标题不再是 Just a moment…），必要时拟人点一下勾选框。
+
+    挑战没过返回 None。调用方据此报一条**可换出口重试**的失败：消息里必须带
+    "Cloudflare" 与 "challenge" 字样，否则 main() 的 RETRYABLE_VIA_PROXY 匹配
+    不上，住宅代理那一轮重试根本不触发。
+    """
+    deadline = time.monotonic() + budget_s
+    st = {"title": "", "url": ""}
+    while time.monotonic() < deadline:
+        try:
+            st = await page.evaluate("() => ({title: document.title, url: location.href})")
+        except Exception:  # noqa: BLE001
+            st = {"title": "", "url": ""}
+        title = str(st.get("title") or "")
+        if title and not CF_TITLE_RE.search(title):
+            return st
+        await click_challenge(page)
+        await page.wait_for_timeout(1000)
+    return None
+
+
+def cf_failure(name, snap, action):
+    return {
+        "name": name,
+        "ok": False,
+        "message": (
+            f"{action}被 Cloudflare challenge 拦住（浏览器通道也没过）："
+            f"{json.dumps(snap, ensure_ascii=False)[:220]}"
+        )[:300],
+    }
+
+
+async def page_snapshot(page):
+    """页面快照：标题 / URL / 登录线索 / 正文头部。
+
+    失败时写进 message 才有得查 —— 否则「没签到」到底是 Cookie 失效被甩到登录页、
+    还是页面结构变了，只能靠猜（这个坑 page_diag 的文档字符串里已经记过一次）。
+    """
+    try:
+        return await page.evaluate(
+            """() => {
+                const body = document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '';
+                const head = document.documentElement ? document.documentElement.outerHTML.slice(0, 60000) : '';
+                return {
+                    title: document.title,
+                    url: location.href,
+                    hasDailyCheckin: !!document.querySelector('a[href="/daily_checkin"]'),
+                    hasUserName: !!document.querySelector('.user-name'),
+                    hasLoginLink: /href="\\/login"|>\\s*登录\\s*<|sign\\s*in/i.test(head),
+                    body: body.slice(0, 300),
+                };
+            }"""
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:120]}
+
+
+async def read_page_flash(page):
+    """读 window.__pageFlash（linux.sb 的一次性提示）。主世界求值由 patch 统一处理。"""
+    try:
+        v = await page.evaluate(
+            "() => (typeof window.__pageFlash === 'string' ? window.__pageFlash : '')"
+        )
+        return v if isinstance(v, str) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def flash_points(text):
+    m = re.search(r"\+?\s*(\d+(?:\.\d+)?)\s*(?:积分|分)", text or "")
+    return float(m.group(1)) if m else None
+
+
+async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
+    """linux.sb：真浏览器过 CF → 打开首页（服务端顺手签到）→ 读 window.__pageFlash。
+
+    判据与 src/adapters/linuxsb.js 完全一致，别另立一套：
+      · flash 含「已帮您完成自动签到」= 刚签上，能带出 +N 积分
+      · flash 为空且是登录态   = 今日已签过（HAR 里两次 GET / 都是空串）
+      · 页面不是登录态         = Cookie 失效，让用户重抄（换出口无用，标不可重试）
+    """
+    name = channel.get("name", "unnamed")
+    base = channel["baseUrl"].rstrip("/")
+    opt = channel.get("options") or {}
+    auto_gacha = str(opt.get("autoGacha", "")).strip().lower() in ("1", "true", "yes")
+    if not forum_cookie_pairs(channel):
+        return {"name": name, "ok": False, "retryable": False, "message": "缺少 Cookie，浏览器通道也签不了（Cookie 是这两站唯一的鉴权方式）"}
+    if proxy:
+        log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
+    async with browser_page(proxy) as page:
+        got = await apply_channel_cookies(page, channel)
+        log(f"  🍪 {name}: 注入 {got} 个 cookie（必须在首次导航前，签到是打开页面时做的）")
+        wait_until, nav_ms = nav_opts(proxy)
+        log(f"  🌐 {name}: 打开 {base}/（服务端渲染时顺手签到）")
+        await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
+        st = await wait_cloudflare(page)
+        snap = await page_snapshot(page)
+        if st is None:
+            return cf_failure(name, snap, "签到")
+        log(f"  🔍 {name}: 首页 {json.dumps(snap, ensure_ascii=False)[:320]}")
+
+        # 等页面脚本落地：走代理时 goto 只等 commit，__pageFlash 可能还没写出来
+        flash = ""
+        for _ in range(20):
+            flash = await read_page_flash(page)
+            if flash:
+                break
+            if snap.get("hasDailyCheckin") or snap.get("hasUserName") or snap.get("hasLoginLink"):
+                break
+            await page.wait_for_timeout(1000)
+            snap = await page_snapshot(page)
+
+        logged = bool(snap.get("hasDailyCheckin")) and bool(snap.get("hasUserName"))
+        if "已帮您完成自动签到" in flash:
+            pts = flash_points(flash)
+            message = flash
+            if pts is not None:
+                message = f"{message} · +{pts:g} 积分"
+            result = {"name": name, "ok": True, "message": message[:300]}
+        elif logged:
+            # 登录态 + 无 flash：按站点机制就是「今天已经签过」。但结论不能只靠一句
+            # 推断（推错了用户当天就漏签），再去 /daily_checkin 核对今日记录。
+            await page.goto(base + "/daily_checkin", wait_until=wait_until, timeout=nav_ms)
+            await wait_cloudflare(page)
+            html = await page.content()
+            rec = re.search(r"(?:已签到|今日已签|签到完成|已获得)", html)
+            if rec:
+                # 只在命中词后面那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
+                # 对整页跑 flash_points 会把总分当成今日奖励。
+                pts = flash_points(html[rec.start(): rec.start() + 140])
+                message = "今日已签过（linux.sb 打开页面即自动签到，__pageFlash 为空即当日已完成）"
+                if pts is not None:
+                    message = f"{message} · {pts:g} 积分"
+                result = {"name": name, "ok": True, "message": message[:300]}
+            else:
+                return {
+                    "name": name,
+                    "ok": False,
+                    "message": (
+                        "登录态正常，但打开首页与 /daily_checkin 都没看到今日签到记录，"
+                        f"服务端这次没有完成自动签到。页面快照：{json.dumps(snap, ensure_ascii=False)[:200]}"
+                    )[:300],
+                }
+        else:
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    "拿到的首页不是登录态（没有「每日签到」入口 / 用户卡片），Cookie 已失效："
+                    "请在浏览器里重新登录 https://linux.sb 后重抄整站 Cookie 到渠道里。"
+                    f"页面快照：{json.dumps(snap, ensure_ascii=False)[:200]}"
+                )[:300],
+            }
+
+        # 签到后自动抽称号（渠道选项 autoGacha）：失败不推翻签到结论，只追加说明
+        if auto_gacha and result["ok"]:
+            g = await linuxsb_browser_gacha(page, name, base, wait_until, nav_ms)
+            log(f"  🎁 {name}: {g['message']}")
+            result["message"] = f"{result['message']} · 抽称号：{g['message']}"[:300]
+            if g.get("titles"):
+                result["titles"] = g["titles"]
+        log(f"  ✅ {name}: {result['message']}")
+        return result
+
+
+async def linuxsb_browser_gacha(page, name, base, wait_until, nav_ms) -> dict:
+    """抽称号（免费一抽）：优先点站点自己的按钮，点不到就退回页面内表单 POST。
+
+    与 src/adapters/linuxsb.js 的 gacha() 是同一套流程（_csrf → POST /gacha_pull →
+    302 → 解析结果页），区别只在这一枪从真浏览器里发出，所以 CF 放行 cookie 和
+    站点自己的 _csrf 都是现成的。
+    """
+    try:
+        await page.goto(base + "/gacha", wait_until=wait_until, timeout=nav_ms)
+        await wait_cloudflare(page)
+        html = ""
+        clicked = await page.evaluate(
+            """() => {
+                const free = document.querySelector('[data-cost="0"]')
+                    || document.querySelector('form[action="/gacha_pull"] button, form[action="/gacha_pull"] input[type=submit]')
+                    || [...document.querySelectorAll('button,input[type=submit],a')]
+                        .find(el => /免费|一抽/.test((el.innerText || el.value || '')));
+                if (!free) return {found: false};
+                const label = (free.innerText || free.value || free.getAttribute('value') || '').trim().slice(0, 20);
+                if (free.tagName === 'FORM') { free.submit(); return {found: true, label: 'form'}; }
+                free.click();
+                return {found: true, label};
+            }"""
+        )
+        if clicked.get("found"):
+            log(f"  🎁 {name}: 点站点自己的免费一抽按钮（{clicked.get('label')}）")
+            for _ in range(15):
+                await page.wait_for_timeout(1000)
+                if "/gacha_pull" in page.url or "gacha-result-card" in (await page.content()):
+                    break
+            html = await page.content()
+        else:
+            log(f"  🎁 {name}: 页面上没有可点的抽称号按钮，退回页面内表单 POST")
+            r = await page.evaluate(
+                """async () => {
+                    const el = document.querySelector('input[name="_csrf"]');
+                    const csrf = el ? el.value : '';
+                    if (!csrf) return {csrf: false, status: 0, url: location.href, text: ''};
+                    const res = await fetch('/gacha_pull', {
+                        method: 'POST', credentials: 'include',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: '_csrf=' + encodeURIComponent(csrf),
+                    });
+                    let text = '';
+                    try { text = await res.text(); } catch (e) {}
+                    return {csrf: true, status: res.status, url: res.url, text: text.slice(0, 60000)};
+                }"""
+            )
+            if not r.get("csrf"):
+                return {"ok": False, "message": "页面里没有 _csrf 令牌（多半是 Cookie 失效拿到未登录页）"}
+            html = r.get("text") or ""
+
+        titles = parse_gacha_titles(html)
+        if not titles:
+            return {
+                "ok": False,
+                "message": (
+                    "提交后没解析到称号卡片（站点可能改了页面结构，或今日免费抽已用完）。"
+                    f"页面头部：{await page_diag(page, limit=200)}"
+                )[:300],
+            }
+        return {
+            "ok": True,
+            "titles": titles,
+            "message": "抽到 " + "、".join(gacha_title_line(t) for t in titles),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"抽称号异常: {str(e)[:120]}"}
+
+
+def gacha_title_line(t):
+    head = " ".join(x for x in (t.get("rarity"), t.get("icon"), t.get("name")) if x)
+    return f"{head}（{t['desc']}）" if t.get("desc") else head
+
+
+def parse_gacha_titles(html):
+    """解析结果页的 gacha-result-card（与 src/adapters/linuxsb.js 的 parseTitles 同构）。"""
+    if not html:
+        return []
+    out = []
+    for chunk in re.split(r'(?=<div class="gacha-result-card)', html)[1:21]:
+
+        def pick(cls):
+            m = re.search(r'class="gacha-result-%s"[^>]*>([\s\S]*?)</div>' % cls, chunk)
+            return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+
+        title_name = pick("name")
+        if not title_name:
+            continue
+        out.append(
+            {
+                "rarity": pick("rarity"),
+                "icon": pick("icon"),
+                "name": title_name,
+                "desc": pick("desc"),
+                "quantity": pick("quantity"),
+            }
+        )
+    return out
+
+
+# 页面内签到请求：与 NodeSeek 前端自己发的一模一样（无请求体、Accept: */*）。
+# 返回 res.url / res.redirected 是关键 —— Worker 出口那次只看到「HTTP 302」查不出
+# 跳去哪，这里能看到落地地址（登录页 = Cookie 失效，挑战页 = CF 拦截）。
+JS_ATTENDANCE = """async () => {
+    const res = await fetch('/api/attendance?random=true', {
+        method: 'POST', credentials: 'include', headers: { Accept: '*/*' },
+    });
+    let text = '';
+    try { text = await res.text(); } catch (e) {}
+    let body = null;
+    try { body = JSON.parse(text); } catch (e) {}
+    return { status: res.status, url: res.url, redirected: res.redirected, body, text: text.slice(0, 400) };
+}"""
+
+JS_BOARD = """async (page) => {
+    const res = await fetch('/api/attendance/board?page=' + page, {
+        credentials: 'include', headers: { Accept: '*/*' },
+    });
+    let body = null;
+    try { body = await res.json(); } catch (e) {}
+    return { status: res.status, url: res.url, body };
+}"""
+
+
+def board_hit(board, username):
+    """今日签到排行榜里有没有自己（判据同 src/adapters/nodeseek.js 的 status()）。"""
+    if not username or not isinstance(board, dict):
+        return None
+    body = board.get("body")
+    rows = body.get("list") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return None
+    low = username.lower()
+    for row in rows:
+        if str((row or {}).get("member_name") or "").lower() == low:
+            return row
+    return None
+
+
+def attendance_result(name, res):
+    """把页面内那一枪的响应翻成结果；「判定不了」返回 None 交给调用方继续尝试。"""
+    body = res.get("body") if isinstance(res.get("body"), dict) else {}
+    status = res.get("status")
+    msg = str(body.get("message") or "").strip()
+    if status == 200 and body.get("success") is True:
+        gain = body.get("gain")
+        already = bool(ALREADY_SIGNED_RE.search(msg)) or (isinstance(gain, (int, float)) and not gain)
+        parts = [msg or ("今日已签到" if already else "签到成功")]
+        if body.get("current") is not None:
+            parts.append(f"鸡腿余额 {body['current']}")
+        return {"name": name, "ok": True, "message": " · ".join(parts)[:300], "already": already}
+    if status == 200 and body.get("success") is False and ALREADY_SIGNED_RE.search(msg):
+        return {"name": name, "ok": True, "already": True, "message": (msg or "今日已签到")[:300]}
+    return None
+
+
+async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
+    """NodeSeek：真浏览器过 CF → 页面内 POST /api/attendance?random=true。
+
+    为什么非得在页面里发：这一枪要同时带上 CF 放行 cookie 与站点前端自己生成的
+    签名头（HAR 里的 refract-key / refract-sign / refract-version 来自 sw.js）。
+    机房出口直连连 CF 那关都过不去（实测 302 / 403），拷 cf_clearance 也没用
+    —— 它与出口 IP 绑定。
+    """
+    name = channel.get("name", "unnamed")
+    base = channel["baseUrl"].rstrip("/")
+    username = str((channel.get("auth") or {}).get("username") or "").strip()
+    if not forum_cookie_pairs(channel):
+        return {"name": name, "ok": False, "retryable": False, "message": "缺少 Cookie，浏览器通道也签不了（Cookie 是这两站唯一的鉴权方式）"}
+    if proxy:
+        log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
+    async with browser_page(proxy) as page:
+        got = await apply_channel_cookies(page, channel)
+        log(f"  🍪 {name}: 注入 {got} 个 cookie")
+        wait_until, nav_ms = nav_opts(proxy)
+        log(f"  🌐 {name}: 打开 {base}/board")
+        await page.goto(base + "/board", wait_until=wait_until, timeout=nav_ms)
+        st = await wait_cloudflare(page)
+        snap = await page_snapshot(page)
+        if st is None:
+            return cf_failure(name, snap, "签到")
+        log(f"  🔍 {name}: 页面 {json.dumps(snap, ensure_ascii=False)[:320]}")
+        # 站点前端自己的脚本要时间起来（签名头由它生成），页面内 fetch 才有机会带上
+        await page.wait_for_timeout(2500)
+
+        # ① 只读确认：填了用户名就能靠今日排行榜直接定论「今日已签」，省掉一次签到请求
+        board = await page.evaluate(JS_BOARD, 1)
+        hit = board_hit(board, username)
+        if hit:
+            return {
+                "name": name,
+                "ok": True,
+                "message": f"今日已签到（签到排行榜确认）· 获得 {hit.get('gain')} 鸡腿"[:300],
+            }
+
+        # ② 页面内 POST 签到（HAR 里站点前端就是这么发的）
+        res = await page.evaluate(JS_ATTENDANCE)
+        done = attendance_result(name, res)
+        if done:
+            return done
+        log(f"  🧪 {name}: 页面内签到未成功 {json.dumps(res, ensure_ascii=False)[:300]}")
+
+        # ③ 点站点自己的签到控件：站点前端会带上它自己那套签名头重发。它自己的请求
+        #    可能先成功（站点前端与我们是两条独立请求），所以点完先查排行榜定论，
+        #    再补一枪页面内 POST，避免把「已经签上了」误报成失败。
+        clicked = await click_site_checkin(page)
+        log(f"  🖱️ {name}: 点站点签到控件 {json.dumps(clicked, ensure_ascii=False)[:120]}")
+        if clicked.get("found"):
+            await page.wait_for_timeout(4000)
+            hit2 = board_hit(await page.evaluate(JS_BOARD, 1), username)
+            if hit2:
+                return {
+                    "name": name,
+                    "ok": True,
+                    "message": f"今日已签到（点站点自身按钮后由排行榜确认）· 获得 {hit2.get('gain')} 鸡腿"[:300],
+                }
+            res2 = await page.evaluate(JS_ATTENDANCE)
+            done2 = attendance_result(name, res2)
+            if done2:
+                return done2
+            res = res2
+
+        # ④ 判定不了：把三种真实原因分开说，别笼统报「签到失败」
+        body = res.get("body") if isinstance(res.get("body"), dict) else {}
+        msg = str(body.get("message") or "").strip()
+        status = res.get("status")
+        where = str(res.get("url") or "")
+        if "high risk action" in msg.lower() or "high risk action" in str(res.get("text") or "").lower():
+            return {
+                "name": name,
+                "ok": False,
+                "message": (
+                    f"站点风控回话 high risk action（HTTP {status}，浏览器通道同样被拦）。"
+                    f"这不是接口写错：多为 Cookie 失效或站点要求浏览器指纹签名。请重新登录后重抄 Cookie。"
+                    f"页面：{json.dumps(snap, ensure_ascii=False)[:160]}"
+                )[:300],
+            }
+        if "/login" in where or ("登录" in str(res.get("text") or "") and not msg):
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"签到请求被重定向到登录页（{where or 'HTTP ' + str(status)}），Cookie 已失效："
+                    "请在浏览器里重新登录 https://www.nodeseek.com 后重抄整站 Cookie。"
+                )[:300],
+            }
+        return {
+            "name": name,
+            "ok": False,
+            "message": (
+                f"浏览器通道没能完成签到：HTTP {status}"
+                f"{f'，站点回话：{msg}' if msg else ''}，落地 {where or '未知'}。"
+                f"页面快照：{json.dumps(snap, ensure_ascii=False)[:160]}"
+            )[:300],
+        }
+
+
+async def forum_browser_checkin(channel, proxy=None) -> dict:
+    """社区站的浏览器通道入口（按类型分流）。"""
+    if channel.get("type") == "linuxsb":
+        return await linuxsb_browser_checkin(channel, proxy=proxy)
+    return await nodeseek_browser_checkin(channel, proxy=proxy)
+
 def load_api_fallback_names():
     """gha_api job 的失败渠道清单（降级链最后一级的重试对象）。"""
     path = os.environ.get("API_FALLBACK_LIST") or "api-artifact/gha-fallback.json"
@@ -2499,11 +2980,15 @@ async def main():
                 # 单次尝试也要有硬上限：里面每一步都各自有超时，但「每步都刚好不超时」
                 # 累加起来仍能拖很久（首次 GHA 跑就是这样撞上 30 分钟 job 上限被
                 # cancelled）。这里兜一层，超时就当失败换下一个出口。
-                coro = (
-                    sub2api_login_checkin(ch, proxy=proxy)
-                    if ch.get("type") == "sub2api"
-                    else checkin_one(ch, proxy=proxy)
-                )
+                ctype = ch.get("type")
+                if ctype == "sub2api":
+                    coro = sub2api_login_checkin(ch, proxy=proxy)
+                elif ctype in FORUM_TYPES:
+                    # 社区站（NodeSeek / linux.sb）：机制与 NewAPI 那套完全不同，
+                    # 各有自己的流程（见 forum_browser_checkin）
+                    coro = forum_browser_checkin(ch, proxy=proxy)
+                else:
+                    coro = checkin_one(ch, proxy=proxy)
                 r = await asyncio.wait_for(coro, timeout=CHANNEL_BUDGET_S)
             except asyncio.TimeoutError:
                 r = {

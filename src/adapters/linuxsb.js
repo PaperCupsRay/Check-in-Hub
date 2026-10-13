@@ -30,6 +30,15 @@
  *   的值完全相同），所以取任意一个已登录页面即可，不必专门打 /gacha。
  *
  * 本适配器只做**免费一抽**（不花积分）。十连/百连要花积分，留给手动操作。
+ *
+ * 【为什么线上必须走浏览器通道（2026-10-13 实测）】
+ *   本文件这套纯 HTTP 流程只对**不被 CF 拦的出口**有效。线上两条出口都过不去：
+ *     · Worker 出口：403 拦截页
+ *     · GHA 的 Azure 出口：403 Just a moment（挑战页）
+ *   而 Cookie 里的 cf_clearance 与签发它的出口 IP 绑定，拷到机房出口直接失效，
+ *   所以「补 cf_clearance」「改 gha_api」这两条老建议对本站都没用。可行解只有一个：
+ *   把渠道的签到通道设成 gha_browser —— 真浏览器过挑战 + 页面内完成签到，
+ *   见 scripts/browser-checkin.py 的 linuxsb_browser_checkin（含抽称号）。
  */
 
 import {
@@ -97,24 +106,48 @@ function flashOf(html) {
   }
 }
 
+/**
+ * 页面级失败判定。返回 null = 正常；否则返回 { message, needsBrowser? }。
+ *
+ * 返回对象而不是字符串，是因为 CF 挑战这一类的失败要带上 needsBrowser ——
+ * 换出口（gha_api）实测同样被挑战（Azure 出口 403），必须让 batchCheckinCore
+ * 直接分发到浏览器通道，而不是再浪费一次注定失败的运行。
+ */
 function pageFailure(channel, res, action) {
   const html = res.text || "";
   if (looksLikeCfChallenge({ raw: html }, res.status)) {
-    return (
-      `linux.sb 的${action}被 Cloudflare 拦截（Just a moment...，HTTP ${res.status}），不是凭证问题。` +
-      "解法：①Cookie 里补上 cf_clearance；②把该渠道的签到通道改成 gha_api（Azure 出口 IP）。"
-    );
+    return {
+      needsBrowser: true,
+      message:
+        `linux.sb 的${action}被 Cloudflare 拦截（Just a moment...，HTTP ${res.status}），不是凭证问题。` +
+        "解法：把该渠道的签到通道改成 gha_browser（真浏览器过挑战，再在页面内完成签到）。" +
+        "注意两种情况都别再试：① 把 cf_clearance 拷进渠道 —— 它与签发时的出口 IP 绑定，" +
+        "换到机房出口即失效；② 改成 gha_api —— 2026-10-13 实测 Azure 出口同样是 403（挑战页）。",
+    };
   }
   if (res.status === 403 || res.status === 401) {
-    return `${action}被拒绝（HTTP ${res.status}）。${cookieMissingMessage()}`;
+    return { message: `${action}被拒绝（HTTP ${res.status}）。${cookieMissingMessage()}` };
   }
   if (!loggedIn(html)) {
-    return (
-      `${action}拿到的页面不是登录态（未登录时首页没有「每日签到」入口）。` +
-      `Cookie 无效或已过期。${cookieMissingMessage()}`
-    );
+    return {
+      message:
+        `${action}拿到的页面不是登录态（未登录时首页没有「每日签到」入口）。` +
+        `Cookie 无效或已过期。${cookieMissingMessage()}`,
+    };
   }
   return null;
+}
+
+/** 把 pageFailure 的结论翻成面板要的失败结果 */
+function failedResult(res, failed, tokens) {
+  return {
+    ok: false,
+    httpStatus: res.status,
+    message: failed.message,
+    ...(failed.needsBrowser ? { needsBrowser: true } : {}),
+    raw: null,
+    tokens,
+  };
 }
 
 function pointsFrom(text) {
@@ -162,7 +195,7 @@ export const linuxsbAdapter = {
     const tokens = { cookie };
 
     const failed = pageFailure(channel, res, "签到");
-    if (failed) return { ok: false, httpStatus: res.status, message: failed, raw: null, tokens };
+    if (failed) return failedResult(res, failed, tokens);
 
     const flash = flashOf(html);
     const auto = /已帮您完成自动签到/.test(flash);
@@ -219,7 +252,7 @@ export const linuxsbAdapter = {
     // _csrf 在站内每个页面的隐藏表单里都是同一个值，取首页即可
     const home = await getPage(channel, "/", cookie);
     const failed = pageFailure(channel, home, "抽称号");
-    if (failed) return { ok: false, httpStatus: home.status, message: failed, raw: null, tokens: { cookie } };
+    if (failed) return failedResult(home, failed, { cookie });
 
     let cur = mergeCookie(cookie, home.setCookies || []);
     const csrf = csrfOf(home.text || "");
@@ -322,7 +355,7 @@ export const linuxsbAdapter = {
     if (!cookie) return { ok: false, message: cookieMissingMessage() };
     const res = await getPage(channel, "/daily_checkin", cookie);
     const failed = pageFailure(channel, res, "状态查询");
-    if (failed) return { ok: false, httpStatus: res.status, message: failed, raw: null, tokens: { cookie } };
+    if (failed) return failedResult(res, failed, { cookie });
 
     const html = res.text || "";
     const flash = flashOf(html);

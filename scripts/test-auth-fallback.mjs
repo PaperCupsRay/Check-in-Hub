@@ -111,6 +111,7 @@ function installFetch(scenario) {
     if (u.includes("/api/user/self")) {
       return json(200, { success: true, data: { id: 1829, username: "u", quota: 1000 } });
     }
+    if (u.includes("/api/attendance")) return scenario.nodeseekAttend();
     return json(404, { message: `unexpected url ${u}` });
   };
   return calls;
@@ -270,6 +271,40 @@ await scenario(
   ({ result, via, calls }) => {
     check("打过了 /api/user/login", calls.some((c) => c.url.includes("/api/user/login")), JSON.stringify(calls.map((c) => c.url)));
     check("仍标 needsBrowser 走浏览器通道", result.needsBrowser === true && via === "gha_browser", `via=${via}`);
+  }
+);
+
+// 11) 社区站（NodeSeek / linux.sb）被 Cloudflare 挑战拦住：Worker 出口与 Azure 出口
+//     实测都过不去（2026-10-13：前者 302/403，后者 403 Just a moment），而 cf_clearance
+//     与出口 IP 绑定、拷过来就失效。所以这类失败必须标 needsBrowser 直连浏览器通道，
+//     而不是丢进 gha_api 再失败一次。
+const NS_CHANNEL = {
+  id: "ch_ns",
+  name: "NodeSeek",
+  type: "nodeseek",
+  baseUrl: "https://www.nodeseek.com",
+  enabled: true,
+  auth: { cookie: "session=abc123", username: "PaperCups" },
+  options: {},
+};
+await scenario(
+  "NodeSeek 被 Cloudflare 挑战拦住 → 标 needsBrowser 并降级浏览器通道",
+  {
+    channel: NS_CHANNEL,
+    fetch: {
+      nodeseekAttend: () =>
+        new Response("<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>", {
+          status: 403,
+          headers: { "Content-Type": "text/html" },
+        }),
+    },
+  },
+  ({ result, via, payloads }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+    check("文案点名 Cloudflare", /Cloudflare/.test(result.message || ""), result.message);
+    check("dispatch 走浏览器通道", JSON.stringify(payloads[0]?.runners) === '["gha_browser"]');
+    check("dispatch 精确带渠道名", JSON.stringify(payloads[0]?.names) === '["NodeSeek"]');
   }
 );
 

@@ -30,8 +30,13 @@ const HEADLESS = (process.env.CHECKIN_HEADLESS || "true") !== "false";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
-/** 浏览器通道能兜住的渠道类型（与 scripts/browser-checkin.py 的两条流程一致） */
-const BROWSER_TYPES = new Set(["sub2api", "newapi"]);
+/**
+ * 浏览器通道能兜住的渠道类型（与 scripts/browser-checkin.py 的流程一一对应）。
+ * nodeseek / linuxsb 是 2026-10-13 加进来的：这两站全站挂在 Cloudflare 后面，而
+ * cf_clearance 与出口 IP 绑定，Worker 与 Azure 出口实测都是 302/403，只有真浏览器
+ * 过得了挑战（详见 scripts/browser-checkin.py 里那两个 browser 流程的说明）。
+ */
+const BROWSER_TYPES = new Set(["sub2api", "newapi", "nodeseek", "linuxsb"]);
 
 function payloadRunners() {
   // repository_dispatch payload 通过 GITHUB_EVENT_PATH 传入

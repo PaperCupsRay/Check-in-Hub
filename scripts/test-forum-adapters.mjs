@@ -163,7 +163,8 @@ try {
     ok(r.ok === false, "ok=false");
     ok(/风控/.test(r.message), "说明是风控", r.message);
     ok(!/不存在/.test(r.message), "不说成接口不存在", r.message);
-    ok(/cf_clearance|gha_api/.test(r.message), "给出 cf_clearance / gha_api 建议", r.message);
+    ok(/cf_clearance/.test(r.message), "说明 cf_clearance 的适用边界（换出口即失效）", r.message);
+    ok(/gha_browser/.test(r.message), "建议改用浏览器通道（gha_api 实测同样被拦）", r.message);
   }
 
   console.log("\n[4] NodeSeek Cloudflare 挑战页");
@@ -175,6 +176,7 @@ try {
     const r = await nodeseekAdapter.checkin(nsChannel());
     ok(r.ok === false, "ok=false");
     ok(/Cloudflare/.test(r.message), "点名 Cloudflare", r.message);
+    ok(r.needsBrowser === true, "标 needsBrowser（浏览器通道才是可行解）");
   }
 
   console.log("\n[5] NodeSeek 404（Base URL 填错）");
@@ -427,6 +429,43 @@ try {
       ok(!map[id]?.length, `${id} 没有额外动作`, JSON.stringify(map[id]));
     }
   }
+  console.log("\n[24] NodeSeek Worker 出口拿到的 302：要把 Location 带出来并直连浏览器通道");
+  {
+    mockFetch({
+      "POST /api/attendance": () =>
+        html(302, "", { Location: "https://www.nodeseek.com/login" }),
+    });
+    const r = await nodeseekAdapter.checkin(nsChannel());
+    ok(r.ok === false, "ok=false");
+    ok(r.needsBrowser === true, "标 needsBrowser（换出口同样被拦，应走浏览器通道）");
+    ok(/302/.test(r.message) && /login/.test(r.message), "把重定向目标带进文案", r.message);
+    ok(r.raw?.location === "https://www.nodeseek.com/login", "raw 里保留 Location", JSON.stringify(r.raw));
+  }
+
+  console.log("\n[25] NodeSeek Cloudflare 挑战：直连浏览器通道，且不再建议 gha_api");
+  {
+    mockFetch({
+      "POST /api/attendance": () =>
+        html(403, "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"),
+    });
+    const r = await nodeseekAdapter.checkin(nsChannel());
+    ok(r.needsBrowser === true, "标 needsBrowser");
+    ok(/gha_browser/.test(r.message), "建议改用浏览器通道", r.message);
+    ok(/Azure 出口同样是 403/.test(r.message), "说明 gha_api 也已实测被拦（别再浪费一次运行）", r.message);
+  }
+
+  console.log("\n[26] linux.sb 被 Cloudflare 拦截：同样直连浏览器通道");
+  {
+    mockFetch({
+      "GET /": () =>
+        html(403, "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"),
+    });
+    const r = await linuxsbAdapter.checkin(sbChannel());
+    ok(r.ok === false, "ok=false");
+    ok(r.needsBrowser === true, "标 needsBrowser");
+    ok(/gha_browser/.test(r.message), "建议改用浏览器通道", r.message);
+  }
+
 } finally {
   globalThis.fetch = restoreFetch;
 }

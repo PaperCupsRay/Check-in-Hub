@@ -12,14 +12,19 @@
  *   → {"list":[{"id":…,"member_id":…,"day_id":…,"gain":13,"created_at":…,"member_name":"…"}]}
  *     这是**今日**签到排行榜；渠道里填了用户名就能用它当只读状态源。
  *
- * 两个坑：
+ * 三个坑：
  *  1. 站点风控对任何可疑请求回 403 + {"success":false,"message":"high risk action"}。
  *     无 Cookie、带 Cookie 但已失效、路径写错（我一开始误以为接口叫 /api/attend）
  *     都是这一句，所以**不能**把它当成「接口不存在」，只能当成会话/风控问题。
  *  2. HAR 里那次成功请求带了站点自己的签名头 refract-key / refract-sign /
  *     refract-version（由 sw.js 生成，key 里带时间戳）。本适配器不带这些头；
- *     若站点强制校验，日志会表现为 high risk action —— 面板会提示换 cf_clearance
- *     或改走 gha_api（Azure 出口），不要伪装成「凭证错了」。
+ *     若站点强制校验，日志会表现为 high risk action。
+ *  3. **本适配器对这两站已经不够用了**（2026-10-13 线上实测）：NodeSeek 全站在
+ *     Cloudflare 后面，Worker 出口只拿到一个 302（CF 边缘重定向）、Azure 出口
+ *     403 Just a moment；而 Cookie 里的 cf_clearance 与签发它的出口 IP 绑定，
+ *     拷到机房出口直接失效。结论：把渠道的签到通道设成 gha_browser，让真浏览器
+ *     过挑战、再在页面里发这一枪（见 scripts/browser-checkin.py 的
+ *     nodeseek_browser_checkin）。下面的实现保留为 worker 通道的降级尝试。
  */
 
 import {
@@ -31,6 +36,7 @@ import {
   messageOf,
   mergeCookie,
   pickCookie,
+  responseTextHint,
   readResponse,
 } from "./forum.js";
 
@@ -72,17 +78,29 @@ function cookieMissingMessage() {
 function riskMessage(res, serverMsg) {
   return (
     `站点风控拦截（HTTP ${res.status}${serverMsg ? `：${serverMsg}` : ""}）。` +
-    "这通常不是接口写错，而是会话 Cookie 失效 / 站点要求通过 Cloudflare 挑战。" +
-    "按顺序试：①重新登录后重拷 Cookie（若站点弹过挑战，请一并带上 cf_clearance）；" +
-    "②把本渠道的签到通道改成 gha_api（GitHub Actions 的 Azure 出口 IP）；" +
-    "③仍失败则该站要求浏览器指纹签名，需在真实浏览器里手动签到。"
+    "这通常不是接口写错，而是会话 Cookie 失效或站点要求浏览器指纹签名。" +
+    "解法：把本渠道的签到通道改成 gha_browser（浏览器通道）—— 真浏览器过 Cloudflare" +
+    "挑战、再在页面里发签到请求，签名头由站点自己的前端生成；" +
+    "若仍失败，请重新登录后重抄整站 Cookie（含 cf_clearance 更好，但换出口即失效）。"
   );
 }
 
 function cfMessage(res) {
   return (
     `NodeSeek 的请求被 Cloudflare 拦截（返回 Just a moment... 挑战页，HTTP ${res.status}），不是凭证问题。` +
-    "解法：①Cookie 里补上 cf_clearance；②把本渠道的签到通道改成 gha_api（Azure 出口 IP）。"
+    "解法：把本渠道的签到通道改成 gha_browser（真浏览器过挑战，再在页面内签到）。" +
+    "注意两种情况都别再试：① 把 cf_clearance 拷进渠道 —— 它与签发时的出口 IP 绑定，" +
+    "换到机房出口即失效；② 改成 gha_api —— 2026-10-13 实测 Azure 出口同样是 403（挑战页）。"
+  );
+}
+
+/** Worker 出口拿到 302（CF 边缘重定向，body 是空的 302 Found）时给出的说明 */
+function redirectMessage(res) {
+  const to = res.location || "(响应没有 Location 头)";
+  return (
+    `NodeSeek 把请求重定向了（HTTP ${res.status} → ${to}），本机出口拿不到签到结果。` +
+    "这同样是出口被 CF 拦下的形态，不是凭证问题：把本渠道的签到通道改成 gha_browser。" +
+    "若跳转目标是登录页，请重新登录后重抄整站 Cookie。"
   );
 }
 
@@ -124,10 +142,24 @@ export const nodeseekAdapter = {
     const tokens = { cookie };
 
     if (looksLikeCfChallenge(data, res.status)) {
-      return { ok: false, httpStatus: res.status, message: cfMessage(res), raw: data, tokens };
+      // needsBrowser：换出口（gha_api）实测同样被挑战，别再浪费一次注定失败的运行；
+      // 交给 batchCheckinCore 直接分发到浏览器通道（BROWSER_CAPABLE 含 nodeseek）。
+      return { ok: false, httpStatus: res.status, needsBrowser: true, message: cfMessage(res), raw: data, tokens };
     }
     if (res.status === 404) {
       return { ok: false, httpStatus: res.status, message: notFoundMessage(res), raw: data, tokens };
+    }
+    // 302（CF 边缘的重定向，body 是空的 302 Found）：2026-10-13 Worker 出口实测就是
+    // 这条。旧版把 Location 丢掉、只报「签到失败 HTTP 302」，谁也没法判断被甩去哪。
+    if (res.status >= 300 && res.status < 400) {
+      return {
+        ok: false,
+        httpStatus: res.status,
+        needsBrowser: true,
+        message: redirectMessage(res),
+        raw: { location: res.location, body: responseTextHint(data) },
+        tokens,
+      };
     }
 
     // HAR 实测成功体：{"success":true,"message":"今天的签到收益是6个鸡腿","gain":6,"current":599}

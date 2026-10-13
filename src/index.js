@@ -173,8 +173,13 @@ function ghFallbackAvailable(env) {
 // 不该把「恰好只有浏览器能解」的失败拦在降级之外。
 const PERMANENT_FAIL_RE = /缺少|需要|未配置|不存在|404|无可用|未知渠道|不支持/;
 
-/** 浏览器通道能兜住的渠道类型（对应 scripts/browser-checkin.py 的两条流程） */
-const BROWSER_CAPABLE = new Set(["sub2api", "newapi"]);
+/**
+ * 浏览器通道能兜住的渠道类型（对应 scripts/browser-checkin.py 的流程）。
+ * nodeseek / linuxsb 走浏览器是唯一可行的路：它们全站在 Cloudflare 后面，而
+ * cf_clearance 与签发它的出口 IP 绑定 —— 2026-10-13 实测 Worker 出口（302/403
+ * 拦截页）与 Azure 出口（403 Just a moment）都过不去，只有真浏览器能过挑战。
+ */
+const BROWSER_CAPABLE = new Set(["sub2api", "newapi", "nodeseek", "linuxsb"]);
 
 async function tryWorkerCheckin(channel) {
   try {

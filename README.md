@@ -84,8 +84,8 @@ cp .dev.vars.example .dev.vars
 | `sub2api` | Sub2API 系站点 | Bearer JWT | `POST /api/v1/check-in` |
 | `newapi` | NewAPI / OneAPI 系 | Cookie + `New-Api-User` | `POST /api/user/checkin` |
 | `agentrouter` | AgentRouter 等同系 | Cookie / 账密（登录前先 logout） | 查询用户信息自动签到，兼容 `sign_in` / `checkin` |
-| `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | `POST /api/attendance?random=true`（收益=鸡腿） |
-| `linuxsb` | linux.sb（烧饼社区） | Cookie | 打开页面即自动签到；另有「抽称号」动作 |
+| `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后，页面内 `POST /api/attendance?random=true`（收益=鸡腿） |
+| `linuxsb` | linux.sb（烧饼社区） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后打开首页触发服务端自动签到；另有「抽称号」动作 |
 | `nodeloc` | NodeLoc（www.nodeloc.com，Discourse） | Cookie + CSRF | `POST /checkin`（form 编码 + `X-Checkin-Nonce`） |
 
 ### 填写建议
@@ -110,20 +110,24 @@ cp .dev.vars.example .dev.vars
 - 三站都**只认浏览器 Cookie**，没有账密登录，也没有 API 令牌
 - 复制方式：浏览器登录后 F12 → Application → Cookies → 复制整站 Cookie
   （NodeLoc 至少要含 `_t`；被 Cloudflare 挑战过的话把 `cf_clearance` 也带上）
+- **NodeSeek / linux.sb 必须把「签到通道」设成 `gha_browser`（浏览器通道）**。这两站全站
+  挂在 Cloudflare 后面，而 `cf_clearance` 与签发它的出口 IP 绑定 —— 2026-10-13 实测
+  Worker 出口（NodeSeek 302、linux.sb 403 拦截页）与 `gha_api` 的 Azure 出口
+  （两站都是 403 Just a moment）都过不去，`cf_clearance` 拷进渠道也照样失效。
+  浏览器通道用真浏览器（Camoufox）过挑战，再在**页面上下文里**发签到请求：
+  CF 放行 cookie 与站点自己的签名头（NodeSeek 的 `refract-*` 由 sw.js 生成）都是现成的
 - **NodeSeek**：签到单位是「鸡腿」不是美元，面板按积分展示，不会折算成金额。
   站点没有独立状态接口，渠道里填上「论坛用户名」后，「状态」按钮会用当日签到排行榜
-  判断今天是否已签。失败时若回 `high risk action`，那是站点风控（不是接口写错），
-  换 Cookie / 带 `cf_clearance` / 把通道改成 `gha_api` 依次试
+  判断今天是否已签。失败时若回 `high risk action`，那是站点风控（不是接口写错）：
+  重新登录后重抄 Cookie 再试
 - **linux.sb**：签到是**自动的** —— 打开任意页面时服务端顺手完成，提示写进页面的
-  `window.__pageFlash`。所以「签到」= 拉一次首页：有「已帮您完成自动签到」= 刚签上，
-  为空 = 今日已签过。卡片上另有 **抽称号** 按钮（`POST /gacha_pull`，每日免费一抽，
-  不花积分）；想在每天签到后自动抽，把渠道的 `options.autoGacha` 填 `true`
+  `window.__pageFlash`。浏览器通道打开首页即可：有「已帮您完成自动签到」= 刚签上
+  （带出当日积分），为空 = 今日已签过。渠道的 `options.autoGacha` 填 `true`
+  时，浏览器通道还会在签到后顺手点一次「每日免费一抽」（不花积分），
+  面板上另有 **抽称号** 按钮（`POST /gacha_pull`）供手动使用
 - **NodeLoc（Discourse）**：会自动用 Cookie 换 `/session/csrf.json` 的会话级 CSRF token，
   通常不用手填；`CSRF Token` 字段只在自动获取失败时用。注意请求体是表单编码
-  （`nonce=…&timestamp=…`），不是 JSON
-- **NodeSeek 整站挂在 Cloudflare 托管挑战后面**，Workers / Actions 的机房 IP 经常
-  被拦。解法：Cookie 里带 `cf_clearance`，或把该渠道的签到通道改成 `gha_api`
-  （GitHub Actions 的 Azure 出口 IP）
+  （`nonce=…&timestamp=…`），不是 JSON。本站走 worker 直连即可（实测没被拦）
 
 ---
 
@@ -230,6 +234,12 @@ curl -X POST https://<your-worker>/api/cron/run \
   → 点站点自己的签到按钮 → 点 `api2/anchor` 里的勾选框 → 轮询权威状态确认，全程不接触
   token（站点前端拿到 token 后自己 `POST /api/user/checkin?recaptcha=<token>`）。
   渠道编辑弹窗里的「该站用 Google reCAPTCHA v2」可强制走这条分支，留空则自动探测。
+- **社区站（NodeSeek / linux.sb）也吃这条降级链**：它们走纯 HTTP 时会被 Cloudflare 拦住
+  （Worker 出口 NodeSeek 302 / linux.sb 403，Azure 出口两站都是 403 挑战页），适配器会把
+  这类失败标成 `needsBrowser`，于是渠道即使配的是 `worker` 也会降到 `gha_browser`；
+  持续跑请直接把这两个渠道的通道设成 `gha_browser`，省掉前面两次注定失败的尝试。
+  浏览器通道的流程见 `scripts/browser-checkin.py` 的 `nodeseek_browser_checkin` /
+  `linuxsb_browser_checkin`（后者含「签到后自动抽称号」）。
 
 
 ---
