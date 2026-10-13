@@ -2645,29 +2645,29 @@ async def linuxsb_browser_checkin(channel, proxy=None) -> dict:
             # 顺带把两个值都写进日志 —— 判据万一还是太紧/太松，日志里有原文可查。
             ymd = site_today()
             stats = await read_stats_cookie(page)
-            evidence = checkin_record_evidence(html, ymd)
+            # 「今天签没签」的判据（2026-10-13 第四轮线上日志定的，别再放宽/收紧）：
+            #   ① __daily_checkin_stats cookie 的日期 = 今天（服务端处理完签到才会改写；
+            #      实测这一页也可能根本没有这个 cookie，所以只能当加分项）；
+            #   ② 页面正文里出现**相对日期**措辞「今天/今日已签到」——
+            #      站点就是这么写的（实测原文：`今天已签到 19 连续天数 46 累计签到 已完成`），
+            #      它压根不写具体日期，所以「要求附近有日期」的判据太紧；
+            #   ③ 兜底：正文/HTML 里「已签到」附近出现今天的日期（有的页面会写日期）。
+            # 只认裸「已签到」太松：第一版因此从 HTML 里抓到「已签到 <div class」这种
+            # 片段就算签过了 —— 那个词页面别处也有。所以必须带日期限定词。
+            ymd = site_today()
+            stats = await read_stats_cookie(page)
+            body_text = str(detail.get("body") or "")
+            m_rel = re.search(r"(?:今天|今日)已签(?:到)?[^一-龥]{0,12}", body_text)
+            evidence = (m_rel.group(0).strip() if m_rel else "") or checkin_record_evidence(html, ymd)
             log(
                 f"  🔎 {name}: 今日 {ymd}｜__daily_checkin_stats={stats.get('raw') or '(无)'}"
                 f"｜记录证据={evidence or '(无)'}"
             )
             if (stats.get("date") == ymd) or evidence:
-                pts = stats.get("points")
-                if pts is None and evidence:
-                    # 只在命中词附近那一小段里找数字：整页侧栏的「积分 1158」是账户总分，
-                    # 对整页跑 flash_points 会把总分当成今日奖励。
-                    pts = flash_points(evidence)
-                message = "今日已签过（linux.sb 打开页面即自动签到，__pageFlash 为空即当日已完成）"
-                if pts is not None:
-                    message = f"{message} · {pts:g} 积分"
+                message = "今日已签到（linux.sb 打开页面即自动签到）"
                 if evidence:
                     message = f"{message} · 站点原文：{evidence}"
                 result = {"name": name, "ok": True, "message": message[:300]}
-            elif not (forum_logged_in(snap) or detail.get("userCard") or detail.get("hasDailyCheckin")):
-                return {
-                    "name": name,
-                    "ok": False,
-                    "retryable": False,
-                    "message": (
                         "Cookie 已失效：首页与 /daily_checkin 都拿不到登录态线索"
                         "（没有用户卡片 /「每日签到」入口）。请在浏览器里重新登录 "
                         "https://linux.sb 后重抄整站 Cookie 到渠道里。"
