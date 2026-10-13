@@ -143,5 +143,44 @@ ok("回复达人" in mod.gacha_title_line(titles[0]), "排版包含称号名")
 ok(mod.parse_gacha_titles("") == [], "空 HTML 返回空列表")
 ok(mod.parse_gacha_titles("<div>很遗憾，什么都没抽到</div>") == [], "空抽结果不伪造称号")
 
+print("\n[9] 登录表单字段识别（NodeSeek 登录页形态：账号框 + 密码框 + 隐藏 csrf）")
+LOGIN_INPUTS = [
+    {"name": "_csrf", "type": "hidden", "id": "", "placeholder": "", "autocomplete": "", "visible": False},
+    {"name": "username", "type": "text", "id": "username", "placeholder": "用户名 / 邮箱", "autocomplete": "username", "visible": True},
+    {"name": "password", "type": "password", "id": "password", "placeholder": "密码", "autocomplete": "current-password", "visible": True},
+    {"name": "submit", "type": "submit", "id": "", "placeholder": "", "autocomplete": "", "visible": True},
+]
+user_el, pw_el = mod.pick_login_fields(LOGIN_INPUTS)
+ok(user_el and user_el["name"] == "username", "挑出账号框", str(user_el))
+ok(pw_el and pw_el["name"] == "password", "挑出密码框", str(pw_el))
+ok(mod.input_selector(user_el) == 'input[name="username"]', "选择器优先用 name", mod.input_selector(user_el))
+ok(mod.input_selector(pw_el) == 'input[name="password"]', "密码框选择器", mod.input_selector(pw_el))
+ok(mod.pick_login_fields([{"name": "q", "type": "text", "visible": True}])[1] is None, "没有密码框时如实返回 None")
+ok(mod.pick_login_fields([]) == (None, None), "空表单不报错")
+# 邮箱框优先于普通文本框（placeholder 里带 email 的那种）
+EMAIL_FIRST = [
+    {"name": "nick", "type": "text", "id": "", "placeholder": "昵称", "autocomplete": "", "visible": True},
+    {"name": "email", "type": "email", "id": "", "placeholder": "邮箱", "autocomplete": "", "visible": True},
+    {"name": "password", "type": "password", "id": "", "placeholder": "", "autocomplete": "", "visible": True},
+]
+ok(mod.pick_login_fields(EMAIL_FIRST)[0]["name"] == "email", "账号框优先挑邮箱输入")
+ok(mod.input_selector({"type": "password"}) == 'input[type="password"]', "没有 name/id 时退到 type")
+
+print("\n[10] Cookie 拼装与「会话到手」判据")
+JAR = [
+    {"name": "session", "value": "abc", "domain": "nodeseek.com"},
+    {"name": "pjwt", "value": "jwt", "domain": ".nodeseek.com"},
+    {"name": "cf_clearance", "value": "cf", "domain": ".nodeseek.com"},
+    {"name": "other", "value": "x", "domain": "example.com"},
+]
+hdr = mod.cookies_to_header(JAR, "nodeseek.com")
+ok("session=abc" in hdr and "pjwt=jwt" in hdr, "取到本站会话 cookie", hdr)
+ok("cf_clearance=cf" in hdr, "cf_clearance 也在（由上层决定要不要写回）", hdr)
+ok("other=x" not in hdr, "不带别的域的 cookie", hdr)
+ok(mod.cookies_to_header([], "nodeseek.com") == "", "空 jar 返回空串")
+ok(mod.has_session_cookie(hdr) is True, "识别出已有会话")
+ok(mod.has_session_cookie("cf_clearance=cf; colorscheme=light") is False, "只有 CF cookie 不算登录")
+ok(mod.has_session_cookie("") is False, "空串不算登录")
+
 print(f"\n{'❌' if failures else '✅'} {checks - failures}/{checks} 通过")
 raise SystemExit(1 if failures else 0)

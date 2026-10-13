@@ -2915,73 +2915,358 @@ def attendance_result(name, res):
     return None
 
 
+# 登录页结构探针：站点没有公开的登录 API 文档，只能驱动它自己的表单。把 input / form /
+# button 全抓下来写进日志 —— 选择器一旦对不上，这份结构就是唯一能说明「站点改成了什么」
+# 的东西（比反复猜选择器省事得多）。
+JS_LOGIN_FORM = """() => {
+    const vis = el => !!(el.offsetWidth || el.offsetHeight);
+    const inputs = [...document.querySelectorAll('input')].map(el => ({
+        name: el.getAttribute('name') || '',
+        type: (el.getAttribute('type') || 'text').toLowerCase(),
+        id: el.getAttribute('id') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        autocomplete: el.getAttribute('autocomplete') || '',
+        visible: vis(el),
+    }));
+    const forms = [...document.querySelectorAll('form')].map(f => ({
+        action: f.getAttribute('action') || '',
+        method: (f.getAttribute('method') || 'get').toLowerCase(),
+    }));
+    const buttons = [...document.querySelectorAll('button,input[type=submit]')]
+        .map(b => (b.innerText || b.value || '').trim()).filter(Boolean).slice(0, 10);
+    const html = document.documentElement ? document.documentElement.innerHTML : '';
+    return {
+        url: location.href,
+        title: document.title,
+        inputs, forms, buttons,
+        hasTurnstile: /cf-turnstile|challenges\\.cloudflare\\.com/i.test(html),
+        hasRecaptcha: /g-recaptcha|google\\.com\\/recaptcha/i.test(html),
+        body: (document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '').slice(0, 240),
+    };
+}"""
+
+# 首页上的「登录」入口（/login 不是登录页时退回这条路）
+JS_CLICK_LOGIN_ENTRY = """() => {
+    const cands = [...document.querySelectorAll('a,button')].filter(el => {
+        const t = (el.innerText || '').trim();
+        const href = el.getAttribute('href') || '';
+        return /^(登录|登入|Login|Sign in)$/i.test(t) || /\\/login/i.test(href);
+    });
+    if (!cands.length) return {found: false};
+    const el = cands[0];
+    el.click();
+    return {found: true, text: ((el.innerText || '').trim() || el.getAttribute('href') || '').slice(0, 24)};
+}"""
+
+# 提交登录表单：优先点文案像「登录」的按钮，退到 form.submit()
+JS_SUBMIT_LOGIN = """() => {
+    const btn = [...document.querySelectorAll('button,input[type=submit]')]
+        .find(b => /登录|登入|login|sign\\s*in/i.test((b.innerText || b.value || '')));
+    if (btn) {
+        btn.click();
+        return {clicked: true, label: ((btn.innerText || btn.value || '').trim()).slice(0, 16)};
+    }
+    const pw = document.querySelector('input[type=password]');
+    const form = pw && pw.closest ? pw.closest('form') : null;
+    if (form) { form.submit(); return {clicked: true, label: 'form.submit'}; }
+    return {clicked: false};
+}"""
+
+
+def pick_login_fields(inputs):
+    """从页面的 input 列表里挑出「账号框」和「密码框」（纯函数，便于离线测试）。
+
+    密码框：第一个可见的 password 型输入。
+    账号框：name/id/placeholder/autocomplete 里带 email / user / account / login / name 的
+    可见文本框；一个都没有就退到第一个可见文本框（按关键词命中优先级排序）。
+    """
+    pw = None
+    for el in inputs or []:
+        if str(el.get("type") or "").lower() == "password" and el.get("visible", True):
+            pw = el
+            break
+    cands = [
+        el
+        for el in (inputs or [])
+        if el is not pw
+        and el.get("visible", True)
+        and str(el.get("type") or "text").lower() in ("text", "email", "tel", "")
+    ]
+
+    def score(el):
+        hay = " ".join(
+            str(el.get(k) or "") for k in ("name", "id", "placeholder", "autocomplete")
+        ).lower()
+        for i, kw in enumerate(("email", "user", "account", "login", "name")):
+            if kw in hay:
+                return i
+        return 99
+
+    cands.sort(key=score)
+    return (cands[0] if cands else None), pw
+
+
+def input_selector(el):
+    """给一个 input 描述挑一个稳定的 CSS 选择器（name > id > type）。"""
+    if not el:
+        return ""
+    if el.get("name"):
+        return 'input[name="%s"]' % el["name"]
+    if el.get("id"):
+        return "#" + str(el["id"])
+    if el.get("type"):
+        return 'input[type="%s"]' % el["type"]
+    return ""
+
+
+def cookies_to_header(cookies, host_suffix):
+    """把浏览器 cookie jar 拼成 Cookie 头（只取目标站自己的域）。"""
+    out = []
+    for c in cookies or []:
+        name = str(c.get("name") or "")
+        domain = str(c.get("domain") or "").lstrip(".").lower()
+        if not name or not domain:
+            continue
+        if host_suffix and not (domain == host_suffix or domain.endswith("." + host_suffix)):
+            continue
+        out.append(f"{name}={c.get('value')}")
+    return "; ".join(out)
+
+
+def has_session_cookie(cookie_header):
+    """会话 cookie 是否已经到手（NodeSeek 登录成功会下发 session / pjwt）。"""
+    return bool(re.search(r"(^|;\s*)(session|pjwt)=", cookie_header or ""))
+
+
+async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password):
+    """用渠道里的账密登录 NodeSeek，换一份新会话 Cookie。
+
+    站点没有公开的登录 API，所以这里**驱动它自己的登录页**：打开 /login（那儿没有密码框
+    就回首页点「登录」），把账密填进它自己的表单再提交 —— 与「人手动登录」等价，CF 放行
+    cookie、站点自己那套前端逻辑都在场。
+
+    **登录页同样有 CF 挑战**（用户 2026-10-13 确认）：所以每一步都先过挑战；表单里若挂了
+    Turnstile 还要等它签发 token 再提交；提交后如果又被挑战，继续解，而不是当成登录失败。
+
+    返回 {ok, cookie?, message}。失败时 message 里带上页面结构（inputs/forms/buttons）：
+    选择器一旦对不上，只有这份结构能说明站点改成了什么。
+    """
+
+    async def settle():
+        """把当前页的 CF 挑战处理掉（等待 + 拟人点勾选框），返回是否已过。"""
+        return await wait_cloudflare(page)
+
+    await page.goto(base + "/login", wait_until=wait_until, timeout=nav_ms)
+    await settle()
+    form = await page.evaluate(JS_LOGIN_FORM)
+    log(f"  🔑 {name}: /login 结构 {json.dumps(form, ensure_ascii=False)[:520]}")
+    if not any(str(i.get("type")) == "password" for i in form.get("inputs") or []):
+        log(f"  🔑 {name}: /login 上没有密码框，回首页找登录入口")
+        await page.goto(base + "/", wait_until=wait_until, timeout=nav_ms)
+        await settle()
+        clicked = await page.evaluate(JS_CLICK_LOGIN_ENTRY)
+        log(f"  🔑 {name}: 点登录入口 {json.dumps(clicked, ensure_ascii=False)[:120]}")
+        if clicked.get("found"):
+            await page.wait_for_timeout(2500)
+            await settle()
+        form = await page.evaluate(JS_LOGIN_FORM)
+        log(f"  🔑 {name}: 登录页结构 {json.dumps(form, ensure_ascii=False)[:520]}")
+
+    user_el, pw_el = pick_login_fields(form.get("inputs"))
+    if not (user_el and pw_el):
+        return {
+            "ok": False,
+            "message": (
+                "没能在登录页找到账号/密码输入框（站点可能改了登录页，或该站只走 OAuth）。"
+                f"页面结构：{json.dumps(form, ensure_ascii=False)[:200]}"
+            )[:300],
+        }
+
+    # 登录表单自己挂的验证码：Turnstile 要等它签发 token（站点前端提交时会带上），
+    # reCAPTCHA/hCaptcha 点一次勾选框。挑战页那种「Just a moment」由 settle() 处理。
+    if form.get("hasTurnstile"):
+        log(f"  🔑 {name}: 登录页带 Turnstile，等它签发 token（拟人点勾选框）")
+        tok, src = await wait_any_token(page, TOKEN_WAIT_S)
+        log(f"  🔑 {name}: Turnstile token {'已就绪（' + str(src) + '）' if tok else '没等到，仍尝试提交'}")
+    if form.get("hasRecaptcha"):
+        log(f"  🔑 {name}: 登录页带 reCAPTCHA，点勾选框")
+        await click_captcha_checkbox(page)
+
+    await page.fill(input_selector(user_el), username)
+    await page.fill(input_selector(pw_el), password)
+    log(f"  🔑 {name}: 已填账号（{input_selector(user_el)}）与密码，提交")
+    submitted = await page.evaluate(JS_SUBMIT_LOGIN)
+    if not submitted.get("clicked"):
+        await page.press(input_selector(pw_el), "Enter")
+        submitted = {"clicked": True, "label": "Enter"}
+    log(f"  🔑 {name}: 提交方式 {json.dumps(submitted, ensure_ascii=False)}")
+
+    host = base.split("//", 1)[1].split("/", 1)[0]
+    suffix = host[4:] if host.startswith("www.") else host
+    cookie = ""
+    for _ in range(15):
+        await page.wait_for_timeout(1000)
+        # 提交后又被挑战（登录接口本身也在 CF 后面）：继续解，别当成失败
+        await settle()
+        cookie = cookies_to_header(await page.context.cookies(), suffix)
+        snap = await page_snapshot(page)
+        if has_session_cookie(cookie) and not snap.get("guestHint"):
+            log(f"  🔑 {name}: 登录成功（Cookie {len(cookie)} 字符，落地 {snap.get('url')}）")
+            return {"ok": True, "cookie": cookie, "message": "已用账密登录换取新会话 Cookie"}
+    snap = await page_snapshot(page)
+    return {
+        "ok": False,
+        "cookie": cookie,
+        "message": (
+            "账密登录没成功：页面仍是游客态或没下发会话 Cookie。可能是账号/密码不对、"
+            "验证码没过，或登录页结构变了。"
+            f"页面：{json.dumps(snap, ensure_ascii=False)[:200]}"
+        )[:300],
+    }
 async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
     """NodeSeek：真浏览器过 CF → 页面内 POST /api/attendance?random=true。
 
-    为什么非得在页面里发：这一枪要同时带上 CF 放行 cookie 与站点前端自己生成的
-    签名头（HAR 里的 refract-key / refract-sign / refract-version 来自 sw.js）。
-    机房出口直连连 CF 那关都过不去（实测 302 / 403），拷 cf_clearance 也没用
-    —— 它与出口 IP 绑定。
+    为什么非得在页面里发：这一枪要同时带上 CF 放行 cookie 与站点前端自己生成的签名头
+    （HAR 里的 refract-key / refract-sign / refract-version 来自 sw.js）。机房出口直连
+    连 CF 那关都过不去（实测 302 / 403），拷 cf_clearance 也没用 —— 它与出口 IP 绑定。
+
+    会话来源两条路：
+      ① 渠道里的 Cookie（用户手抄）；
+      ② 渠道里填了账密时由本函数登录换一份新 Cookie（2026-10-13 起，省掉手抄；换到的
+         Cookie 随结果回传面板写回 KV，下次直接用）。
     """
     name = channel.get("name", "unnamed")
     base = channel["baseUrl"].rstrip("/")
-    username = str((channel.get("auth") or {}).get("username") or "").strip()
-    if not forum_cookie_pairs(channel):
-        return {"name": name, "ok": False, "retryable": False, "message": "缺少 Cookie，浏览器通道也签不了（Cookie 是这两站唯一的鉴权方式）"}
+    auth = channel.get("auth") or {}
+    username = str(auth.get("username") or auth.get("email") or "").strip()
+    password = str(auth.get("password") or "")
+    has_creds = bool(username and password)
+    has_cookie = bool(forum_cookie_pairs(channel))
+    if not has_cookie and not has_creds:
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": False,
+            "message": (
+                "NodeSeek 只认浏览器会话，而本渠道既没有 Cookie 也没有账密。"
+                "填「论坛用户名 + 密码」（浏览器通道自动登录换 Cookie），或手抄一份整站 Cookie。"
+            )[:300],
+        }
     if proxy:
         log(f"  🌍 {name}: 走代理 {mask_proxy(proxy)}")
     async with browser_page(proxy) as page:
         got = await apply_channel_cookies(page, channel)
         log(f"  🍪 {name}: 注入 {got} 个 cookie")
         wait_until, nav_ms = nav_opts(proxy)
-        log(f"  🌐 {name}: 打开 {base}/board")
-        await page.goto(base + "/board", wait_until=wait_until, timeout=nav_ms)
-        st = await wait_cloudflare(page)
-        snap = await page_snapshot(page)
-        if st is None:
-            return cf_failure(name, snap, "签到")
-        log(f"  🔍 {name}: 页面 {json.dumps(snap, ensure_ascii=False)[:320]}")
-        # 站点前端自己的脚本要时间起来（签名头由它生成），页面内 fetch 才有机会带上
-        await page.wait_for_timeout(2500)
 
-        # ① 只读确认：填了用户名就能靠今日排行榜直接定论「今日已签」，省掉一次签到请求
-        board = await page.evaluate(JS_BOARD, 1)
-        hit = board_hit(board, username)
-        if hit:
-            return {
-                "name": name,
-                "ok": True,
-                "message": f"今日已签到（签到排行榜确认）· 获得 {hit.get('gain')} 鸡腿"[:300],
-            }
+        async def open_board():
+            """打开 /board 并等 CF 过、等站点前端脚本起来（签名头由它生成）。"""
+            await page.goto(base + "/board", wait_until=wait_until, timeout=nav_ms)
+            await wait_cloudflare(page)
+            await page.wait_for_timeout(2500)
+            return await page_snapshot(page)
 
-        # ② 页面内 POST 签到（HAR 里站点前端就是这么发的）
-        res = await page.evaluate(JS_ATTENDANCE)
-        done = attendance_result(name, res)
-        if done:
-            return done
-        log(f"  🧪 {name}: 页面内签到未成功 {json.dumps(res, ensure_ascii=False)[:300]}")
+        async def attempt():
+            """页面内跑一遍：排行榜确认 → POST 签到 → 点站点按钮 → 再 POST。
 
-        # ③ 点站点自己的签到控件：站点前端会带上它自己那套签名头重发。它自己的请求
-        #    可能先成功（站点前端与我们是两条独立请求），所以点完先查排行榜定论，
-        #    再补一枪页面内 POST，避免把「已经签上了」误报成失败。
-        clicked = await click_site_checkin(page)
-        log(f"  🖱️ {name}: 点站点签到控件 {json.dumps(clicked, ensure_ascii=False)[:120]}")
-        if clicked.get("found"):
-            await page.wait_for_timeout(4000)
-            hit2 = board_hit(await page.evaluate(JS_BOARD, 1), username)
-            if hit2:
+            返回 (结果 or None, 最后一枪的响应)。None 表示「判定不了」，由调用方决定
+            是去登录换 Cookie 还是如实报失败。
+            """
+            hit = board_hit(await page.evaluate(JS_BOARD, 1), username)
+            if hit:
                 return {
                     "name": name,
                     "ok": True,
-                    "message": f"今日已签到（点站点自身按钮后由排行榜确认）· 获得 {hit2.get('gain')} 鸡腿"[:300],
-                }
-            res2 = await page.evaluate(JS_ATTENDANCE)
-            done2 = attendance_result(name, res2)
-            if done2:
-                return done2
-            res = res2
+                    "message": f"今日已签到（签到排行榜确认）· 获得 {hit.get('gain')} 鸡腿"[:300],
+                }, None
+            res = await page.evaluate(JS_ATTENDANCE)
+            done = attendance_result(name, res)
+            if done:
+                return done, res
+            log(f"  🧪 {name}: 页面内签到未成功 {json.dumps(res, ensure_ascii=False)[:300]}")
+            # 点站点自己的签到控件：站点前端会带上它自己那套签名头重发。它自己的请求可能
+            # 先成功（两条独立请求），所以点完先查排行榜定论，再补一枪页面内 POST，
+            # 免得把「已经签上了」误报成失败。
+            clicked = await click_site_checkin(page)
+            log(f"  🖱️ {name}: 点站点签到控件 {json.dumps(clicked, ensure_ascii=False)[:120]}")
+            if clicked.get("found"):
+                await page.wait_for_timeout(4000)
+                hit2 = board_hit(await page.evaluate(JS_BOARD, 1), username)
+                if hit2:
+                    return {
+                        "name": name,
+                        "ok": True,
+                        "message": f"今日已签到（点站点自身按钮后由排行榜确认）· 获得 {hit2.get('gain')} 鸡腿"[:300],
+                    }, None
+                res2 = await page.evaluate(JS_ATTENDANCE)
+                done2 = attendance_result(name, res2)
+                if done2:
+                    return done2, res2
+                res = res2
+            return None, res
 
-        # ④ 判定不了：把几种真实原因分开说，别笼统报「签到失败」
+        log(f"  🌐 {name}: 打开 {base}/board")
+        snap = await open_board()
+        if not snap.get("title"):
+            return cf_failure(name, snap, "签到")
+        log(f"  🔍 {name}: 页面 {json.dumps(snap, ensure_ascii=False)[:320]}")
+
+        fresh = ""
+        logged_in_now = False
+        # 没 Cookie、或页面明显是游客态（签到入口写着「登录后签到」）时先登录再谈签到：
+        # 否则那一枪必然 USER NOT FOUND，白等一轮。
+        if has_creds and (not has_cookie or snap.get("guestHint")):
+            log(f"  🔑 {name}: {'没有 Cookie' if not has_cookie else '页面是游客态'} → 先用账密登录")
+            login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
+            log(f"  🔑 {name}: 登录结果 {login.get('message')}")
+            if not login.get("ok"):
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": f"账密登录失败：{login.get('message')}"[:300],
+                }
+            fresh = login.get("cookie") or ""
+            logged_in_now = True
+            snap = await open_board()
+
+        result, res = await attempt()
+
+        # 会话失效（USER NOT FOUND / 被甩到登录页 / 页面转成游客态）且填了账密：
+        # 登录换新的再跑一遍 —— 这就是「填账密不用手抄 Cookie」的兑现点。
+        if result is None and has_creds and not logged_in_now:
+            res_body = (res or {}).get("body") if isinstance((res or {}).get("body"), dict) else {}
+            probe = str(res_body.get("message") or "") + str((res or {}).get("text") or "")
+            session_dead = (
+                "user not found" in probe.lower()
+                or snap.get("guestHint")
+                or "/login" in str((res or {}).get("url") or "")
+            )
+            if session_dead:
+                log(f"  🔑 {name}: 会话已失效 → 用账密登录换新 Cookie 后重试")
+                login = await nodeseek_browser_login(page, name, base, wait_until, nav_ms, username, password)
+                log(f"  🔑 {name}: 登录结果 {login.get('message')}")
+                if login.get("ok"):
+                    fresh = login.get("cookie") or ""
+                    logged_in_now = True
+                    snap = await open_board()
+                    result, res = await attempt()
+                else:
+                    return {
+                        "name": name,
+                        "ok": False,
+                        "retryable": False,
+                        "message": f"Cookie 已失效，且账密登录失败：{login.get('message')}"[:300],
+                    }
+
+        if result is not None:
+            if fresh:
+                result["message"] = f"{result['message']} · 已用账密登录刷新 Cookie"[:300]
+                # 面板（/api/gh/result）会把它写回 KV，省掉手抄；cf_clearance 之类会被剔除
+                result["newTokens"] = {"cookie": fresh}
+            return result
+
+        # 判定不了：把几种真实原因分开说，别笼统报「签到失败」
         body = res.get("body") if isinstance(res.get("body"), dict) else {}
         msg = str(body.get("message") or "").strip()
         text = str(res.get("text") or "")
@@ -2993,23 +3278,24 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 "ok": False,
                 "message": (
                     f"站点风控回话 high risk action（HTTP {status}，浏览器通道同样被拦）。"
-                    f"这不是接口写错：多为 Cookie 失效或站点要求浏览器指纹签名。请重新登录后重抄 Cookie。"
+                    f"这不是接口写错：多为会话失效或站点要求浏览器指纹签名。"
+                    f"{'账密登录已试过；' if logged_in_now else ''}"
                     f"页面：{json.dumps(snap, ensure_ascii=False)[:160]}"
                 )[:300],
             }
-        # 「USER NOT FOUND」= 站点按这份 Cookie 查不到用户：会话已失效。2026-10-13 线上
-        # 实测就是这个形态（HTTP 500 + {"message":"USER NOT FOUND","status":404}），
-        # 而游客页还有第二个信号：签到入口写着「登录后签到」。两者都指向重抄 Cookie，
-        # 换出口/补 cf_clearance 都解决不了会话失效，所以标不可重试。
+        # 「USER NOT FOUND」= 站点按这份 Cookie 查不到用户：会话已失效（2026-10-13 实测形态：
+        # HTTP 500 + {"message":"USER NOT FOUND","status":404}）。走到这里说明没填账密
+        # （填了的话上面已经登录重试过），所以只能让用户补凭证。
         if "user not found" in (msg + text).lower() or snap.get("guestHint"):
             return {
                 "name": name,
                 "ok": False,
                 "retryable": False,
                 "message": (
-                    f"Cookie 已失效：站点回 USER NOT FOUND（HTTP {status}）"
+                    f"会话已失效：站点回 USER NOT FOUND（HTTP {status}）"
                     f"{'，页面上的签到入口也是「登录后签到」' if snap.get('guestHint') else ''}。"
-                    "请在浏览器里重新登录 https://www.nodeseek.com 后重抄整站 Cookie 到渠道里。"
+                    "在渠道里填「论坛用户名 + 密码」即可自动登录换 Cookie（推荐），"
+                    "或重新登录后重抄整站 Cookie。"
                 )[:300],
             }
         if "/login" in where or ("登录" in text and not msg):
@@ -3018,8 +3304,9 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
                 "ok": False,
                 "retryable": False,
                 "message": (
-                    f"签到请求被重定向到登录页（{where or 'HTTP ' + str(status)}），Cookie 已失效："
-                    "请在浏览器里重新登录 https://www.nodeseek.com 后重抄整站 Cookie。"
+                    f"签到请求被重定向到登录页（{where or 'HTTP ' + str(status)}），会话已失效："
+                    "在渠道里填「论坛用户名 + 密码」即可自动登录换 Cookie（推荐），"
+                    "或重新登录后重抄整站 Cookie。"
                 )[:300],
             }
         return {

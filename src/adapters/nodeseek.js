@@ -70,9 +70,39 @@ async function request(channel, path, cookie) {
 
 function cookieMissingMessage() {
   return (
-    "缺少 Cookie。NodeSeek 只支持浏览器 Cookie 鉴权（站点走 LinuxDo OAuth，无账密登录）：" +
-    "在浏览器登录 https://www.nodeseek.com 后，F12 → Application → Cookies 复制整站 Cookie。"
+    "缺少 Cookie。NodeSeek 只认浏览器会话，两种填法任选：" +
+    "① 填「论坛用户名 + 密码」—— 浏览器通道会自动登录换 Cookie（推荐，不用手抄）；" +
+    "② 在浏览器登录 https://www.nodeseek.com 后，F12 → Application → Cookies 复制整站 Cookie。"
   );
+}
+
+/** 渠道里的账密（浏览器通道用它登录换 Cookie）；只填一半不算 */
+function credentialsOf(channel) {
+  const auth = channel.auth || {};
+  const username = String(auth.username || auth.email || "").trim();
+  const password = String(auth.password || "");
+  return username && password ? { username, password } : null;
+}
+
+/**
+ * 已配置账密、但当前没有 Cookie 时的说明。
+ *
+ * 措辞刻意避开 PERMANENT_FAIL_RE 里的词（缺少 / 需要 / 未配置 / 不存在 / 404 / 无可用 /
+ * 未知渠道 / 不支持）—— 命中那个正则的失败不会降级，用户填了账密也会被卡在 worker 出口。
+ */
+function credentialsMessage() {
+  return (
+    "NodeSeek 只认浏览器会话，worker 出口连 Cloudflare 那关都过不去。" +
+    "本渠道已填账密：浏览器通道会打开站点登录页用账密换一份新 Cookie，" +
+    "再在页面内完成签到，换到的 Cookie 自动写回渠道（下次直接复用）。"
+  );
+}
+
+/** 会话失效类失败统一补一句「填了账密就让浏览器通道自动登录」 */
+function sessionHint(channel) {
+  return credentialsOf(channel)
+    ? "渠道里已填账密：浏览器通道会用它自动登录换新 Cookie。"
+    : "可在渠道里填「论坛用户名 + 密码」，让浏览器通道自动登录换 Cookie（不必手抄）。";
 }
 
 function riskMessage(res, serverMsg) {
@@ -118,21 +148,35 @@ export const nodeseekAdapter = {
   fields: [
     { key: "baseUrl", label: "站点地址", placeholder: "https://www.nodeseek.com", required: true },
     {
-      key: "auth.cookie",
-      label: "Cookie（必需；浏览器登录后从 F12 → Application → Cookies 复制，含 cf_clearance 更好）",
-      type: "textarea",
-      placeholder: "session=...; ...",
+      key: "auth.username",
+      label: "论坛用户名 / 邮箱（推荐：与密码一起填，浏览器通道自动登录换 Cookie，不用手抄）",
+      placeholder: "蓝色的雨",
     },
     {
-      key: "auth.username",
-      label: "论坛用户名（可选；填了才能用签到排行榜判断「今日是否已签」）",
-      placeholder: "PaperCups",
+      key: "auth.password",
+      label: "密码（推荐：与用户名一起填；只存在你的 KV 里，供浏览器通道登录用）",
+      type: "password",
+      placeholder: "••••••••",
+    },
+    {
+      key: "auth.cookie",
+      label: "Cookie（可选：不填账密时用；浏览器登录后从 F12 → Application → Cookies 复制）",
+      type: "textarea",
+      placeholder: "session=...; ...",
     },
   ],
 
   async checkin(channel) {
     let cookie = pickCookie(channel);
-    if (!cookie) return { ok: false, message: cookieMissingMessage() };
+    if (!cookie) {
+      // 渠道里填了账密：这一枪交给浏览器通道去登录换 Cookie（worker 出口连 CF 都过不去）。
+      // 文案里不能出现 PERMANENT_FAIL_RE 的词（缺少/需要/未配置…），否则会被判成永久失败、
+      // 根本不降级 —— 那用户填了账密也永远签不上。
+      if (credentialsOf(channel)) {
+        return { ok: false, needsBrowser: true, message: credentialsMessage() };
+      }
+      return { ok: false, message: cookieMissingMessage() };
+    }
 
     const res = await request(channel, `${ATTEND_PATH}?random=true`, cookie);
     if (res.setCookies?.length) cookie = mergeCookie(cookie, res.setCookies);
@@ -193,14 +237,34 @@ export const nodeseekAdapter = {
     // 「high risk action」是 NodeSeek 的通用风控回话（Cookie 失效 / 没带 CF 放行 /
     // 站点要求浏览器指纹签名都会这样），必须单独说清，否则用户只会一直换 Cookie。
     if (/high risk action/i.test(serverMsg)) {
-      return { ok: false, httpStatus: res.status, message: riskMessage(res, serverMsg), raw: data, tokens };
+      return {
+        ok: false,
+        httpStatus: res.status,
+        needsBrowser: true,
+        message: `${riskMessage(res, serverMsg)}${sessionHint(channel)}`,
+        raw: data,
+        tokens,
+      };
     }
-    // 其他会话类拒绝
+    // 其他会话类拒绝（含站点按 Cookie 查不到用户的「USER NOT FOUND」）
     if (AUTH_FAIL_RE.test(serverMsg) || res.status === 401 || res.status === 403) {
       return {
         ok: false,
         httpStatus: res.status,
-        message: `Cookie 无效或已过期（站点回：${serverMsg || `HTTP ${res.status}`}）。${cookieMissingMessage()}`,
+        needsBrowser: true,
+        message: `Cookie 无效或已过期（站点回：${serverMsg || `HTTP ${res.status}`}）。${cookieMissingMessage()}${sessionHint(channel)}`,
+        raw: data,
+        tokens,
+      };
+    }
+    // 站点按会话查不到用户（实测形态：HTTP 500 + {"message":"USER NOT FOUND"}）：
+    // 这就是会话失效，交给浏览器通道用账密登录换新的，别让用户去手抄。
+    if (/user not found/i.test(responseTextHint(data))) {
+      return {
+        ok: false,
+        httpStatus: res.status,
+        needsBrowser: true,
+        message: `站点按这份 Cookie 查不到用户（USER NOT FOUND，HTTP ${res.status}）：会话已失效。${sessionHint(channel)}`,
         raw: data,
         tokens,
       };
@@ -220,7 +284,14 @@ export const nodeseekAdapter = {
    */
   async status(channel) {
     const cookie = pickCookie(channel);
-    if (!cookie) return { ok: false, message: cookieMissingMessage() };
+    if (!cookie) {
+      return {
+        ok: false,
+        message: credentialsOf(channel)
+          ? "状态查询要 Cookie（worker 出口被 CF 拦，查不了）。点「签到」即可：浏览器通道会用账密登录，顺手在排行榜上确认今日状态。"
+          : cookieMissingMessage(),
+      };
+    }
     const username = String(channel.auth?.username || "").trim();
 
     if (!username) {
@@ -273,7 +344,14 @@ export const nodeseekAdapter = {
 
   async me(channel) {
     const cookie = pickCookie(channel);
-    if (!cookie) return { ok: false, message: cookieMissingMessage() };
+    if (!cookie) {
+      return {
+        ok: false,
+        message: credentialsOf(channel)
+          ? "用户信息查询要 Cookie（worker 出口被 CF 拦）。点「签到」即可：浏览器通道会用账密登录完成签到。"
+          : cookieMissingMessage(),
+      };
+    }
     // 没有 /api/user/self 之类端点：鸡腿余额只在签到响应里，别为了「有返回」去猜路径。
     return {
       ok: true,
@@ -287,9 +365,25 @@ export const nodeseekAdapter = {
     };
   },
 
-  /** Cookie 校验：没有只读接口，只能跑一次幂等签到。 */
+  /**
+   * 凭证校验：没有只读接口，只能跑一次幂等签到。
+   *
+   * 无 Cookie 但填了账密时不能只说「缺少 Cookie」—— 那种文案会让人以为填账密没用。
+   * 这里如实说明：校验要落在浏览器通道上（点「签到」触发）。
+   */
   async login(channel) {
-    if (!pickCookie(channel)) return { ok: false, message: cookieMissingMessage() };
+    if (!pickCookie(channel)) {
+      if (credentialsOf(channel)) {
+        return {
+          ok: false,
+          needsBrowser: true,
+          message:
+            "已填账密。NodeSeek 的凭证校验只能在浏览器通道做（worker 出口被 CF 拦）：" +
+            "点「签到」即会打开站点、用账密登录并顺手确认会话可用。",
+        };
+      }
+      return { ok: false, message: cookieMissingMessage() };
+    }
     const r = await this.checkin(channel);
     return {
       ok: r.ok,

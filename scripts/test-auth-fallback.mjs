@@ -308,5 +308,29 @@ await scenario(
   }
 );
 
+// 12) NodeSeek 填了账密、没有 Cookie：worker 这一枪注定过不去 CF，必须直接进浏览器通道
+//     （那里会用账密登录换 Cookie）。文案若命中 PERMANENT_FAIL_RE 就永远不会降级 ——
+//     这正是「填了账密也签不上」的坑，所以这里专门钉住路由结果。
+const NS_CRED_CHANNEL = {
+  id: "ch_ns_cred",
+  name: "NodeSeek",
+  type: "nodeseek",
+  baseUrl: "https://www.nodeseek.com",
+  enabled: true,
+  auth: { username: "蓝色的雨", password: "secret" },
+  options: {},
+};
+await scenario(
+  "NodeSeek 只填账密（无 Cookie）→ 降级浏览器通道登录换 Cookie",
+  { channel: NS_CRED_CHANNEL, fetch: {} },
+  ({ result, via, calls, payloads }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+    check("没向站点发请求（没有 Cookie 可带）", calls.every((c) => !c.url.includes("nodeseek")), JSON.stringify(calls.map((c) => c.url)));
+    check("dispatch 走浏览器通道", JSON.stringify(payloads[0]?.runners) === '["gha_browser"]');
+    check("dispatch 精确带渠道名", JSON.stringify(payloads[0]?.names) === '["NodeSeek"]');
+  }
+);
+
 console.log(`\n失败断言: ${failures}`);
 process.exit(failures ? 1 : 0);

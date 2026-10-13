@@ -1,4 +1,5 @@
 import { listAdapters, runAction, getAdapter } from "./adapters/index.js";
+import { stripIpBoundCookies } from "./adapters/forum.js";
 import {
   authRequired,
   isAuthenticated,
@@ -933,11 +934,18 @@ async function handleGhResult(request, env) {
       at: Date.now(),
     };
     if (r.quotaInfo) ch.quotaInfo = { ...(ch.quotaInfo || {}), ...r.quotaInfo };
-    // 浏览器登录流程产生的新 token 写回 KV（sub2api 账密登录刷新）
+    // 浏览器登录流程产生的新凭证写回 KV：sub2api 的 accessToken/refreshToken，
+    // 以及社区站（NodeSeek / linux.sb）用账密登录换到的 Cookie —— 后者是「填账密就不用
+    // 手抄 Cookie」的关键：不回写的话每次都要重新登录一遍。
+    // cf_clearance 这类与出口 IP 绑定的 cookie 会被 stripIpBoundCookies 去掉。
     if (r.newTokens) {
       ch.auth = { ...(ch.auth || {}) };
       if (r.newTokens.accessToken) ch.auth.accessToken = r.newTokens.accessToken;
       if (r.newTokens.refreshToken) ch.auth.refreshToken = r.newTokens.refreshToken;
+      if (r.newTokens.cookie) {
+        const fresh = stripIpBoundCookies(r.newTokens.cookie);
+        if (fresh) ch.auth.cookie = fresh;
+      }
     }
     merged++;
   }

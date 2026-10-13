@@ -73,6 +73,26 @@ export function mergeCookie(existing, setPairs) {
   return [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+/**
+ * 去掉与出口 IP 绑定的 Cloudflare cookie（cf_clearance / __cf_bm / __cf_ob …）。
+ *
+ * 用途：浏览器通道用账密登录换到新会话后，把 Cookie 写回渠道 KV。但那份 jar 里还带着
+ * 浏览器**自己那次挑战**换来的 cf_clearance —— 它与签发它的出口 IP 绑定，写回渠道只会
+ * 造成「我都带了 cf_clearance 怎么还被拦」的误解（对 worker / gha_api 出口确实没用）。
+ * 会话类 cookie（session / pjwt / bbs_auth …）照常保留。
+ */
+export function stripIpBoundCookies(cookie) {
+  return String(cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter((part) => {
+      const name = part.split("=")[0].trim().toLowerCase();
+      return !(name === "cf_clearance" || name.startsWith("__cf") || name.startsWith("_cf"));
+    })
+    .join("; ");
+}
+
 /** 归一化从 DevTools / 插件复制来的 Cookie（同名逻辑见 newapi.js）。 */
 export function normalizeCookie(input) {
   let s = String(input || "")

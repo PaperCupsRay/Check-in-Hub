@@ -1674,10 +1674,15 @@
       // 论坛系三站（NodeSeek / linux.sb / NodeLoc）只认浏览器 Cookie，
       // 缺 Cookie 时 me() 只能给出「无用户信息接口」的说明，测不出真假，
       // 所以在发请求前先拦下来，别让人以为测过了。
-      if (["nodeseek", "linuxsb", "nodeloc"].includes(ch.type) && !ch.auth?.cookie) {
+      // NodeSeek 例外：渠道里填了账密时由浏览器通道登录换 Cookie（2026-10-13 起），
+      // 那时没有 Cookie 也该放行 —— 否则用户填了账密连「测试」都点不了。
+      const nsCreds = ch.type === "nodeseek" && !!ch.auth?.username && !!ch.auth?.password;
+      if (["nodeseek", "linuxsb", "nodeloc"].includes(ch.type) && !ch.auth?.cookie && !nsCreds) {
         return showToast(
           "请先填写 Cookie",
-          "这些社区站只支持浏览器 Cookie 鉴权（F12 → Application → Cookies 复制）",
+          ch.type === "nodeseek"
+            ? "NodeSeek 可以填「论坛用户名 + 密码」（浏览器通道自动登录换 Cookie），或手抄整站 Cookie"
+            : "这些社区站只支持浏览器 Cookie 鉴权（F12 → Application → Cookies 复制）",
           "warn"
         );
       }

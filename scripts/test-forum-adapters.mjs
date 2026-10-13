@@ -429,6 +429,44 @@ try {
       ok(!map[id]?.length, `${id} 没有额外动作`, JSON.stringify(map[id]));
     }
   }
+  console.log("\n[27] NodeSeek 填了账密、没有 Cookie：交给浏览器通道登录换 Cookie");
+  {
+    const calls = mockFetch({ "*": () => json(200, { success: true }) });
+    const r = await nodeseekAdapter.checkin({
+      ...nsChannel(),
+      auth: { username: "蓝色的雨", password: "secret" },
+    });
+    ok(r.ok === false, "worker 这一枪不报成功（它连 CF 都过不去）");
+    ok(r.needsBrowser === true, "标 needsBrowser → 降级浏览器通道");
+    ok(calls.length === 0, "没发请求（没有 Cookie 可带）", `calls=${calls.length}`);
+    // 这条文案会被 batchCheckinCore 的 PERMANENT_FAIL_RE 过一遍：命中就永不降级，
+    // 用户填了账密也签不上。措辞里不能出现 缺少/需要/未配置/不存在/404/无可用/未知渠道/不支持。
+    ok(
+      !/缺少|需要|未配置|不存在|404|无可用|未知渠道|不支持/.test(r.message),
+      "文案避开永久失败判据（否则不会降级）",
+      r.message
+    );
+    ok(/账密|登录/.test(r.message), "说明会用账密登录", r.message);
+  }
+
+  console.log("\n[28] NodeSeek 会话失效（USER NOT FOUND）：提示填账密自动登录");
+  {
+    mockFetch({
+      "POST /api/attendance": () =>
+        json(500, { message: "USER NOT FOUND", status: 404, success: false }),
+    });
+    const withCreds = await nodeseekAdapter.checkin({
+      ...nsChannel(),
+      auth: { cookie: "session=stale", username: "蓝色的雨", password: "secret" },
+    });
+    ok(withCreds.needsBrowser === true, "标 needsBrowser");
+    ok(/自动登录换新 Cookie/.test(withCreds.message), "说明会用账密自动登录", withCreds.message);
+
+    const noCreds = await nodeseekAdapter.checkin(nsChannel());
+    ok(noCreds.needsBrowser === true, "没账密时同样降级浏览器通道");
+    ok(/论坛用户名 \+ 密码/.test(noCreds.message), "建议补账密（不必手抄 Cookie）", noCreds.message);
+  }
+
   console.log("\n[24] NodeSeek Worker 出口拿到的 302：要把 Location 带出来并直连浏览器通道");
   {
     mockFetch({
