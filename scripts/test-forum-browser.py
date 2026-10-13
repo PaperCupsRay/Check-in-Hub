@@ -196,5 +196,29 @@ ok(mod.has_session_cookie(hdr) is True, "识别出已有会话")
 ok(mod.has_session_cookie("cf_clearance=cf; colorscheme=light") is False, "只有 CF cookie 不算登录")
 ok(mod.has_session_cookie("") is False, "空串不算登录")
 
+print("\n[11] 浏览器流程引用的 JS 常量与函数都在（编辑时被整段删掉过一次，钉住）")
+for _name in ("JS_LOGIN_FORM", "JS_CLICK_LOGIN_ENTRY", "JS_SUBMIT_LOGIN", "JS_ATTENDANCE", "JS_BOARD"):
+    _v = getattr(mod, _name, None)
+    ok(isinstance(_v, str) and len(_v) > 20, f"{_name} 存在且非空", str(type(_v)))
+for _fn in (
+    "nodeseek_browser_login",
+    "nodeseek_browser_checkin",
+    "linuxsb_browser_checkin",
+    "linuxsb_browser_gacha",
+    "forum_browser_checkin",
+    "pick_login_fields",
+    "input_selector",
+    "cookies_to_header",
+    "session_value",
+    "has_session_cookie",
+    "today_signed_evidence",
+    "checkin_record_evidence",
+    "parse_stats_cookie",
+    "parse_gacha_titles",
+):
+    ok(callable(getattr(mod, _fn, None)), f"{_fn} 可调用")
+ok("nearPassword" in mod.JS_SUBMIT_LOGIN, "提交按钮选择器带「靠近密码框」优先级（别点错邮箱验证那一栏）")
+ok("inVerifyBlock" in mod.JS_SUBMIT_LOGIN, "提交按钮选择器排除「验证码/动态验证」区块")
+
 print(f"\n{'❌' if failures else '✅'} {checks - failures}/{checks} 通过")
 raise SystemExit(1 if failures else 0)

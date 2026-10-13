@@ -2945,7 +2945,51 @@ JS_LOGIN_FORM = """() => {
     };
 }"""
 
-# 首页上的「登录」入口（/login 不是登录页时退回这条路）
+# 提交登录表单：**必须点对「密码登录」那个按钮**。
+# 2026-10-13 线上实测：signIn.html 上「密码登录」与「邮箱动态验证」两个区块的按钮文案
+# 都叫「登录」，而邮箱那一栏的按钮在 DOM 里更靠前且是隐藏的 —— 旧实现取第一个匹配项，
+# 于是点进了邮箱动态验证流程（站点跳到 emailSignIn.html?email=… 要验证码），
+# 看起来像「账号密码不对」。这里按可靠性排序：与密码框共享最近容器 > 可见且不在
+# 「验证码/动态验证」区块内 > 第一个可见 > 兜底。
+JS_SUBMIT_LOGIN = """() => {
+    const vis = el => !!(el.offsetWidth || el.offsetHeight);
+    const label = el => (el.innerText || el.value || '').trim();
+    const pw = document.querySelector('input[type=password]');
+    const cands = [...document.querySelectorAll('button,input[type=submit]')]
+        .filter(b => /登录|登入|login|sign\\s*in/i.test(label(b)));
+    const visible = cands.filter(vis);
+    const pool = visible.length ? visible : cands;
+    const inVerifyBlock = el => {
+        let a = el.parentElement, depth = 0;
+        while (a && depth < 3) {
+            if (/验证码|动态验证/.test(a.innerText || '')) return true;
+            a = a.parentElement; depth++;
+        }
+        return false;
+    };
+    const nearPassword = el => {
+        if (!pw) return false;
+        let a = el.parentElement, depth = 0;
+        while (a && depth < 4) {
+            if (a.contains(pw)) return true;
+            a = a.parentElement; depth++;
+        }
+        return false;
+    };
+    let pick = pool.find(nearPassword) || pool.find(b => !inVerifyBlock(b)) || pool[0] || null;
+    const dump = cands.map(b => label(b).slice(0, 10) + (vis(b) ? '' : '(hidden)')).slice(0, 8);
+    if (!pick) {
+        const pw2 = document.querySelector('input[type=password]');
+        const form = pw2 && pw2.closest ? pw2.closest('form') : null;
+        if (form) { form.submit(); return {clicked: true, label: 'form.submit', candidates: dump}; }
+        return {clicked: false, candidates: dump};
+    }
+    pick.click();
+    return {clicked: true, label: label(pick).slice(0, 16), candidates: dump};
+}"""
+
+
+# 首页上的「登录」入口（/signIn.html 打不开时退回这条路）
 JS_CLICK_LOGIN_ENTRY = """() => {
     const cands = [...document.querySelectorAll('a,button')].filter(el => {
         const t = (el.innerText || '').trim();
@@ -2957,21 +3001,6 @@ JS_CLICK_LOGIN_ENTRY = """() => {
     el.click();
     return {found: true, text: ((el.innerText || '').trim() || el.getAttribute('href') || '').slice(0, 24)};
 }"""
-
-# 提交登录表单：优先点文案像「登录」的按钮，退到 form.submit()
-JS_SUBMIT_LOGIN = """() => {
-    const btn = [...document.querySelectorAll('button,input[type=submit]')]
-        .find(b => /登录|登入|login|sign\\s*in/i.test((b.innerText || b.value || '')));
-    if (btn) {
-        btn.click();
-        return {clicked: true, label: ((btn.innerText || btn.value || '').trim()).slice(0, 16)};
-    }
-    const pw = document.querySelector('input[type=password]');
-    const form = pw && pw.closest ? pw.closest('form') : null;
-    if (form) { form.submit(); return {clicked: true, label: 'form.submit'}; }
-    return {clicked: false};
-}"""
-
 
 def pick_login_fields(inputs):
     """从页面的 input 列表里挑出「账号框」和「密码框」（纯函数，便于离线测试）。
@@ -3201,6 +3230,19 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                 # 真伪由调用方用签到接口验证（USER NOT FOUND 会再报回来），这里不拦。
                 log(f"  🔑 {name}: 已离开登录流程（落地 {snap.get('url')}），按成功处理")
                 return {"ok": True, "cookie": cookie, "message": "已用账密登录（站点未换会话 Cookie）"}
+            # 被转到「邮箱动态验证」页（emailSignIn.html）：站点要往账号邮箱发验证码再填回来，
+            # 脚本没法代收邮件，继续点下去只是白烧预算 —— 直接如实报出来。
+            if "emailsignin" in str(snap.get("url") or "").lower():
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        "站点把这次登录转到了「邮箱动态验证」（emailSignIn.html）："
+                        "要往账号邮箱发验证码再填回来，脚本代收不了邮件。"
+                        "请在浏览器里手动登录一次并重抄整站 Cookie（或继续用 Cookie 方式）。"
+                        f"页面提示：{str(snap.get('body') or '')[:90]}"
+                    )[:300],
+                }
         log(f"  🔑 {name}: 第 {steps} 步提交后仍在登录流程（{snap.get('url')}），继续下一步")
 
     snap = await page_snapshot(page)
