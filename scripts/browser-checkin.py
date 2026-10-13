@@ -3019,6 +3019,60 @@ JS_LOGIN_DIAG = """() => {
 }"""
 
 
+# 页面内网络钩子：抓登录接口的**响应体**（Playwright 的 response.text() 在页面导航后常读不到
+# 内容，而服务端到底说了什么才是关键 —— 2026-10-13 就是靠它才看到 /api/account/signIn）。
+JS_NET_HOOK = """() => {
+    if (window.__hubNetHooked) return {hooked: true, already: true};
+    window.__hubNetHooked = true;
+    window.__hubNet = [];
+    const keep = (url, status, body) => {
+        try {
+            if (!/signin|sign-?in|login|api\\/account|api\\/user/i.test(String(url))) return;
+            window.__hubNet.push({
+                url: String(url).slice(0, 90),
+                status,
+                body: String(body || '').slice(0, 400),
+            });
+        } catch (e) {}
+    };
+    const of = window.fetch;
+    if (of) {
+        window.fetch = async function (...args) {
+            const res = await of.apply(this, args);
+            try {
+                const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+                const t = await res.clone().text();
+                keep(u, res.status, t);
+            } catch (e) {}
+            return res;
+        };
+    }
+    const oo = XMLHttpRequest.prototype.open;
+    const os = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+        this.__hubUrl = u;
+        return oo.call(this, m, u, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (...args) {
+        this.addEventListener('load', () => {
+            try { keep(this.__hubUrl, this.status, this.responseText); } catch (e) {}
+        });
+        return os.apply(this, args);
+    };
+    return {hooked: true};
+}"""
+
+# 读钩子攒下的响应 + 当前 Turnstile token 长度（提交时 token 是否为空，直接决定服务端怎么答）
+JS_NET_READ = """() => {
+    const el = document.querySelector('[name=cf-turnstile-response]');
+    return {
+        net: (window.__hubNet || []).slice(-4),
+        tokenLen: el ? (el.value || '').length : -1,
+    };
+}"""
+
+
+
 async def type_like_human(page, selector, value):
     """用**真实按键**输入，而不是直接设 value。
 
@@ -3325,7 +3379,12 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
         if form.get("hasRecaptcha"):
             log(f"  🔑 {name}: 登录页带 reCAPTCHA，点勾选框")
             await click_captcha_checkbox(page)
-
+        # 装页面内网络钩子（抓登录接口响应体）：每步都装一次，页面导航后 window 会重置
+        try:
+            hook = await page.evaluate(JS_NET_HOOK)
+            log(f"  🛰️ {name}: 网络钩子 {json.dumps(hook, ensure_ascii=False)}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  🛰️ {name}: 网络钩子安装失败 {str(e)[:60]}")
         filled = []
         if user_el:
             sel = input_selector(user_el)
@@ -3394,10 +3453,15 @@ async def nodeseek_browser_login(page, name, base, wait_until, nav_ms, username,
                     await page.press(target, "Enter")
                 submitted = {"clicked": True, "how": "Enter"}
         log(f"  🔑 {name}: 第 {steps} 步提交方式 {json.dumps(submitted, ensure_ascii=False)}")
-        # 等一小会儿让登录接口的响应落地，再把抓到的网络日志打出来（含服务端回话）
+        # 等一小会儿让登录接口的响应落地，再把**页面内钩子**抓到的响应体打出来（含服务端回话）
         await page.wait_for_timeout(1500)
+        try:
+            hooked = await page.evaluate(JS_NET_READ)
+            log(f"  🛰️ {name}: 第 {steps} 步登录接口回话 {json.dumps(hooked, ensure_ascii=False)[:700]}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  🛰️ {name}: 读登录接口回话失败 {str(e)[:60]}")
         if net:
-            log(f"  🛰️ {name}: 第 {steps} 步登录相关响应 {json.dumps(net[-4:], ensure_ascii=False)[:700]}")
+            log(f"  🛰️ {name}: 第 {steps} 步页面级响应 {json.dumps(net[-3:], ensure_ascii=False)[:500]}")
             net.clear()
 
         deadline = time.monotonic() + 15
