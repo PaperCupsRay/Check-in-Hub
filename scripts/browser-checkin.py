@@ -2931,9 +2931,23 @@ def attendance_result(name, res):
         if body.get("current") is not None:
             parts.append(f"鸡腿余额 {body['current']}")
         return {"name": name, "ok": True, "message": " · ".join(parts)[:300], "already": already}
-    if status == 200 and body.get("success") is False and ALREADY_SIGNED_RE.search(msg):
+    # 「今天已完成签到，请勿重复操作」这类回话站点是配 **HTTP 500** 发的（2026-10-14 实测），
+    # 所以这里不能要求 status==200 —— 否则把「今天已经签过了」当成失败，还白跑代理重试。
+    if ALREADY_SIGNED_RE.search(msg):
         return {"name": name, "ok": True, "already": True, "message": (msg or "今日已签到")[:300]}
     return None
+
+
+def page_checkin_status(body_text):
+    """从页面正文里读「今日签到获得鸡腿 N 个」—— 登录态 + 今天已签的**权威信号**。
+
+    为什么需要它：签到接口对重复签到回 500 +「今天已完成签到」，而排行榜按 member_name
+    匹配（渠道里填的可能是邮箱，与论坛显示名不同 → 匹配不上）。页面自己那行状态不受这两点
+    影响，2026-10-14 实测原文：`今日签到获得鸡腿5个，当前排名第7122`。
+    返回 gain（int）或 None。
+    """
+    m = re.search(r"今日签到获得鸡腿\s*(\d+)\s*个", str(body_text or ""))
+    return int(m.group(1)) if m else None
 
 
 # 登录页结构探针：站点没有公开的登录 API 文档，只能驱动它自己的表单。把 input / form /
@@ -3630,11 +3644,23 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
             return await page_snapshot(page)
 
         async def attempt():
-            """页面内跑一遍：排行榜确认 → POST 签到 → 点站点按钮 → 再 POST。
+            """页面内跑一遍：页面状态行/排行榜确认 → POST 签到 → 点站点按钮 → 再 POST。
 
             返回 (结果 or None, 最后一枪的响应)。None 表示「判定不了」，由调用方决定
             是去登录换 Cookie 还是如实报失败。
+
+            先看**页面自己那行状态**（「今日签到获得鸡腿 N 个」）：它不受「渠道里填的是邮箱、
+            排行榜按论坛显示名匹配」这类不一致影响，是登录态 + 今日已签最硬的信号
+            （2026-10-14 实测：签到接口对重复签到回 500，靠排行榜又匹配不上邮箱）。
             """
+            snap_now = await page_snapshot(page)
+            page_gain = page_checkin_status(snap_now.get("body"))
+            if page_gain is not None:
+                return {
+                    "name": name,
+                    "ok": True,
+                    "message": f"今日已签到（页面状态行确认）· 获得 {page_gain} 鸡腿"[:300],
+                }, None
             hit = board_hit(await page.evaluate(JS_BOARD, 1), username)
             if hit:
                 return {

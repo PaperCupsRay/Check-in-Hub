@@ -220,6 +220,20 @@ for _fn in (
 ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
 ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
 
+print("\n[17] 页面状态行 + 重复签到的 500 回话（2026-10-14 实测形态）")
+ok(
+    mod.page_checkin_status("... 今日签到获得鸡腿5个，当前排名第7122 今日签到鸡腿排行榜 ...") == 5,
+    "从页面正文读出今日收益",
+)
+ok(mod.page_checkin_status("... 登录后签到 今日签到鸡腿排行榜 ...") is None, "游客页不误报")
+ok(mod.page_checkin_status("") is None, "空正文不误报")
+_dup = mod.attendance_result(
+    "NodeSeek", {"status": 500, "body": {"success": False, "message": "今天已完成签到，请勿重复操作"}}
+)
+ok(_dup is not None and _dup.get("ok") is True and _dup.get("already") is True, "500 + 「已完成签到」也算已签（不再当失败）", str(_dup))
+_risk = mod.attendance_result("NodeSeek", {"status": 500, "body": {"success": False, "message": "high risk action"}})
+ok(_risk is None, "风控回话仍交给上层处理（不当已签）", str(_risk))
+
 print("\n[16] Cookie 注入必须按站点自己的 host（host-only），别用去掉 www 的 domain")
 ok(
     mod.cookie_injection_url({"baseUrl": "https://www.nodeseek.com"}) == "https://www.nodeseek.com/",
