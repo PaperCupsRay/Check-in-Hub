@@ -2392,8 +2392,15 @@ CF_WAIT_JS = """() => {
 }"""
 # 与 src/adapters/forum.js 的 ALREADY_RE 同一套词（两处判据必须一致，否则同一个
 # 渠道在 worker 通道说「已签到」、在浏览器通道说「失败」）
-ALREADY_SIGNED_RE = re.compile(r"已经?签到|已签过|重复签到|重复领取|重复打卡|already", re.I)
-
+# 「已签到」词表。2026-10-14 补：站点对重复签到回的是「今天已完成签到，请勿重复操作」
+# —— 旧词表里只有「已签到 / 已签过」，认不出「已完成签到」，于是把一次成功（或已签）
+# 当成 unknown，白跑一趟浏览器流程。
+# 注意别写成裸「请勿重复」：那会命中「请勿重复提交」这类**限流**措辞，把没签到误报成已签
+# （与 src/adapters/forum.js 的 ALREADY_RE 同一个坑）。
+ALREADY_SIGNED_RE = re.compile(
+    r"已经?签到|已签过|已完成签到|今天已签|今日已签|请勿重复操作|重复签到|重复领取|重复打卡|already",
+    re.I,
+)
 
 def looks_challenged(st):
     """页面是不是还停在 CF 挑战页上（多语言标题 + markup 兜底）。"""
@@ -2406,6 +2413,21 @@ def forum_cookie_pairs(channel):
     return parse_cookie_pairs((channel.get("auth") or {}).get("cookie") or "")
 
 
+def cookie_injection_url(channel):
+    """注入 Cookie 时用哪个 URL（纯函数，便于离线测试）。
+
+    **必须用站点自己的 URL，不能用「去掉 www 的 domain」**：Playwright 的 add_cookies
+    传 domain="nodeseek.com" 时，Chromium 存的是 **host-only** cookie（只发给 nodeseek.com
+    本身，不发给 www.nodeseek.com）—— 于是 NodeSeek 的会话 Cookie 一直没被带上，
+    浏览器流程永远看到游客页（表现为 USER NOT FOUND /「登录后签到」）。
+    2026-10-14 线上实测踩到：同一份 Cookie 用 cloudscraper 直连能签到成功，
+    浏览器流程却报会话失效，差别就在这里。
+    传 url 则按站点自己的 host 存 host-only cookie —— 与浏览器手动登录后的形态一致。
+    """
+    base = str(channel.get("baseUrl") or "").rstrip("/")
+    return f"{base}/"
+
+
 async def apply_channel_cookies(page, channel):
     """把渠道 Cookie 注入浏览器，返回注入条数。
 
@@ -2416,10 +2438,9 @@ async def apply_channel_cookies(page, channel):
     pairs = forum_cookie_pairs(channel)
     if not pairs:
         return 0
-    host = channel["baseUrl"].split("//", 1)[1].split("/", 1)[0]
-    domain = host[4:] if host.startswith("www.") else host
+    url = cookie_injection_url(channel)
     await page.context.add_cookies(
-        [{"name": n, "value": v, "domain": domain, "path": "/"} for n, v in pairs]
+        [{"name": n, "value": v, "url": url} for n, v in pairs]
     )
     return len(pairs)
 
@@ -3895,6 +3916,11 @@ async def nodeseek_http_checkin(channel, proxy=None) -> dict:
     开一次 Camoufox 只是白烧一分钟。
     """
     name = channel.get("name", "unnamed")
+    # 诊断开关：渠道 options.skipFastPath=true 时强制走真浏览器流程
+    # （用来单独验证浏览器那条路，例如排查「Cookie 到底有没有注入成功」）
+    if str((channel.get("options") or {}).get("skipFastPath", "")).strip().lower() in ("1", "true", "yes"):
+        log(f"  ⚡ {name}: 渠道要求跳过快路径（options.skipFastPath）→ 走真浏览器")
+        return None
     if not forum_cookie_pairs(channel):
         return None  # 没 Cookie 就没什么可发的，交给浏览器流程（它可能用账密登录）
     try:

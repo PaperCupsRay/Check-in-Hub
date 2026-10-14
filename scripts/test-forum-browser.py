@@ -220,6 +220,27 @@ for _fn in (
 ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
 ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
 
+print("\n[16] Cookie 注入必须按站点自己的 host（host-only），别用去掉 www 的 domain")
+ok(
+    mod.cookie_injection_url({"baseUrl": "https://www.nodeseek.com"}) == "https://www.nodeseek.com/",
+    "www 站用完整 host 作 url",
+    mod.cookie_injection_url({"baseUrl": "https://www.nodeseek.com"}),
+)
+ok(
+    mod.cookie_injection_url({"baseUrl": "https://linux.sb/"}) == "https://linux.sb/",
+    "非 www 站同样正确（去掉尾部斜杠再加）",
+    mod.cookie_injection_url({"baseUrl": "https://linux.sb/"}),
+)
+_src4 = open(os.path.join(HERE, "browser-checkin.py"), encoding="utf-8").read()
+ok('"url": url' in _src4, "add_cookies 用 url 而不是 domain（domain 会变成 host-only，漏发 www 子域）")
+ok("skipFastPath" in _src4, "有强制走真浏览器的诊断开关")
+
+# 「今天已完成签到，请勿重复操作」是站点对重复签到的回话（2026-10-14 实测）
+V_DONE = mod.nodeseek_http_verdict(200, '{"success":false,"message":"今天已完成签到，请勿重复操作"}')
+ok(V_DONE[0] == "already", "「已完成签到」→ already（不再白跑浏览器）", str(V_DONE))
+ok(bool(mod.ALREADY_SIGNED_RE.search("今天已完成签到，请勿重复操作")), "词表认「已完成签到 / 请勿重复」")
+ok(not mod.ALREADY_SIGNED_RE.search("请勿重复提交表单"), "但不把「请勿重复提交」当已签到（限流措辞）")
+
 print("\n[15] NodeSeek 快路径（cloudscraper 直连 POST，参考 xinycai/nodeseek_signin）")
 _ck = mod.nodeseek_cookie_dict({"auth": {"cookie": "session=abc; pjwt=jwt; fog=x"}})
 ok(_ck.get("session") == "abc" and _ck.get("pjwt") == "jwt", "Cookie 拆成 dict", str(_ck))
