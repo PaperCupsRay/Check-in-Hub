@@ -220,6 +220,39 @@ for _fn in (
 ok("inPasswordForm" in mod.JS_PICK_LOGIN_SUBMIT, "候选清单标注是否在密码表单内（别点错邮箱验证那一栏）")
 ok("closest('form')" in mod.JS_PICK_LOGIN_SUBMIT, "以密码框所属 form 为范围挑提交按钮")
 
+print("\n[15] NodeSeek 快路径（cloudscraper 直连 POST，参考 xinycai/nodeseek_signin）")
+_ck = mod.nodeseek_cookie_dict({"auth": {"cookie": "session=abc; pjwt=jwt; fog=x"}})
+ok(_ck.get("session") == "abc" and _ck.get("pjwt") == "jwt", "Cookie 拆成 dict", str(_ck))
+ok(mod.nodeseek_cookie_dict({"auth": {}}) == {}, "空 Cookie 返回空 dict")
+
+# 线上实测的真实响应（2026-10-13 按参考项目跑通的那一枪）
+V_OK = mod.nodeseek_http_verdict(200, '{"success":true,"message":"今天的签到收益是5个鸡腿","gain":5,"current":656}')
+ok(V_OK[0] == "ok", "success:true → ok", str(V_OK))
+ok(V_OK[2] == 5 and V_OK[3] == 656, "带出 gain / current", str(V_OK))
+V_ALREADY = mod.nodeseek_http_verdict(200, '{"success":true,"message":"今天的签到收益是0个鸡腿","gain":0,"current":656}')
+ok(V_ALREADY[0] == "already", "gain=0 → already", str(V_ALREADY))
+V_DEAD = mod.nodeseek_http_verdict(500, '{"message":"USER NOT FOUND","status":404,"success":false}')
+ok(V_DEAD[0] == "session_dead", "USER NOT FOUND → session_dead（不再开浏览器）", str(V_DEAD))
+V_CF = mod.nodeseek_http_verdict(403, "<html><title>Just a moment...</title></html>")
+ok(V_CF[0] == "challenge", "挑战页 → challenge（退回真浏览器）", str(V_CF))
+V_RISK = mod.nodeseek_http_verdict(403, '{"success":false,"message":"high risk action"}')
+ok(V_RISK[0] == "challenge", "风控回话 → challenge（真浏览器可能过）", str(V_RISK))
+V_UNK = mod.nodeseek_http_verdict(200, "not json at all")
+ok(V_UNK[0] == "unknown", "非 JSON → unknown（退回真浏览器）", str(V_UNK))
+
+_merged = mod.merge_cookie_header(
+    [("session", "old"), ("fog", "keep")],
+    "session=new; Path=/; HttpOnly, smac=xyz; Path=/",
+)
+ok("session=new" in _merged and "fog=keep" in _merged and "smac=xyz" in _merged, "Set-Cookie 合并（同名覆盖，其余保留）", _merged)
+ok("Path" not in _merged and "HttpOnly" not in _merged, "不把属性当 cookie 写回", _merged)
+ok(mod.merge_cookie_header([("a", "1")], "") == "a=1", "没有 Set-Cookie 时原样保留")
+
+_src3 = open(os.path.join(HERE, "browser-checkin.py"), encoding="utf-8").read()
+ok("random=false" in _src3, "用的是参考项目的 random=false")
+ok("cloudscraper" in _src3, "走 cloudscraper（自动解 CF 挑战）")
+ok("await nodeseek_http_checkin(channel, proxy=proxy)" in _src3, "快路径在浏览器流程之前")
+
 print("\n[14] 服务端回话要透出（RATE_LIMITED 这类必须原样告诉用户，别只说「Cookie 没变」）")
 _src2 = open(os.path.join(HERE, "browser-checkin.py"), encoding="utf-8").read()
 ok("RATE_LIMITED" in _src2, "识别账号限流（该账户操作过于频繁）")

@@ -3785,11 +3785,198 @@ async def nodeseek_browser_checkin(channel, proxy=None) -> dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# NodeSeek 快路径：cloudscraper 直连 POST（参考 xinycai/nodeseek_signin）
+# ---------------------------------------------------------------------------
+#
+# 参考项目（https://github.com/xinycai/nodeseek_signin）的做法很直接：
+#   cloudscraper（自动解 Cloudflare JS 挑战的库）+ POST /api/attendance?random=false，
+#   带上整站 Cookie，不启浏览器。
+# 2026-10-13 按它原样在机房出口实测：HTTP 200 + {"success":true,"message":"今天的签到收益是5个鸡腿",
+# "gain":5,"current":656} —— 说明这条路对 NodeSeek 是通的，比开 Camoufox 快得多（秒级 vs 一分钟）。
+#
+# 所以浏览器通道对 NodeSeek 改成**两段**：先走这条快路径；解不了挑战 / 网络层失败才退回
+# 真浏览器流程（nodeseek_browser_checkin）。两条路共用同一份渠道 Cookie 与结果文案规则。
+
+NODESEEK_ATTEND_PATH = "/api/attendance"
+NODESEEK_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+)
+
+
+def nodeseek_cookie_dict(channel):
+    """渠道 Cookie → dict（cloudscraper / requests 要的形式）。纯函数，便于离线测试。"""
+    out = {}
+    for name, value in forum_cookie_pairs(channel):
+        if name:
+            out[name] = value
+    return out
+
+
+def nodeseek_http_verdict(status, body_text):
+    """把快路径那一枪的响应翻成结论（纯函数，便于离线测试）。
+
+    返回 (verdict, message, gain, current)：
+      ok            签到成功（gain/current 可能为 None）
+      already       今日已签（站点明说，或收益为 0）
+      session_dead  会话失效（USER NOT FOUND / 未登录）—— 换出口无解，直接报给用户
+      challenge     CF 挑战没过 / 被拦 —— 交给真浏览器流程
+      unknown       其他（同样交给浏览器流程，但日志里保留原文）
+    """
+    text = str(body_text or "")
+    low = text.lower()
+    if "user not found" in low or "请先登录" in text or "未登录" in text:
+        return ("session_dead", "站点按这份 Cookie 查不到用户（USER NOT FOUND）：会话已失效", None, None)
+    if "high risk action" in low:
+        return ("challenge", "站点风控回话 high risk action", None, None)
+    if re.search(r"just a moment|challenge-platform|cf_chl_|cdn-cgi/challenge", text, re.I):
+        return ("challenge", "被 Cloudflare 挑战页拦住", None, None)
+    body = None
+    try:
+        body = json.loads(text)
+    except Exception:  # noqa: BLE001
+        body = None
+    if isinstance(body, dict):
+        msg = str(body.get("message") or "").strip()
+        gain = body.get("gain")
+        current = body.get("current")
+        if body.get("success") is True:
+            already = bool(ALREADY_SIGNED_RE.search(msg)) or (
+                isinstance(gain, (int, float)) and not gain
+            )
+            return ("already" if already else "ok", msg, gain, current)
+        if body.get("success") is False and ALREADY_SIGNED_RE.search(msg):
+            return ("already", msg, gain, current)
+        if body.get("success") is False and msg:
+            return ("unknown", msg, gain, current)
+    if status in (403, 429, 503):
+        return ("challenge", f"HTTP {status}（疑似 Cloudflare 层拦截）", None, None)
+    return ("unknown", text[:120], None, None)
+
+
+def nodeseek_http_checkin_sync(channel, proxy=None, random_flag="false", timeout=30):
+    """同步跑快路径（cloudscraper 是阻塞库，调用方用 asyncio.to_thread 包起来）。
+
+    返回 (verdict, message, gain, current, cookie_header)。cookie_header 是站点在响应里
+    下发的 Cookie（若有），供写回渠道。
+    """
+    import cloudscraper  # 延迟导入：没装这个库时整条链路照常退回浏览器流程
+
+    base = channel["baseUrl"].rstrip("/")
+    cookie_dict = nodeseek_cookie_dict(channel)
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Content-Length": "0",
+        "Origin": base,
+        "Referer": f"{base}/board",
+        "User-Agent": NODESEEK_UA,
+    }
+    # 代理：只喂 http(s) 给 cloudscraper（SOCKS 需要 PySocks，池子里不一定有）
+    proxies = None
+    if proxy and not str(proxy).startswith("socks"):
+        proxies = {"http": proxy, "https": proxy}
+    url = f"{base}{NODESEEK_ATTEND_PATH}?random={random_flag}"
+    resp = scraper.post(
+        url, headers=headers, cookies=cookie_dict, proxies=proxies, timeout=timeout
+    )
+    verdict, message, gain, current = nodeseek_http_verdict(resp.status_code, resp.text)
+    return verdict, message, gain, current, (resp.headers.get("set-cookie") or "")
+
+
+async def nodeseek_http_checkin(channel, proxy=None) -> dict:
+    """快路径入口：返回结果 dict；返回 None 表示「这条路走不通，交给真浏览器」。
+
+    判定为 session_dead 时**直接返回失败**（不再开浏览器）：会话失效换出口无解，
+    开一次 Camoufox 只是白烧一分钟。
+    """
+    name = channel.get("name", "unnamed")
+    if not forum_cookie_pairs(channel):
+        return None  # 没 Cookie 就没什么可发的，交给浏览器流程（它可能用账密登录）
+    try:
+        verdict, message, gain, current, set_cookie = await asyncio.to_thread(
+            nodeseek_http_checkin_sync, channel, proxy
+        )
+    except ImportError:
+        log(f"  ⚡ {name}: 未安装 cloudscraper，跳过快路径（走真浏览器）")
+        return None
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚡ {name}: 快路径失败（{str(e)[:90]}），交给真浏览器")
+        return None
+
+    where = "直连" if not proxy else f"代理 {mask_proxy(proxy)}"
+    if verdict in ("ok", "already"):
+        parts = [message or ("今日已签到" if verdict == "already" else "签到成功")]
+        if current is not None:
+            parts.append(f"鸡腿余额 {current}")
+        log(f"  ⚡ {name}: 快路径命中（{where}，cloudscraper）→ {parts[0]}")
+        out = {
+            "name": name,
+            "ok": True,
+            "message": " · ".join(parts)[:300],
+            "result": {
+                "success": True,
+                "alreadyCheckedIn": verdict == "already",
+                "rewardPoints": gain if isinstance(gain, (int, float)) else None,
+                "balance": current,
+                "via": f"{NODESEEK_ATTEND_PATH}?random=false（cloudscraper）",
+            },
+        }
+        if set_cookie:
+            merged = merge_cookie_header(forum_cookie_pairs(channel), set_cookie)
+            if merged:
+                out["newTokens"] = {"cookie": merged}
+        return out
+    if verdict == "session_dead":
+        log(f"  ⚡ {name}: 快路径判定会话失效（{where}）")
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": False,
+            "message": (
+                f"{message}。请在浏览器里重新登录 https://www.nodeseek.com 后重抄整站 Cookie"
+                "（或填「用户名 + 密码」让脚本登录换 Cookie）。"
+            )[:300],
+        }
+    log(f"  ⚡ {name}: 快路径没成功（{where}）：{message}")
+    return None
+
+
+def merge_cookie_header(pairs, set_cookie_raw):
+    """把响应里的 Set-Cookie 合并进渠道 Cookie（同名覆盖）。纯函数，便于离线测试。"""
+    out = {}
+    for name, value in pairs or []:
+        if name:
+            out[name] = value
+    for chunk in str(set_cookie_raw or "").split(","):
+        first = chunk.split(";")[0].strip()
+        if "=" not in first:
+            continue
+        name, _, value = first.partition("=")
+        name = name.strip()
+        if name and not name.lower().startswith(("expires", "path", "domain", "max-age", "samesite")):
+            out[name] = value.strip()
+    return "; ".join(f"{k}={v}" for k, v in out.items())
+
+
 async def forum_browser_checkin(channel, proxy=None) -> dict:
-    """社区站的浏览器通道入口（按类型分流）。"""
+    """社区站的浏览器通道入口（按类型分流）。
+
+    NodeSeek 先走 cloudscraper 快路径（参考 xinycai/nodeseek_signin：直接 POST
+    /api/attendance?random=false，秒级完成）；只有它「走不通」时才退回真浏览器流程。
+    """
     if channel.get("type") == "linuxsb":
         return await linuxsb_browser_checkin(channel, proxy=proxy)
+    fast = await nodeseek_http_checkin(channel, proxy=proxy)
+    if fast is not None:
+        return fast
     return await nodeseek_browser_checkin(channel, proxy=proxy)
+
+
 
 def load_api_fallback_names():
     """gha_api job 的失败渠道清单（降级链最后一级的重试对象）。"""

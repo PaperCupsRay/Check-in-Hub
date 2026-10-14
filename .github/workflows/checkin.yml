@@ -86,10 +86,15 @@ jobs:
 
       # camoufox fetch 下载 Firefox 内核；geoip 附加包用于按代理出口 IP 推时区/经纬度
       # （见 browser_page() 里的 geoip=True，避免「美国 IP + 上海时区」这种矛盾指纹）。
-      - name: Install Camoufox
+      #
+      # cloudscraper 是 NodeSeek 快路径要用的（参考 xinycai/nodeseek_signin）：它自己解
+      # Cloudflare 的 JS 挑战，于是「POST /api/attendance?random=false」这一枪不必开浏览器
+      # （2026-10-13 实测：机房出口直接 200 + 签到成功，秒级完成）。没装它时脚本会自动
+      # 跳过该路径、照常走真浏览器，不会因此失败。
+      - name: Install Camoufox + cloudscraper
         run: |
           python -m pip install --upgrade pip
-          pip install 'camoufox[geoip]'
+          pip install 'camoufox[geoip]' cloudscraper
           python -m camoufox fetch
 
       # 浏览器内完成 Turnstile 解证 + 页面内 fetch 签到。
