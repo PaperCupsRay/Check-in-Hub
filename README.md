@@ -251,6 +251,29 @@ curl -X POST https://<your-worker>/api/cron/run \
   `needsBrowser`，Worker 直接把它降级到**浏览器通道**（不再浪费一次注定失败的 gha_api 运行）；
 - `gha_api` 侧同理：本次 run 没带 browser job 时，`scripts/gha-checkin.mjs` 会反向请求
   面板补触发一次浏览器通道，否则这类渠道当天就漏签。
+- **多家人机验证同时生效**（星见雅，2026-10-15 起）是**第四种形态**，也是最容易做错的：
+  站点在 `/api/status` 里把 `checkin_turnstile_check` 与 `checkin_hcaptcha_check`
+  **同时**置真，服务端要求**两个 token 都非空**：
+
+  | 提交 | 服务端回话 |
+  |------|-----------|
+  | 不带 token / 只带一家 | 「人机验证 token 为空」 |
+  | 两家都带（即使是假的） | 「Turnstile 校验失败，请刷新重试！」← 先校验 Turnstile |
+
+  站点前端也是把启用的 token **全部** append 到同一个 query 上：
+  `POST /api/user/checkin?turnstile=<ts>&hcaptcha=<hc>`。所以浏览器通道改成
+  **多厂商同时自挂**：按 `checkin_<vendor>_check` 把每一家都挂上、拿到全部 token 后
+  一起提交（每家一个独立容器、token 按厂商分别收；缺哪家补哪家的 SDK，被 SPA 重渲染
+  清掉就重挂）。旧实现在 hCaptcha / reCAPTCHA 之间二选一，必然漏一家，于是每次都卡在
+  「token 为空」，重试多少次都没用 —— `scripts/test-human-verify.py` 把这条钉住了。
+
+  两个易错点：① 判据只认 `checkin_<vendor>_check`，**不能**回退到全局的
+  `turnstile_check` / `hcaptcha_check`（那两个是登录用的；星见雅正是
+  `turnstile_check=false` 而 `checkin_turnstile_check=true`）；
+  ② 声明里含 reCAPTCHA 时仍走下面的站点 UI 驱动 —— v2 的 token 与页面 origin 绑定，
+  自挂会被判低分。
+
+  Cloudflare 对机房出口常静默不签发 Turnstile 挑战，所以这个渠道建议保留住宅代理。
 - **Google reCAPTCHA v2**（星见雅等）单独处理，**不能照搬 Turnstile 的自挂组件**：
   reCAPTCHA v2 的 token 与渲染它的那个页面 origin 绑定，自挂 widget 拿到的 token 会被
   判低分。所以浏览器通道对这类站改成**驱动站点自己的 UI** —— 打开 `/console/personal`
@@ -378,7 +401,7 @@ checkin-hub/
 | `npm run tail` | 查看线上日志 |
 | `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + 图片验证码判据 |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
-| `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py`，不联网、不开浏览器、不依赖 ddddocr） |
+| `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py` + `python scripts/test-human-verify.py`，不联网、不开浏览器、不依赖 ddddocr） |
 
 ---
 

@@ -299,6 +299,31 @@ function recaptchaRejected(data) {
   return !/<!doctype html|<html[\s>]/i.test(raw);
 }
 /**
+ * 站点要求「人机验证 token 不齐 / 校验失败」时的判定（星见雅 2026-10-15 起）。
+ *
+ * 站点把签到的人机验证扩成了**多家同时**（/api/status 里 checkin_turnstile_check 与
+ * checkin_hcaptcha_check 同时为真），服务端要求两个 token 都非空：
+ *     不带 token / 只带一家            → 「人机验证 token 为空」
+ *     turnstile + hcaptcha 都带假的    → 「Turnstile 校验失败，请刷新重试！」
+ * 前者不含 "turnstile" 字样，turnstileRejected 匹配不到，会被当成普通业务失败丢给
+ * gha_api 再失败一次 —— 而纯 HTTP 通道根本产不出 token，那一趟是白跑的。
+ * 所以这里单独认一句，让 src/index.js 直接分发到 gha_browser。
+ */
+function humanVerificationRejected(data) {
+  const raw = responseTextHint(data);
+  if (/<!doctype html|<html[\s>]/i.test(raw)) return false;
+  if (/人机验证[^"]*为空/.test(raw)) return true;
+  return /(turnstile|hcaptcha|recaptcha)[^"]*(校验失败|无效)/i.test(raw);
+}
+
+const HUMAN_VERIFICATION_GUIDE =
+  "该站的签到挂了多家同时生效的人机验证（星见雅 2026-10-15 起：Turnstile + hCaptcha，" +
+  "服务端要求两个 token 都非空，且先校验 Turnstile）。纯 HTTP 通道产不出 token，" +
+  "已转 GitHub Actions · 浏览器通道：脚本按 /api/status 的 checkin_*_check 把每一家都" +
+  "自挂组件、拿到全部 token 后一起提交（POST /api/user/checkin?turnstile=…&hcaptcha=…）。" +
+  "注意 Cloudflare 对机房出口常静默不签发 Turnstile 挑战，该渠道建议保留住宅代理。";
+
+/**
  * 站点自己加了一层图片验证码时的拒绝判定（jianzhile.vip 这类 NewAPI 定制版）。
  *
  * 与 Turnstile / reCAPTCHA 都不同：这层是站点后端自己实现的图形验证码，既不挂
@@ -372,6 +397,11 @@ function httpErrorMessage(action, res) {
       );
     }
     return `${action} 接口不存在 (HTTP 404)${serverMsg ? `：${serverMsg}` : ""}。请确认 Base URL 是否为 API 根地址（如 https://api.pie-xian.com）。`;
+  }
+  // 多家同时的人机验证（星见雅）也要排在鉴权/CF 分支前面：它的回话是
+  // 「人机验证 token 为空」，不含 turnstile 字样，会被下面各分支误判成凭证问题。
+  if (humanVerificationRejected(data)) {
+    return `${serverMsg || "人机验证未通过"} · ${HUMAN_VERIFICATION_GUIDE}`;
   }
   // Turnstile 拦截要先判：它是 HTTP 200 + success:false，凭证其实是好的，
   // 不能被下面的凭证/CF 分支误报成「Cookie 失效」或「出口 IP 不匹配」。
@@ -978,7 +1008,9 @@ export const newapiAdapter = {
         // reCAPTCHA v2 / 图片验证码换出口都无解：纯 HTTP 通道无论从 Worker 还是
         // GHA 发出都产不出答案，标 needsBrowser 让 src/index.js 直接分发到
         // gha_browser，省掉一次注定失败的 gha_api 运行。
-        ...(recaptchaRejected(data) || captchaRejected(data) ? { needsBrowser: true } : {}),
+        ...(recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
+          ? { needsBrowser: true }
+          : {}),
         result: normalized,
         status: preStatus,
         raw: data,
@@ -991,7 +1023,9 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
-        ...(recaptchaRejected(data) || captchaRejected(data) ? { needsBrowser: true } : {}),
+        ...(recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
+          ? { needsBrowser: true }
+          : {}),
         result: normalized,
         status: preStatus,
         raw: data,

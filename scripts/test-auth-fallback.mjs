@@ -236,6 +236,63 @@ await scenario(
   }
 );
 
+// 9a-2) 星见雅 2026-10-15 起：签到同时要 Turnstile + hCaptcha，服务端要求两个 token
+//       都非空。缺任一的回话是「人机验证 token 为空」—— 这句**不含 turnstile 字样**，
+//       turnstileRejected 匹配不到，会被当成普通业务失败丢给 gha_api 白跑一趟。
+const XJY_MULTI_CHANNEL = {
+  id: "ch_xjy_multi",
+  name: "星见雅(多验证)",
+  type: "newapi",
+  baseUrl: "https://new.xinjianya.top",
+  enabled: true,
+  auth: { cookie: "session=fake", userId: "1829", token: "FAKE_TOKEN_FOR_TEST" },
+  options: {},
+};
+await scenario(
+  "人机验证 token 为空（星见雅两家同时）→ 标 needsBrowser 并降级浏览器通道",
+  {
+    channel: XJY_MULTI_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, { success: true, data: { enabled: true, stats: { checked_in_today: false } } }),
+      checkinNewapi: () => json(200, { success: false, message: "人机验证 token 为空" }),
+    },
+  },
+  ({ result, via, payloads }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+    check(
+      "文案说明是多家同时的人机验证",
+      /多家同时/.test(result.message || ""),
+      result.message
+    );
+    check(
+      "文案点名 Turnstile + hCaptcha",
+      /Turnstile/.test(result.message || "") && /hCaptcha/.test(result.message || ""),
+      result.message
+    );
+    check("dispatch 走浏览器通道", JSON.stringify(payloads[0]?.runners) === '["gha_browser"]');
+  }
+);
+
+// 9a-3) 两家都带但被拒：回话点名 Turnstile 校验失败，同样直连浏览器通道
+await scenario(
+  "Turnstile 校验失败（两家都带）→ 标 needsBrowser",
+  {
+    channel: XJY_MULTI_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, { success: true, data: { enabled: true, stats: { checked_in_today: false } } }),
+      checkinNewapi: () => json(200, { success: false, message: "Turnstile 校验失败，请刷新重试！" }),
+    },
+  },
+  ({ result, via }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+  }
+);
+
+
 // 9b) 站点自建图片验证码（jianzhile.vip）：同样是「HTTP 200 + success:false」，
 //     但解法既不是自挂 Turnstile 组件、也不是点 reCAPTCHA 勾选框 —— 只能取图 OCR
 //     再带 captcha_id 提交。最容易踩的坑有两个：

@@ -114,12 +114,14 @@ JOB_BUDGET_S = int(os.environ.get("CHECKIN_JOB_BUDGET_S") or 1200)
 
 
 async def click_challenge(page, x_offset=35):
-    """拟人点击 Cloudflare 挑战 iframe 的勾选框区域。
+    """拟人点击 Cloudflare 挑战 iframe 的勾选框区域，返回点到的次数。
 
     三处等 token 的循环原本各自内联一份同样的代码，改预算时容易漏改一处。
     异常一律忽略：iframe 随时可能被 CF 换掉或移除，拿不到 bounding_box 是常态，
-    下一轮重试即可。
+    下一轮重试即可。返回次数是给「多厂商同时」那条路用的 —— 它要在一轮里把
+    Turnstile 与 hCaptcha 的勾选框都点一遍，日志里得看得出各点了几次。
     """
+    hits = 0
     for f in page.frames:
         if "challenges.cloudflare.com" not in (f.url or ""):
             continue
@@ -130,8 +132,10 @@ async def click_challenge(page, x_offset=35):
                 x, y = box["x"] + x_offset, box["y"] + box["height"] / 2
                 await page.mouse.move(x, y, steps=5)
                 await page.mouse.click(x, y)
+                hits += 1
         except Exception:  # noqa: BLE001
             pass
+    return hits
 
 
 def nav_opts(proxy):
@@ -2255,28 +2259,107 @@ async def click_captcha_checkbox(page):
     return hits
 
 
-async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai", why=""):
-    """站点 UI 点不到时的回退：自己挂一个验证码组件，拿到 token 自己提交签到。
+# ---------------------------------------------------------------------------
+# 人机验证（多厂商**同时**）：Turnstile / hCaptcha / reCAPTCHA
+# ---------------------------------------------------------------------------
+#
+# 站点在 /api/status 里用 checkin_<vendor>_check 声明「签到需要哪几家人机验证」。
+# 2026-10-15 实测星见雅把 checkin_turnstile_check 与 checkin_hcaptcha_check **同时**
+# 打开，服务端要求两个 token 都非空：
+#     不带 token / 只带一家            → 「人机验证 token 为空」
+#     turnstile + hcaptcha 都带假的    → 「Turnstile 校验失败，请刷新重试！」
+# 即：先要求「齐」，再按 Turnstile → hCaptcha 的顺序校验。站点前端也是这么干的 ——
+# 把启用的 token 全部 append 到同一个 query 上（站点 bundle 的 URLSearchParams 逻辑）：
+#     POST /api/user/checkin?turnstile=<ts>&hcaptcha=<hc>
+# 所以这里必须支持**多家同时**，不能像以前那样在 hCaptcha / reCAPTCHA 之间二选一
+# —— 二选一必然漏一家，表现为「token 为空」而反复重试。
+CAPTCHA_VENDORS = {
+    "turnstile": {
+        "flag": "checkin_turnstile_check",
+        "sitekey": "turnstile_site_key",
+        "global": "turnstile",
+        "sdk": "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
+        "sdk_match": "challenges.cloudflare.com",
+        "label": "Turnstile",
+    },
+    "hcaptcha": {
+        "flag": "checkin_hcaptcha_check",
+        "sitekey": "hcaptcha_site_key",
+        "global": "hcaptcha",
+        "sdk": "https://js.hcaptcha.com/1/api.js?render=explicit",
+        "sdk_match": "hcaptcha.com/1/api.js",
+        "label": "hCaptcha",
+    },
+    "recaptcha": {
+        "flag": "checkin_recaptcha_check",
+        "sitekey": "recaptcha_site_key",
+        "global": "grecaptcha",
+        "sdk": "https://www.google.com/recaptcha/api.js?render=explicit",
+        "sdk_match": "recaptcha/api.js",
+        "label": "reCAPTCHA",
+    },
+}
 
-    什么时候会走到这里：站点的 /console/personal 挂了，签到按钮压根不渲染。
-    2026-09-27 实测星见雅就是这个形态 —— ErrorBoundary 把正文换成
-    「页面渲染出错，请刷新页面重试」（站点前端 TypeError 崩在渲染「每日签到」卡片时）。
-    但**接口是好的**：GET 状态查询正常、POST 签到只差一个验证码 token。所以页面崩
-    不影响我们走接口这条路 —— 这也正是不能一看到「没找到控件」就判死的原因。
 
-    与自挂 Turnstile 的差别（踩过的坑，别改回去）：
-    · sitekey 取 /api/status 的 hcaptcha_site_key / recaptcha_site_key，并按
-      checkin_hcaptcha_check / checkin_recaptcha_check 判断**用哪个**。不能只看
-      site_key 是否存在 —— 星见雅 recaptcha 已关但 recaptcha_site_key 仍留着。
-    · 提交的参数名跟着开关走：hCaptcha 站是 ?hcaptcha=，reCAPTCHA 站是 ?recaptcha=
-      （站点 bundle 拼 URLSearchParams 就是这么拼的）。
-    · 勾选框点法沿用 click_captcha_checkbox（它已同时认两家的 iframe）。
+def captcha_vendors_from_status(st):
+    """从 /api/status 算出签到需要哪几家人机验证（纯函数，便于离线回归）。
+
+    只认 **checkin_<vendor>_check** 这个显式开关，**不回退**到全局的 turnstile_check /
+    hcaptcha_check —— 那两个是登录/注册用的。星见雅就是活证据：turnstile_check=false
+    而 checkin_turnstile_check=true，拿全局开关判断会得出「签到不需要 Turnstile」的
+    错误结论，于是漏带 token、被服务端回「人机验证 token 为空」。
+
+    老 fork 没有 checkin_* 键时返回空列表 —— 那种站交给既有的 Turnstile 探针流程，
+    宁可漏判也不要误判（误判会给不需要验证码的站硬挂组件）。
+
+    返回 [{"vendor", "sitekey", "label"}]，只含开关为真的项；sitekey 允许是空串，
+    调用方据此给出「开关开了但没配 sitekey」的明确报错。
     """
-    # 读 /api/status 时**必须区分三种结果**：拿到配置 / 站点不可达（5xx、521、
-    # 非 JSON）/ 拿到了但没有验证码字段。2026-09-27 线上报的「reCAPTCHA 站但
-    # /api/status 没给出 sitekey」就是把这三种混成了第一种：当时整站 521/502，
-    # fetch 回来的不是 JSON，于是 st 变成 {}，被误报成「站点没配置验证码」——
-    # 而真相是站点宕机，重试和改配置都没用。
+    if not isinstance(st, dict):
+        return []
+    out = []
+    for vendor, spec in CAPTCHA_VENDORS.items():
+        if st.get(spec["flag"]) is not True:
+            continue
+        out.append(
+            {
+                "vendor": vendor,
+                "sitekey": str(st.get(spec["sitekey"]) or "").strip(),
+                "label": spec["label"],
+            }
+        )
+    return out
+
+
+def human_verification_missing(body):
+    """服务端是不是在说「人机验证 token 不齐 / 校验失败」，返回点名的那家。
+
+    返回 'empty'（token 没带齐）、厂商名（该家 token 被拒）或 ''（不是这类回话）。
+
+    2026-10-15 星见雅实测的两句话都在这一组里，且都表示「只能重新取 token 再试」：
+    换出口、换凭证都没用，所以调用方不要把它当成凭证问题去引导用户重配。
+    """
+    if not isinstance(body, dict):
+        return ""
+    msg = str(body.get("message") or "")
+    if not msg:
+        return ""
+    if "人机验证" in msg and "为空" in msg:
+        return "empty"
+    low = msg.lower()
+    for vendor, spec in CAPTCHA_VENDORS.items():
+        if spec["label"].lower() in low and ("失败" in msg or "无效" in msg):
+            return vendor
+    return ""
+
+
+async def read_site_status(page):
+    """读 /api/status，**区分三种结果**：拿到配置 / 站点不可达 / 拿到了但没有 data。
+
+    2026-09-27 线上报的「reCAPTCHA 站但 /api/status 没给出 sitekey」就是把这三种混成了
+    一种：当时整站 521/502，fetch 回来的不是 JSON，于是 st 变成 {}，被误报成「站点没
+    配置验证码」—— 而真相是站点宕机，重试和改配置都没用。返回 (st, err)。
+    """
     st = None
     st_err = ""
     try:
@@ -2297,6 +2380,138 @@ async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai
             st = None
     except Exception as e:  # noqa: BLE001
         st_err = str(e)[:80]
+    return st, st_err
+
+
+# 给每家验证码各挂一个自己的容器，token 收进 window.__capTokens[vendor]。
+# 容器 id 带厂商名：以前只有一个 #self-rc，多家同时挂会互相覆盖。
+CAPTCHA_MOUNT_JS = """(specs) => {
+    if (!window.__capTokens) window.__capTokens = {};
+    if (!window.__capErrors) window.__capErrors = {};
+    const out = { mounted: [], failed: [] };
+    for (const sp of specs) {
+        if (window.__capTokens[sp.vendor]) { out.mounted.push(sp.vendor); continue; }
+        const api = window[sp.global];
+        if (!api || typeof api.render !== 'function') {
+            out.failed.push(sp.vendor + ':' + sp.global + ' 不可用');
+            continue;
+        }
+        const id = 'self-cap-' + sp.vendor;
+        let box = document.getElementById(id);
+        if (!box) {
+            box = document.createElement('div');
+            box.id = id;
+            box.style.cssText = 'position:fixed;left:8px;bottom:' + (8 + 88 * sp.idx)
+                + 'px;z-index:2147483647;width:303px;height:78px';
+            document.body.appendChild(box);
+        }
+        if (box.dataset.mounted === '1') { out.mounted.push(sp.vendor); continue; }
+        try {
+            api.render(box, {
+                sitekey: sp.sitekey,
+                callback: (t) => { window.__capTokens[sp.vendor] = t; },
+                'error-callback': (e) => { window.__capErrors[sp.vendor] = String(e); },
+                'expired-callback': () => { delete window.__capTokens[sp.vendor]; },
+                'response-field': false,
+            });
+            box.dataset.mounted = '1';
+            out.mounted.push(sp.vendor);
+        } catch (e) {
+            out.failed.push(sp.vendor + ': render 抛错 ' + ((e && e.message) || e));
+        }
+    }
+    return out;
+}"""
+
+# 补 SDK：只补缺的那几家。hCaptcha 对 createElement 注入的脚本照样能用（2026-09-27 实测）。
+CAPTCHA_INJECT_JS = """(specs) => {
+    const added = [];
+    for (const sp of specs) {
+        if (window[sp.global] && typeof window[sp.global].render === 'function') continue;
+        const sel = 'script[src*="' + sp.sdk_match + '"]';
+        if (document.querySelector(sel)) continue;
+        const s = document.createElement('script');
+        s.src = sp.sdk;
+        s.async = true; s.defer = true;
+        document.head.appendChild(s);
+        added.push(sp.vendor);
+    }
+    return added;
+}"""
+
+# 一轮探测：token / 报错 / 组件 iframe 是否还在 / 全局 API 是否还在。
+# 四样一起取回来，省得每轮多次 evaluate。
+CAPTCHA_STATE_JS = """(specs) => {
+    const srcs = [...document.querySelectorAll('iframe')].map(el => el.src || '');
+    const out = {
+        tokens: window.__capTokens || {},
+        errors: window.__capErrors || {},
+        iframes: {
+            turnstile: srcs.some(s => s.includes('challenges.cloudflare.com')),
+            hcaptcha: srcs.some(s => s.includes('hcaptcha.com')),
+            recaptcha: srcs.some(s => s.includes('/recaptcha/api2/')),
+        },
+        globals: {},
+    };
+    for (const sp of specs) {
+        out.globals[sp.vendor] =
+            !!(window[sp.global] && typeof window[sp.global].render === 'function');
+    }
+    return out;
+}"""
+
+# 提交：把拿到的 token 全部 append 到 query 上（与站点前端逐字同构）。
+# 用 URLSearchParams 而不是自己拼字符串，编码交给浏览器，避免 token 里的 +/= 被弄坏。
+CAPTCHA_SUBMIT_JS = """async ([tokens, headersJs]) => {
+    const __h = JSON.parse(headersJs || '{}');
+    try {
+        const u = JSON.parse(localStorage.getItem('user') || 'null');
+        if (u && u.id != null) __h['New-Api-User'] = String(u.id);
+    } catch (e) {}
+    const qs = new URLSearchParams();
+    for (const k of Object.keys(tokens)) {
+        if (tokens[k]) qs.append(k, tokens[k]);
+    }
+    const q = qs.toString();
+    const url = '/api/user/checkin' + (q ? '?' + q : '');
+    const r = await fetch(url, { method: 'POST', credentials: 'include', headers: __h });
+    let b = null; try { b = await r.json(); } catch (e) {}
+    return { status: r.status, body: b, query: q.replace(/=[^&]{12}[^&]*/g, '=<token>').slice(0, 160) };
+}"""
+
+
+async def selfmounted_captcha_checkin(
+    page, name, base, token, tz="Asia/Shanghai", why="", status=None
+):
+    """自己挂人机验证组件、拿到 token 自己提交签到（**支持多家同时**）。
+
+    什么时候会走到这里：
+      · 站点的 /console/personal 挂了，签到按钮压根不渲染（2026-09-27 星见雅就是
+        ErrorBoundary 把正文换成「页面渲染出错，请刷新页面重试」）；
+      · 站点在 /api/status 里显式声明了签到需要哪些人机验证（checkin_*_check），
+        此时由 checkin_one 直接分流过来，比驱动站点 UI 更确定。
+    页面崩不崩无所谓：状态查询与签到接口都是好的，只差 token。
+
+    为什么必须支持多家同时（2026-10-15 星见雅实测）：
+      · /api/status 里 checkin_turnstile_check=true **且** checkin_hcaptcha_check=true；
+      · 服务端要求两个 token 都非空 —— 只带一家回「人机验证 token 为空」；
+      · 两家都带（即使是假的）才往下走，且先校验 Turnstile（回「Turnstile 校验失败」）。
+      旧实现用 use_hc 在 hCaptcha / reCAPTCHA 之间二选一，必然漏一家，于是每次都卡在
+      「token 为空」，重试多少次都没用。
+
+    提交形态与站点前端逐字同构（站点 bundle 用 URLSearchParams 拼的）：
+        POST /api/user/checkin?turnstile=<ts>&hcaptcha=<hc>
+
+    与自挂 Turnstile 的老路（checkin_one 里的单家流程）的差别：
+      · sitekey 按厂商从 /api/status 取（turnstile_site_key / hcaptcha_site_key /
+        recaptcha_site_key），开关只认 checkin_<vendor>_check；
+      · 勾选框点法沿用 click_captcha_checkbox（已同时认 hCaptcha 与 reCAPTCHA 的
+        iframe）与 click_challenge（Turnstile 的 iframe）。
+    """
+    st = status
+    st_err = ""
+    if st is None:
+        st, st_err = await read_site_status(page)
 
     if st is None:
         # 站点侧不可达。标成可重试 —— 宕机是暂时的，换出口/改配置都无意义。
@@ -2312,173 +2527,158 @@ async def selfmounted_captcha_checkin(page, name, base, token, tz="Asia/Shanghai
             )[:300],
         }
 
-    use_hc = bool(st.get("checkin_hcaptcha_check") or st.get("hcaptcha_check"))
-    sitekey = (st.get("hcaptcha_site_key") if use_hc else st.get("recaptcha_site_key")) or ""
-    param = "hcaptcha" if use_hc else "recaptcha"
-    vendor = "hCaptcha" if use_hc else "reCAPTCHA"
-    if not sitekey:
+    vendors = captcha_vendors_from_status(st)
+    if not vendors:
         return {
             "name": name,
             "ok": False,
             "retryable": False,
             "message": (
-                f"/api/status 可达但没有验证码 sitekey（{vendor} 开关="
-                f"{use_hc}，why={why or '无'}）。可能站点刚关掉了该校验，"
-                "或改用了别家验证码；可直接再点一次签到验证"
+                "/api/status 可达但没有声明任何签到人机验证（checkin_turnstile_check / "
+                "checkin_hcaptcha_check / checkin_recaptcha_check 全为假）。可能站点刚关掉了"
+                f"该校验，或改用了别家验证码；可直接再点一次签到验证（why={why or '无'}）"
             )[:300],
         }
-    log(f"  🔑 {name}: 自挂 {vendor} 组件，sitekey={sitekey[:16]}… 提交参数 ?{param}=")
 
-    # 挂我们自己的 widget。#self-rc 与站点的分开，且 response-field 关掉 ——
-    # 否则我们注入的隐藏域会和站点自己的同名、抢 token。
-    RENDER_JS = """(sk, isHc) => {
-        const api = isHc ? window.hcaptcha : window.grecaptcha;
-        if (!api || typeof api.render !== 'function')
-            return { ok: false, why: (isHc ? 'window.hcaptcha' : 'window.grecaptcha') + ' 不可用' };
-        window.__capToken = null; window.__capErr = null;
-        let box = document.getElementById('self-rc');
-        if (!box) {
-            box = document.createElement('div');
-            box.id = 'self-rc';
-            box.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;width:303px;height:78px';
-            document.body.appendChild(box);
-        }
-        try {
-            api.render(box, {
-                sitekey: sk,
-                callback: (t) => { window.__capToken = t; },
-                'error-callback': (e) => { window.__capErr = String(e); },
-                'response-field': false,
-            });
-            return { ok: true };
-        } catch (e) {
-            return { ok: false, why: 'render 抛错: ' + ((e && e.message) || e) };
-        }
-    }"""
-
-    # 动态注入 api.js。实测（2026-09-27）hCaptcha 对 createElement 注入的脚本**照样能用**，
-    # 所以不需要改成静态 <script> 标签 —— 那样反而可能因为 async/defer 时序拿不到 render。
-    INJECT_SDK_JS = """(isHc) => {
-        if (isHc) {
-            if (!document.querySelector('script[src*="hcaptcha.com/1/api.js"]')) {
-                const s = document.createElement('script');
-                s.src = 'https://js.hcaptcha.com/1/api.js?render=explicit';
-                s.async = true; s.defer = true;
-                document.head.appendChild(s);
-            }
-        } else if (!document.querySelector('script[src*="recaptcha/api.js"]')) {
-            const s = document.createElement('script');
-            s.src = 'https://www.google.com/recaptcha/api.js?render=explicit';
-            s.async = true; s.defer = true;
-            document.head.appendChild(s);
-        }
-    }"""
-
-    mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
-    if not mounted.get("ok"):
-        # 组件 API 还没就绪（api.js 是异步加载的）：把脚本挂上再等一轮
-        await page.evaluate(INJECT_SDK_JS, [use_hc])
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            await page.wait_for_timeout(1000)
-            mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
-            if mounted.get("ok"):
-                break
-    if not mounted.get("ok"):
+    no_key = [v["label"] for v in vendors if not v["sitekey"]]
+    if no_key:
         return {
             "name": name,
             "ok": False,
-            "message": f"自挂 {vendor} 组件失败：{mounted.get('why') or '未知'}（why={why or '无'}）"[:300],
+            "retryable": False,
+            "message": (
+                f"/api/status 说签到需要 {'/'.join(no_key)}，但没给出对应的 sitekey。"
+                "站点配置不完整（或改了字段名），自挂组件无法进行；"
+                f"请把这条报给站点方（why={why or '无'}）"
+            )[:300],
         }
-    log(f"  🧩 {name}: 自挂组件已渲染，开始点勾选框")
 
-    # 点勾选框 + 收 token。
-    # 每轮都要**重新确认组件还在** —— 2026-09-27 实测踩过：站点页面崩在 ErrorBoundary
-    # 上，SPA 会重渲染 / 换路由，我们挂上去的 div 与 script 标签**当场被清掉**（实测
-    # 一轮后 window.hcaptcha 已 undefined、#self-rc 不存在、script 列表为空）。只在
-    # 开头挂一次的话，后面几十秒全在点空气：点击次数照涨，token 永远不来。
-    deadline = time.monotonic() + RECAPTCHA_BUDGET_S
-    clicks = 0
-    cap = ""
-    rebuilds = 0
-    while time.monotonic() < deadline:
-        await page.wait_for_timeout(1500)
-        cap = await page.evaluate("() => window.__capToken || ''")
-        if cap:
-            break
-        # 判活必须用 **page.frames**（跨世界可见），不能用 evaluate 查 window.hcaptcha：
-        # Camoufox 的 evaluate 默认在隔离世界跑（见 patch_main_world / ev_script），
-        # 那里读不到主世界的 window.hcaptcha，也读不到我们挂的 #self-rc —— 会误判成
-        # 「一直活着」，于是永远不重建（2026-09-27 实测：重建 0 次但 div 其实已被清掉）。
-        alive = any(
-            ("hcaptcha.com" in (f.url or "") and "frame=checkbox" in (f.url or ""))
-            or "/recaptcha/api2/anchor" in (f.url or "")
-            for f in page.frames
-        )
-        if not alive:
-            rebuilds += 1
-            if rebuilds <= 3:
-                log(f"  ♻️ 组件被页面重渲染清掉了，重新挂（第 {rebuilds} 次）")
-            mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
-            if not mounted.get("ok"):
-                # api.js 标签也一起没了，先补脚本再等一轮
-                await page.evaluate(INJECT_SDK_JS, [use_hc])
-                await page.wait_for_timeout(2500)
-                mounted = await page.evaluate(RENDER_JS, [sitekey, use_hc])
-            if not mounted.get("ok"):
-                continue
-        if await click_captcha_checkbox(page):
-            clicks += 1
-    if not cap:
-        cap = await page.evaluate("() => window.__capToken || ''")
-    if not cap:
-        err = await page.evaluate("() => window.__capErr")
+    labels = "/".join(v["label"] for v in vendors)
+    log(
+        f"  🔑 {name}: 站点声明签到需要 {labels}（共 {len(vendors)} 家），"
+        f"自挂组件后一起提交 ?{'&'.join(v['vendor'] + '=' for v in vendors)}"
+    )
+    specs = [
+        {
+            "vendor": v["vendor"],
+            "sitekey": v["sitekey"],
+            "global": CAPTCHA_VENDORS[v["vendor"]]["global"],
+            "sdk": CAPTCHA_VENDORS[v["vendor"]]["sdk"],
+            "sdk_match": CAPTCHA_VENDORS[v["vendor"]]["sdk_match"],
+            "idx": i,
+        }
+        for i, v in enumerate(vendors)
+    ]
+
+    await page.evaluate(CAPTCHA_INJECT_JS, specs)
+    mounted = await page.evaluate(CAPTCHA_MOUNT_JS, specs)
+    log(f"  🧩 {name}: 挂载结果 {mounted}")
+    if not mounted.get("mounted"):
         return {
             "name": name,
             "ok": False,
             "message": (
-                f"自挂 {vendor} 组件 {RECAPTCHA_BUDGET_S}s 内没出 token（点了 {clicks} 次、"
-                f"重建 {rebuilds} 次，组件报错={err}）。重建次数>0 多半是站点页面在"
-                "重渲染（ErrorBoundary）把组件清掉了；重建 0 次仍失败则多半是弹了"
-                "图片题（该出口 IP 被判高风险，需要住宅代理）"
+                f"自挂 {labels} 组件失败：{mounted.get('failed') or '未知'}"
+                f"（why={why or '无'}）"
             )[:300],
         }
-    log(f"  🔑 {name}: 拿到 {vendor} token（{len(cap)} 字符），自己提交签到")
 
-    # 我们自己带 token POST，参数名跟着站点开关走
-    res = await page.evaluate(
-        """async ([p, tk, headersJs]) => {
-            const __h = JSON.parse(headersJs || '{}');
-            try {
-                const u = JSON.parse(localStorage.getItem('user') || 'null');
-                if (u && u.id != null) __h['New-Api-User'] = String(u.id);
-            } catch (e) {}
-            const r = await fetch('/api/user/checkin?' + p + '=' + encodeURIComponent(tk), {
-                method: 'POST', credentials: 'include', headers: __h,
-            });
-            let b = null; try { b = await r.json(); } catch (e) {}
-            return { status: r.status, body: b };
-        }""",
-        [param, cap, auth_headers_js(token)],
+    # 等 token。每轮都要**重新确认组件还在** —— 2026-09-27 实测踩过：站点页面崩在
+    # ErrorBoundary 上，SPA 会重渲染 / 换路由，我们挂上去的 div 与 script 标签**当场被
+    # 清掉**（一轮后 window.hcaptcha 已 undefined、容器不存在、script 列表为空）。
+    # 只在开头挂一次的话，后面几十秒全在点空气：点击次数照涨，token 永远不来。
+    deadline = time.monotonic() + RECAPTCHA_BUDGET_S
+    tokens = {}
+    clicks = 0
+    rebuilds = 0
+    state = {}
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(1500)
+        state = await page.evaluate(CAPTCHA_STATE_JS, specs)
+        tokens = state.get("tokens") or {}
+        if all(tokens.get(v["vendor"]) for v in vendors):
+            break
+        # 哪家的全局 API 或 iframe 没了就补哪家（不整批重挂，避免把已拿到的 token 弄丢）
+        need = []
+        for sp in specs:
+            if tokens.get(sp["vendor"]):
+                continue
+            if not (state.get("globals") or {}).get(sp["vendor"]):
+                await page.evaluate(CAPTCHA_INJECT_JS, [sp])
+                need.append(sp)
+            elif not (state.get("iframes") or {}).get(sp["vendor"]):
+                need.append(sp)
+        if need:
+            rebuilds += 1
+            if rebuilds <= 3:
+                log(
+                    f"  ♻️ 组件被页面重渲染清掉了，重新挂 "
+                    f"{[sp['vendor'] for sp in need]}（第 {rebuilds} 次）"
+                )
+            await page.wait_for_timeout(2500)
+            await page.evaluate(CAPTCHA_MOUNT_JS, need)
+        # 点击：Turnstile 的勾选框在它自己的 iframe 里，hCaptcha / reCAPTCHA 在
+        # frame=checkbox / api2/anchor 里，两套点法都要跑（谁在页面上就点谁）。
+        clicks += await click_challenge(page) or 0
+        clicks += await click_captcha_checkbox(page) or 0
+
+    state = await page.evaluate(CAPTCHA_STATE_JS, specs)
+    tokens = state.get("tokens") or {}
+    missing = [v["label"] for v in vendors if not tokens.get(v["vendor"])]
+    if missing:
+        errs = state.get("errors") or {}
+        return {
+            "name": name,
+            "ok": False,
+            "message": (
+                f"自挂 {labels} 组件 {RECAPTCHA_BUDGET_S}s 内没出 token："
+                f"缺 {'/'.join(missing)}（点了 {clicks} 次、重建 {rebuilds} 次，"
+                f"组件报错={errs}）。重建次数>0 多半是站点页面在重渲染（ErrorBoundary）"
+                "把组件清掉了；重建 0 次仍失败则多半是弹了图片题或该出口 IP 被判高风险"
+                "（Cloudflare 对机房 IP 常静默不签发挑战，需要住宅代理）"
+            )[:300],
+        }
+
+    got = {v["vendor"]: tokens[v["vendor"]] for v in vendors}
+    log(
+        f"  🔑 {name}: 拿到 "
+        + "、".join(f"{v['label']} {len(tokens[v['vendor']])} 字符" for v in vendors)
+        + "，自己提交签到"
     )
+
+    res = await page.evaluate(CAPTCHA_SUBMIT_JS, [got, auth_headers_js(token)])
     body = res.get("body") if isinstance(res.get("body"), dict) else {}
     ok = checkin_ok(body, res.get("status"))
     if not ok:
         # token 一次性，可能站点前端已经抢先签了 —— 状态查询才是权威
         done = await confirm_checked_in(page, token, name, tz)
         if done:
-            done["message"] = f"{done['message']}（{vendor}：自挂组件提交）"[:300]
+            done["message"] = f"{done['message']}（{labels}：自挂组件提交）"[:300]
             await attach_quota(page, done, token)
             return done
+        # 「人机验证 token 为空 / Turnstile 校验失败」是**可重试**的：token 一次性、
+        # 也可能这一轮恰好被判低分，换一轮/换出口重取即可。标清楚是哪一家，别让人
+        # 以为是凭证问题。
+        which = human_verification_missing(body)
+        note = ""
+        if which == "empty":
+            note = "（服务端说 token 为空：确认站点声明的每一家都带上了）"
+        elif which:
+            label = CAPTCHA_VENDORS.get(which, {}).get("label", which)
+            note = f"（{label} token 被拒：token 一次性，重取即可；机房 IP 常被判低分）"
         return {
             "name": name,
             "ok": False,
-            "message": f"{checkin_message(ok, body, res.get('status'))}（{vendor}：自挂组件提交）"[:300],
+            "retryable": bool(which),
+            "message": (
+                f"{checkin_message(ok, body, res.get('status'))}"
+                f"（{labels}：自挂组件提交，参数 {res.get('query') or '无'}）{note}"
+            )[:300],
         }
     result = {
         "name": name,
         "ok": True,
-        "message": f"{checkin_message(ok, body, res.get('status'))}（{vendor}：自挂组件提交）"[:300],
+        "message": f"{checkin_message(ok, body, res.get('status'))}（{labels}：自挂组件提交）"[:300],
     }
     await attach_quota(page, result, token)
     return result
@@ -2686,6 +2886,30 @@ async def checkin_one(channel, proxy=None) -> dict:
                 return res
 
 
+        # 站点在 /api/status 里显式声明了签到需要哪几家人机验证时，直接走「多厂商自挂」。
+        # 这条路比驱动站点 UI 确定：站点页面可能崩在 ErrorBoundary 上（按钮压根不渲染），
+        # 而签到接口本身是好的，只差 token。
+        # 2026-10-15 星见雅实测 checkin_turnstile_check 与 checkin_hcaptcha_check 同时为真，
+        # 服务端要求两个 token 都非空 —— 必须一次把两家都拿到（见 selfmounted_captcha_checkin）。
+        # 例外：声明了 reCAPTCHA 时仍走站点 UI 驱动，因为 reCAPTCHA v2 的 token 与渲染它的
+        # 那个页面 origin 强绑定，自挂组件拿到的 token 会被判低分（这条实测结论别改回去）。
+        site_st = None
+        try:
+            site_st, site_st_err = await read_site_status(page)
+        except Exception as e:  # noqa: BLE001
+            site_st, site_st_err = None, str(e)[:80]
+            log(f"  ⚠️ {name}: /api/status 读取异常 {site_st_err}")
+        declared = captcha_vendors_from_status(site_st) if site_st else []
+        if declared:
+            kinds = [v["vendor"] for v in declared]
+            if "recaptcha" in kinds:
+                log(f"  🧩 {name}: 站点声明签到需要 {kinds}，含 reCAPTCHA → 走站点 UI 驱动")
+            else:
+                log(f"  🧩 {name}: 站点声明签到需要 {kinds} → 走多厂商自挂组件")
+                return await selfmounted_captcha_checkin(
+                    page, name, base, token, tz, "站点声明的签到人机验证", site_st
+                )
+
         # 站点用 Google reCAPTCHA 时必须在这里分流。下面的 Turnstile 流程会先自挂
         # 组件死等 TOKEN_WAIT_S(45s) 才去探针，而 reCAPTCHA 站上 Turnstile 组件永远
         # 不出 token —— 不分流的话每次都要白烧 45s 才轮得到真正的解法。
@@ -2832,6 +3056,20 @@ async def checkin_one(channel, proxy=None) -> dict:
             if re.search(r"recaptcha|g-recaptcha", pmsg + str(pb)[:200], re.I):
                 log(f"  🧩 {name}: 探针回话点名 reCAPTCHA，改走站点 UI 驱动")
                 return await recaptcha_site_ui_checkin(page, name, base, token, tz)
+            # 兜底：空 token POST 的回话点名「人机验证 token 为空 / 校验失败」时，按
+            # **多厂商自挂**处理。这条要排在下面「与 Turnstile 无关」的分支之前，否则
+            # 会被判成不可重试、当天直接漏签。
+            # 2026-10-15 星见雅实测：它同时要 Turnstile 与 hCaptcha，缺任一只回
+            # 「人机验证 token 为空」；这句不含「Turnstile」字样，靠下面的正则匹配不到。
+            if human_verification_missing(pb):
+                log(f"  🧩 {name}: 探针回话点名人机验证（{pmsg}），改走多厂商自挂组件")
+                res = await selfmounted_captcha_checkin(
+                    page, name, base, token, tz, f"探针回话：{pmsg}", site_st
+                )
+                if res.get("ok"):
+                    await attach_quota(page, res, token)
+                return res
+
             # 兜底：状态查询没看出 captcha_enabled（例如渠道缺 session，状态接口直接
             # 401），但空 token POST 的回话点名了验证码 —— 仍然按图片验证码站处理。
             # 「请打开网站后再签到」也要认：它就是本站缺会话时签到接口的固定话术，
