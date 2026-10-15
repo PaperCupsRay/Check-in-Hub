@@ -220,15 +220,14 @@ ok(
     "声明里含 reCAPTCHA 时仍走站点 UI 驱动（v2 的 token 与页面 origin 绑定，自挂会被判低分）",
 )
 
-print("\n[18] 浏览器要关掉跟踪保护名单（否则 hCaptcha 的 API 域名被拦）")
-ok('"firefox_user_prefs"' in SOURCE, "Camoufox 启动参数里设了 firefox_user_prefs")
-for _pref in (
-    "privacy.trackingprotection.enabled",
-    "privacy.trackingprotection.fingerprinting.enabled",
-    "privacy.trackingprotection.cryptomining.enabled",
-    "privacy.annotate_channels.strict_list.enabled",
-):
-    ok(f'"{_pref}": False' in SOURCE, f"{_pref} 关掉")
+print("\n[18] 已试过的改动不要留成死代码：跟踪保护那处已回退")
+# 2026-10-15：曾怀疑 Firefox 跟踪保护名单拦了 api.hcaptcha.com，加了
+# firefox_user_prefs 关名单；真机复测**没有改善**（api.hcaptcha.com 仍 NetworkError），
+# 于是回退 —— 关掉名单会让指纹偏离真实 Firefox，没证据支持就不该留。
+ok(
+    "firefox_user_prefs" not in SOURCE,
+    "firefox_user_prefs 已回退（无证据支持的指纹改动不留）",
+)
 ok("CAPTCHA_REACH_JS" in SOURCE and "页面内可达性=" in SOURCE, "失败文案带上页面内探测结果")
 ok(
     "mode: 'no-cors'" in mod.CAPTCHA_REACH_JS,

@@ -368,27 +368,7 @@ async def _browser_page_raw(proxy=None, window=(1366, 768), geoip_proxy=None):
             # 官方文档明确写着用于「让跨域 iframe 里的 Turnstile 勾选框可点击」
             "disable_coop": True,
             "window": window,
-            "window": window,
             "i_know_what_im_doing": True,
-            # 关掉 Firefox 的跟踪保护名单。为什么必须关（2026-10-15 星见雅实测）：
-            # hCaptcha 的 API 域名 api.hcaptcha.com 落在「跟踪器/指纹识别器」名单里，
-            # 被浏览器直接拦掉 —— 表现为页内 fetch 报 NetworkError。而
-            # js.hcaptcha.com（SDK）与 newassets.hcaptcha.com（勾选框 iframe）不在名单里、
-            # 照常加载，于是组件能渲染、却永远拿不到 token（hCaptcha 自己报
-            # network-error / challenge-error，看着像网络问题，其实是浏览器拦的）。
-            # 判据：同一出口用裸 socket 发真实 HTTP 请求（含经代理）全部 302 正常，
-            # 只有浏览器里 api.hcaptcha.com 单独 FAIL。
-            # 只关名单，不动 cookie 策略 —— 改动越少，指纹越接近真实 Firefox。
-            "firefox_user_prefs": {
-                "privacy.trackingprotection.enabled": False,
-                "privacy.trackingprotection.pbmode.enabled": False,
-                "privacy.trackingprotection.socialtracking.enabled": False,
-                "privacy.trackingprotection.cryptomining.enabled": False,
-                "privacy.trackingprotection.fingerprinting.enabled": False,
-                "privacy.trackingprotection.emailtracking.enabled": False,
-                "privacy.annotate_channels.strict_list.enabled": False,
-                "browser.contentblocking.category": "standard",
-            },
         }
         if CAMOUFOX_EXECUTABLE:
             opts["executable_path"] = CAMOUFOX_EXECUTABLE
