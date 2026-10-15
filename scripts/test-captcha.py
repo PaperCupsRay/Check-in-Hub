@@ -77,6 +77,20 @@ ok(
     "没有会话 → no_session（缺 session cookie，重试无用）",
 )
 ok(
+    mod.classify_captcha_reply({"message": "请从网站页面发起签到", "success": False}, 200)
+    == "not_from_page",
+    "站点新增的来源闸 → not_from_page（认 Origin/Referer，不是会话问题）",
+)
+ok(
+    mod.CAPTCHA_NEEDS_SESSION_RE.search("请从网站页面发起签到") is None,
+    "来源闸不会被会话判据误命中（否则会引导用户去换 cookie）",
+)
+ok(
+    mod.classify_captcha_reply({"message": "Unauthorized, New-Api-User header not provided"}, 401)
+    == "other",
+    "缺 New-Api-User 的 401 归 other（那是请求头问题，不是验证码问题）",
+)
+ok(
     mod.classify_captcha_reply({"message": "今日已签到", "success": True}, 200) == "ok",
     "success:true 优先于文案（别把成功判成已签）",
 )
@@ -184,14 +198,22 @@ else:
     class FakePage:
         """只实现 captcha_checkin 用到的 page.evaluate，按 JS 特征分派。"""
 
-        def __init__(self, status, captchas, submissions):
+        def __init__(self, status, captchas, submissions, self_alive=None):
             self.status = status          # 状态查询回话
             self.captchas = list(captchas)  # 每次取图的回话
             self.submissions = list(submissions)  # 每次提交的回话
+            self.self_alive = self_alive  # /api/user/self 探测回话（None=走默认"有效"）
             self.fetched = 0
             self.submitted = []
+            self.probed = 0
 
         async def evaluate(self, js, arg=None):
+            if "/api/user/self" in js:
+                # session_alive() 的只读探测：不带 Authorization，只可能靠 session 通过
+                self.probed += 1
+                if self.self_alive is not None:
+                    return self.self_alive
+                return {"status": 200, "success": True, "id": 25341, "message": ""}
             if "checkin/captcha" in js:
                 got = self.captchas[min(self.fetched, len(self.captchas) - 1)]
                 self.fetched += 1
@@ -317,14 +339,12 @@ else:
 
     # 5g) 会话失效 + 渠道存了账密 → 自动换 session 后重试成功，并把新 cookie 回传
     mod.solve_image_captcha = lambda png: "abcde"
+    # 主动自愈：探测说会话已死 → 签到前就换新 session，所以取图一次就成
     page = FakePage(
         STATUS_NOT_CHECKED,
-        [
-            # 第一次取图被拒：会话已失效
-            {"status": 200, "success": False, "message": "请打开网站后再签到", "captcha_id": "", "captcha_image": ""},
-            CAPTCHA_REPLY,
-        ],
+        [CAPTCHA_REPLY],
         [{"status": 200, "body": {"success": True, "data": {"quota_awarded": 5000000}}}],
+        self_alive={"status": 401, "success": False, "id": None, "message": "not logged in"},
     )
     login_calls = []
 
@@ -345,10 +365,78 @@ else:
         )
     )
     ok(res.get("ok") is True, "会话失效 → 账密换 session 后签到成功", str(res)[:200])
+    ok(page.probed == 1, f"签到前只读探了一次会话（实际 {page.probed}）")
     ok(len(login_calls) == 1, f"只登录一次（实际 {len(login_calls)}）")
-    ok(page.fetched == 2, f"换会话后重新取图（实际 {page.fetched}）")
+    ok(page.fetched == 1, f"换会话后取图一次即成（实际 {page.fetched}）")
     ok(res.get("newTokens", {}).get("cookie") == "session=FRESH; other=1", "把新 cookie 回传（面板写回 KV）")
     ok("刷新 Cookie" in (res.get("message") or ""), "文案说明已刷新 Cookie", res.get("message"))
+    ok(
+        getattr(page.context, "added", None) and page.context.added[0]["name"] == "session",
+        "新 session 已注入浏览器上下文",
+    )
+
+    # 5g2) 会话有效时不登录（别把账密换成不必要的登录请求）
+    login_calls.clear()
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [CAPTCHA_REPLY],
+        [{"status": 200, "body": {"success": True, "data": {"quota_awarded": 5000000}}}],
+        self_alive={"status": 200, "success": True, "id": 25341, "message": ""},
+    )
+    res = run(
+        mod.captcha_checkin(
+            page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai",
+            {"auth": {"username": "u", "password": "p", "userId": "25341"}},
+        )
+    )
+    ok(res.get("ok") is True, "会话有效 → 正常签到")
+    ok(not login_calls, "会话有效时不登录")
+    ok(page.probed == 1, "仍会探一次会话（只读，成本极低）")
+
+    # 5g3) 探测不通（网络异常）时不得误判成会话失效：照常往下走
+    login_calls.clear()
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [CAPTCHA_REPLY],
+        [{"status": 200, "body": {"success": True, "data": {"quota_awarded": 5000000}}}],
+        self_alive=None,
+    )
+    real_probe = mod.session_alive
+
+    async def probe_unknown(pg):
+        return None
+
+    mod.session_alive = probe_unknown
+    res = run(
+        mod.captcha_checkin(
+            page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai",
+            {"auth": {"username": "u", "password": "p", "userId": "25341"}},
+        )
+    )
+    mod.session_alive = real_probe
+    ok(res.get("ok") is True, "探测不通时照常签到（不误判会话失效）")
+    ok(not login_calls, "探测不通时不登录")
+
+    # 5g4) 续期成功但签到仍失败 → 新 cookie 依然要回写（否则每次重跑都重新登录）
+    login_calls.clear()
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [CAPTCHA_REPLY],
+        [{"status": 200, "body": {"success": False, "message": "验证码错误，请重试"}}],
+        self_alive={"status": 401, "success": False, "id": None, "message": "not logged in"},
+    )
+    res = run(
+        mod.captcha_checkin(
+            page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai",
+            {"auth": {"username": "u", "password": "p", "userId": "25341"}}, attempts=2,
+        )
+    )
+    ok(res.get("ok") is False, "验证码连错 → 失败")
+    ok(
+        res.get("newTokens", {}).get("cookie") == "session=FRESH; other=1",
+        "失败结果也带回新 cookie（下次不必重新登录）",
+        str(res.get("newTokens")),
+    )
 
     # 5h) 会话失效但渠道没有账密 → 不空转，直接给出可照做的指引
     mod.solve_image_captcha = lambda png: "abcde"
@@ -360,7 +448,21 @@ else:
     res = run(mod.captcha_checkin(page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai", {"auth": {}}))
     ok(res.get("ok") is False, "无账密时失败")
     ok(page.fetched == 1, "不反复取图空转")
+    ok(page.probed == 0, "没账密就不做会话探测（省一次请求）")
     ok("账密" in (res.get("message") or ""), "文案提示可补账密", res.get("message"))
+
+    # 5i) 站点新增的来源闸：请求必须"从网站页面发起"（认 Origin / Referer）
+    mod.solve_image_captcha = lambda png: "abcde"
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [{"status": 200, "success": False, "message": "请从网站页面发起签到", "captcha_id": "", "captcha_image": ""}],
+        [],
+    )
+    res = run(mod.captcha_checkin(page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai", {"auth": {}}))
+    ok(res.get("ok") is False, "来源被拒 → 失败")
+    ok(res.get("retryable") is False, "标不可重试")
+    ok("Origin" in (res.get("message") or ""), "文案点名 Origin/Referer", res.get("message"))
+    ok("session" not in (res.get("message") or "").lower(), "不误导成会话问题", res.get("message"))
 
     mod.login_for_session = real_login
     mod.solve_image_captcha = real_solver

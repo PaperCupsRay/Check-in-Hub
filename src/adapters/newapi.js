@@ -317,7 +317,10 @@ function recaptchaRejected(data) {
 function captchaRejected(data) {
   const raw = responseTextHint(data);
   if (/<!doctype html|<html[\s>]/i.test(raw)) return false;
-  return /请打开网站后再签到|请输入验证码|验证码错误|验证码不正确|验证码已失效|请刷新后重试/.test(
+  // 「请从网站页面发起签到」是站点 2026-10-15 新增的来源闸（实测认 Origin / Referer，
+  // 换成别的站点即被拒）。它同样只能靠浏览器通道解决，所以并入这一组；
+  // 但文案要分开说 —— 它是来源问题，不是会话问题，别引导用户去换 cookie。
+  return /请打开网站后再签到|请从网站页面发起签到|请输入验证码|验证码错误|验证码不正确|验证码已失效|请刷新后重试/.test(
     raw
   );
 }
@@ -327,7 +330,10 @@ const CAPTCHA_GUIDE =
   "captcha_enabled=true），纯 HTTP 通道产不出答案，且该接口只认浏览器会话、" +
   "不认访问令牌。已转 GitHub Actions · 浏览器通道：脚本会在页面上下文里取验证码图片、" +
   "OCR 识别后带 captcha_id 提交，答错自动换一张重试。注意该站的 Cookie 栏必须填" +
-  "浏览器里已登录的 session（访问令牌对签到接口无效，状态查询仍可用）。";
+  "浏览器里已登录的 session（访问令牌对签到接口无效，状态查询仍可用）；" +
+  "若渠道里还填了账密，脚本会在会话失效时自动换新 session 并写回配置。" +
+  "该站 2026-10-15 起还要求请求从站点页面发起（认 Origin / Referer），" +
+  "浏览器通道的页内 fetch 天然满足。";
 
 
 const RECAPTCHA_GUIDE =

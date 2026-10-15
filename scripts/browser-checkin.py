@@ -1413,11 +1413,16 @@ CAPTCHA_WRONG_RE = re.compile(r"验证码错误|验证码不正确|验证码有�
 CAPTCHA_EXPIRED_RE = re.compile(r"验证码已失效|请刷新后重试|验证码过期")
 CAPTCHA_MISSING_RE = re.compile(r"请输入验证码")
 CAPTCHA_NEEDS_SESSION_RE = re.compile(r"请打开网站后再签到|请打开网站")
+# 2026-10-15 站点新增的一道闸：请求必须"从网站页面发起"。实测判据是 Origin / Referer
+# 指向本域 —— 只带 Origin 或只带 Referer 都放行，两者都缺或指向别的站点则回这句。
+# 与「请打开网站后再签到」分开匹配：那句是会话问题（换 cookie 能解），
+# 这句是请求来源问题（换 cookie 没用，得补 Origin/Referer）。
+CAPTCHA_NOT_FROM_PAGE_RE = re.compile(r"请从网站页面发起签到")
 
 
 def classify_captcha_reply(body, status):
     """把签到回话归到一个动作上：ok / already / wrong / expired / missing /
-    no_session / other。
+    no_session / not_from_page / other。
 
     提成纯函数是为了能离线回归（scripts/test-captcha.py）—— 判据错一个方向就有代价：
     把「今日已签到」当成失败会无限重试烧光预算，把「验证码错误」当成成功会让用户
@@ -1438,6 +1443,11 @@ def classify_captcha_reply(body, status):
         return "wrong"
     if CAPTCHA_MISSING_RE.search(msg):
         return "missing"
+    # 「请从网站页面发起签到」要排在 no_session 之前判：两句都含「签到」，
+    # 而 no_session 的正则只认「请打开网站」，不会误命中这句 —— 但反过来若有人
+    # 把 no_session 的正则放宽到「请打开网站|请从网站」，就会把来源问题误报成会话问题。
+    if CAPTCHA_NOT_FROM_PAGE_RE.search(msg):
+        return "not_from_page"
     if CAPTCHA_NEEDS_SESSION_RE.search(msg):
         return "no_session"
     return "other"
@@ -1601,6 +1611,48 @@ async def captcha_status_enabled(page, token):
         log(f"  ⚠️ 验证码状态查询失败: {str(e)[:100]}")
         return None
 
+async def session_alive(page):
+    """只带 session cookie（故意不带 Authorization）问一次 /api/user/self，
+    判断会话是否还有效。
+
+    为什么要这样探：该站的**状态查询两种凭证都认**，所以带令牌的状态查询在会话失效时
+    照样 200 —— 用它判断会话等于没判。而 /api/user/self 不带 Authorization 时只可能靠
+    session 通过：有效 → 200，失效 → 401「not logged in and no access token provided」
+    （2026-10-15 实测：真 session 200 / 伪造 session 401）。
+
+    这是只读请求，不消耗验证码、不在站点留失败记录，所以可以在签到前先探一次，
+    会话过期就主动换新的 —— 比"等签到接口拒绝再补救"少一次往返，也不依赖拒绝文案
+    （站点当天就新增过一条「请从网站页面发起签到」，光靠文案匹配很脆）。
+
+    返回 True/False；探测本身失败（网络异常）时返回 None，调用方按"未知"处理，
+    不要因为探不通就误判成会话失效。
+    """
+    try:
+        got = await asyncio.wait_for(
+            page.evaluate(
+                """async () => {
+                    const res = await fetch('/api/user/self', { credentials: 'include' });
+                    let b = null; try { b = await res.json(); } catch (e) {}
+                    return {
+                        status: res.status,
+                        success: !!(b && b.success),
+                        id: (b && b.data && b.data.id) || null,
+                        message: (b && b.message) || '',
+                    };
+                }"""
+            ),
+            timeout=STATUS_QUERY_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ 会话探测失败（按未知处理）: {str(e)[:100]}")
+        return None
+    if not isinstance(got, dict):
+        return None
+    if got.get("status") == 200 and got.get("success") and got.get("id"):
+        return True
+    return False
+
+
 
 async def fetch_captcha(page, token):
     """页内 POST /api/user/checkin/captcha，返回 {captcha_id, captcha_image} 或 None。"""
@@ -1651,7 +1703,7 @@ async def submit_captcha(page, token, captcha_id, answer):
     )
 
 
-async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CAPTCHA_ATTEMPTS):
+async def _captcha_checkin_run(page, name, base, token, tz, channel, attempts, state):
     """图片验证码签到：取图 → OCR → 提交，答错就换一张重来。
 
     为什么要重试而不是一次定生死：单轮识别率实测约 70–75%，每次都是独立的新验证码，
@@ -1661,10 +1713,11 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
     日子答对也会回「今日已签到」。先查状态就能在已签时直接返回，省掉取图 + OCR，
     也避免把「今日已签到」误读成需要重试。
 
-    会话自愈：该站的签到接口只认 session cookie（访问令牌无效），而 session 有有效期。
-    渠道里存了账密时，一旦服务端回「请打开网站后再签到」就用账密换一个新 session 并
-    重试 —— 换到的 cookie 经 newTokens 回传，面板写回 KV，之后直接复用，用户不必手抄。
-    没存账密时给出可照做的指引，而不是含糊地报一句失败。
+    会话自愈（**主动**）：签到接口只认 session cookie（访问令牌无效），而 session 有
+    有效期。所以进页面后先用 session_alive() 只读探一次会话：失效且渠道存了账密时，
+    立刻用账密换一个新 session 再开始签到 —— 换到的 cookie 经 newTokens 回传，面板
+    写回 KV，之后直接复用，用户不必手抄。探不通（网络异常）或没存账密时不预判，
+    照常往下走，由服务端回话决定；真被拒了还有一轮被动补救（renew_session）。
     """
     deps, err = _captcha_deps()
     if deps is None:
@@ -1674,12 +1727,10 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
     username = auth.get("username") or auth.get("email") or ""
     password = auth.get("password") or ""
     user_id = str(auth.get("userId") or auth.get("newApiUser") or "").strip()
-    fresh_cookie = ""
     renew_tried = False
 
     async def renew_session():
-        """会话被拒时用账密换一个新 session；返回 True 表示可以重试。"""
-        nonlocal fresh_cookie, renew_tried
+        nonlocal renew_tried
         if renew_tried or not (username and password):
             return False
         renew_tried = True
@@ -1687,8 +1738,8 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
         if not got.get("session"):
             log(f"  ⚠️ {name}: 会话失效且账密登录未换到 session（{got.get('why') or '未知'}）")
             return False
-        fresh_cookie = got["cookie"]
-        pairs = parse_cookie_pairs(fresh_cookie)
+        state["fresh_cookie"] = got["cookie"]
+        pairs = parse_cookie_pairs(got["cookie"])
         if pairs:
             host = base.split("//", 1)[1].split("/", 1)[0]
             domain = host[4:] if host.startswith("www.") else host
@@ -1698,12 +1749,15 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
         log(f"  🔑 {name}: 会话失效，已用账密换到新 session，重试")
         return True
 
-    def finish(res):
-        """成功时把新换到的 cookie 一起回传（面板会写回 KV）。"""
-        if res.get("ok") and fresh_cookie:
-            res["message"] = f"{res.get('message', '')} · 已用账密登录刷新 Cookie"[:300]
-            res["newTokens"] = {"cookie": fresh_cookie}
-        return res
+    # 主动会话自愈：先只读探一次会话，失效就用账密换新的再开始。
+    # 放在状态查询之前：会话失效时「今日已签到」也读不准（状态查询走令牌能通，
+    # 但拿到的仍是站点数据，不影响判断；这里提前换新是为了让后续取图一次成功）。
+    if username and password:
+        alive = await session_alive(page)
+        if alive is False:
+            log(f"  🔑 {name}: 会话已失效，签到前先用账密换新 session")
+            if not await renew_session():
+                log(f"  ⚠️ {name}: 账密未能换到新 session，继续用原 cookie 试")
 
     st = await captcha_status_enabled(page, token)
     if st and st.get("checkedInToday"):
@@ -1722,6 +1776,21 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
             reason = (got or {}).get("message") or "接口未返回验证码"
             # 没有会话时这个接口就是这个回话：先试账密自愈，换不到再给出可照做的指引。
             # 换出口 / 重试都没用，所以标不可重试。
+            # 站点新增的来源闸：请求必须"从网站页面发起"（实测认 Origin / Referer）。
+            # 页内 fetch 天然带这两个头，所以走到这里说明页面上下文有问题（例如被甩到
+            # 了别的 origin），换 cookie / 换出口都没用，直接说清是来源问题。
+            if CAPTCHA_NOT_FROM_PAGE_RE.search(str(reason)):
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        f"服务端回「{reason}」：该站要求请求从站点页面发起（认 Origin / "
+                        "Referer）。浏览器通道的页内 fetch 本应自带这两个头，出现这句通常"
+                        "意味着页面被重定向到了别的域名。请确认站点地址填写正确，"
+                        "并检查该站是否改了域名。"
+                    ),
+                }
             if CAPTCHA_NEEDS_SESSION_RE.search(str(reason)):
                 if await renew_session():
                     attempt -= 1  # 换会话不算一次识别机会
@@ -1771,24 +1840,32 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
         log(f"  🧩 {name}: 第 {attempt} 次 OCR={answer} → {verdict} {srv}")
 
         if verdict == "ok":
-            return finish(
-                {
-                    "name": name,
-                    "ok": True,
-                    "message": checkin_message(True, body, res.get("status")),
-                    "raw": body,
-                }
-            )
+            return {
+                "name": name,
+                "ok": True,
+                "message": checkin_message(True, body, res.get("status")),
+                "raw": body,
+            }
         if verdict == "already":
             # 站点先校验验证码再判已签，所以这句本身就是「答案对了」的证据
-            return finish(
-                {
-                    "name": name,
-                    "ok": True,
-                    "message": "今日已签到（服务端在验证码通过后回「今日已签到」）",
-                    "raw": body,
-                }
-            )
+            return {
+                "name": name,
+                "ok": True,
+                "message": "今日已签到（服务端在验证码通过后回「今日已签到」）",
+                "raw": body,
+            }
+        if verdict == "not_from_page":
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"服务端回「{srv or '请从网站页面发起签到'}」：该站要求请求从站点页面"
+                    "发起（认 Origin / Referer）。页内 fetch 本应自带，出现这句通常意味着"
+                    "页面被重定向到了别的域名，请确认站点地址是否正确。"
+                ),
+                "raw": body,
+            }
         if verdict == "no_session":
             if await renew_session():
                 attempt -= 1  # 换会话不算一次识别机会
@@ -1824,6 +1901,23 @@ async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CA
             f"单轮通过率约七成，可调大 CHECKIN_CAPTCHA_ATTEMPTS 再试。"
         ),
     }
+
+
+async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CAPTCHA_ATTEMPTS):
+    """图片验证码签到（对外入口）：跑一遍流程，并把换到的 session 一并回传。
+
+    单独包一层是为了让**所有**返回路径（成功、失败、超预算）都带上新 cookie ——
+    续期成功但这次签到仍失败时（例如验证码连错 6 次），新 session 依然是有效的资产：
+    不回写的话下一次运行又要重新登录一遍。面板侧对 newTokens 的处理与 ok 无关
+    （src/index.js 的 ghResult 分支），所以失败结果带 cookie 也会被写回 KV。
+    """
+    state = {"fresh_cookie": ""}
+    res = await _captcha_checkin_run(page, name, base, token, tz, channel, attempts, state)
+    fresh = state.get("fresh_cookie") or ""
+    if fresh:
+        res["message"] = f"{res.get('message', '')} · 已用账密登录刷新 Cookie"[:300]
+        res["newTokens"] = {"cookie": fresh}
+    return res
 
 
 
