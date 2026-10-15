@@ -49,6 +49,11 @@ def ok(cond, label, extra=""):
         print(f"  \u2717 {label}{' — ' + extra if extra else ''}")
 
 
+def CAPTCHA_VENDORS_HAS_HOSTS(vendor):
+    """该厂商是否配了「失败时要探的域名」（供 [17] 用）。"""
+    return bool(mod.CAPTCHA_VENDORS.get(vendor, {}).get("hosts"))
+
+
 # 星见雅 2026-10-15 的真实 /api/status（只留相关字段）
 XJY_STATUS = {
     "checkin_enabled": True,
@@ -218,6 +223,55 @@ ok(
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")
 i_probe = SOURCE.find("if human_verification_missing(pb):")
 i_unrelated = SOURCE.find("与 Turnstile 无关的失败")
+ok(i_probe > 0, "存在该兜底分支")
+ok(
+    0 < i_probe < i_unrelated,
+    "兜底排在「与 Turnstile 无关的失败」之前 —— 否则「人机验证 token 为空」会被判成"
+    "不可重试，当天直接漏签",
+)
+
+print("\n[16] 组件报错后要 reset 重挂，而不是空等到预算耗尽")
+i_reset = SOURCE.find("await page.evaluate(CAPTCHA_REMOUNT_JS, reset)")
+# 锚点必须用 CAPTCHA 预算那一行：`while time.monotonic() < deadline` 在文件里有多处
+# （wait_any_token 里也有），拿它当锚点会指到别处、断言假失败。
+i_budget = SOURCE.find("deadline = time.monotonic() + RECAPTCHA_BUDGET_S")
+i_state_after = SOURCE.find("state = await page.evaluate(CAPTCHA_STATE_JS, specs)", i_reset)
+ok(i_reset > 0, "存在 reset 重挂")
+ok(
+    0 < i_budget < i_reset < i_state_after,
+    "reset 在等 token 的循环内（组件报错后立刻重挂，不是等超时）",
+)
+ok("error_resets < 3" in SOURCE, "reset 有次数上限（别把预算全烧在重挂上）")
+ok(
+    "api.reset(wid)" in mod.CAPTCHA_REMOUNT_JS and "box.innerHTML = ''" in mod.CAPTCHA_REMOUNT_JS,
+    "重挂前先 reset 并清空容器（hCaptcha 对同一容器重复 render 会抛错）",
+)
+ok(
+    "window.__capWidgets[sp.vendor] = api.render" in mod.CAPTCHA_MOUNT_JS,
+    "存 widgetId（没有它就无法 reset）",
+)
+
+print("\n[17] 失败时要在页面内探可达性（区分「出口连不上」与「浏览器侧被拦」）")
+ok("CAPTCHA_REACH_JS" in SOURCE and "页面内可达性=" in SOURCE, "失败文案带上页面内探测结果")
+ok(
+    "mode: 'no-cors'" in mod.CAPTCHA_REACH_JS,
+    "用 no-cors fetch 探（只看能不能连上，不看响应内容）",
+)
+ok(
+    all(CAPTCHA_VENDORS_HAS_HOSTS(v) for v in ("turnstile", "hcaptcha", "recaptcha")),
+    "三家都配了要探的域名",
+)
+_hc_hosts = mod.CAPTCHA_VENDORS["hcaptcha"]["hosts"]
+ok(
+    "newassets.hcaptcha.com" in _hc_hosts and "api.hcaptcha.com" in _hc_hosts,
+    "hCaptcha 要探三个域名（js=SDK、newassets=勾选框 iframe、api=checksiteconfig）",
+    str(_hc_hosts),
+)
+ok(
+    "hosts" in SOURCE and "CAPTCHA_VENDORS[v[\"vendor\"]].get(\"hosts\", ())" in SOURCE,
+    "只探缺失厂商的域名（已拿到 token 的不白探）",
+)
+
 print("\n[14] 各出口诊断：失败文案要能看出试过哪些出口、各自卡在哪")
 ok(
     mod.attempt_reason("自挂 Turnstile/hCaptcha 组件 90s 内没出 token：缺 hCaptcha（点了 54 次）")

@@ -2306,6 +2306,8 @@ CAPTCHA_VENDORS = {
         "sdk": "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit",
         "sdk_match": "challenges.cloudflare.com",
         "label": "Turnstile",
+        # 失败时要在页面内探可达性的域名（见 CAPTCHA_REACH_JS）
+        "hosts": ("challenges.cloudflare.com",),
     },
     "hcaptcha": {
         "flag": "checkin_hcaptcha_check",
@@ -2314,6 +2316,9 @@ CAPTCHA_VENDORS = {
         "sdk": "https://js.hcaptcha.com/1/api.js?render=explicit",
         "sdk_match": "hcaptcha.com/1/api.js",
         "label": "hCaptcha",
+        # 三个域名缺一不可：js 是 SDK、newassets 是勾选框/challenge iframe、
+        # api 是 checksiteconfig/getcaptcha。只探一个会得出错误结论。
+        "hosts": ("js.hcaptcha.com", "newassets.hcaptcha.com", "api.hcaptcha.com"),
     },
     "recaptcha": {
         "flag": "checkin_recaptcha_check",
@@ -2322,6 +2327,7 @@ CAPTCHA_VENDORS = {
         "sdk": "https://www.google.com/recaptcha/api.js?render=explicit",
         "sdk_match": "recaptcha/api.js",
         "label": "reCAPTCHA",
+        "hosts": ("www.google.com", "www.gstatic.com"),
     },
 }
 
@@ -2413,6 +2419,7 @@ async def read_site_status(page):
 CAPTCHA_MOUNT_JS = """(specs) => {
     if (!window.__capTokens) window.__capTokens = {};
     if (!window.__capErrors) window.__capErrors = {};
+    if (!window.__capWidgets) window.__capWidgets = {};
     const out = { mounted: [], failed: [] };
     for (const sp of specs) {
         if (window.__capTokens[sp.vendor]) { out.mounted.push(sp.vendor); continue; }
@@ -2432,7 +2439,9 @@ CAPTCHA_MOUNT_JS = """(specs) => {
         }
         if (box.dataset.mounted === '1') { out.mounted.push(sp.vendor); continue; }
         try {
-            api.render(box, {
+            // 存 widgetId：hCaptcha 的 iframe 初始化失败（challenge-error）时要 reset 后重挂，
+            // 没有 id 就只能整页重来。
+            window.__capWidgets[sp.vendor] = api.render(box, {
                 sitekey: sp.sitekey,
                 callback: (t) => { window.__capTokens[sp.vendor] = t; },
                 'error-callback': (e) => { window.__capErrors[sp.vendor] = String(e); },
@@ -2447,6 +2456,50 @@ CAPTCHA_MOUNT_JS = """(specs) => {
     }
     return out;
 }"""
+
+# 重置并清空某几家的容器，好让下一轮 MOUNT_JS 重新 render。
+# 为什么要 reset 而不是只清 DOM：hCaptcha 的 render 对同一容器重复调用会抛错，
+# 而它的内部状态（已初始化的 iframe、已消耗的 challenge）也要一并丢掉。
+CAPTCHA_REMOUNT_JS = """(specs) => {
+    const cleared = [];
+    for (const sp of specs) {
+        const api = window[sp.global];
+        const wid = (window.__capWidgets || {})[sp.vendor];
+        try {
+            if (api && typeof api.reset === 'function' && wid !== undefined && wid !== null) {
+                api.reset(wid);
+            }
+        } catch (e) {}
+        const box = document.getElementById('self-cap-' + sp.vendor);
+        if (box) { box.dataset.mounted = ''; box.innerHTML = ''; }
+        if (window.__capTokens) delete window.__capTokens[sp.vendor];
+        if (window.__capErrors) delete window.__capErrors[sp.vendor];
+        if (window.__capWidgets) delete window.__capWidgets[sp.vendor];
+        cleared.push(sp.vendor);
+    }
+    return cleared;
+}"""
+
+# 失败时在**页面内**探一遍验证码厂商的域名可达性。
+# 为什么非要在页面里探：GHA 上的失败是「iframe 初始化超时 / API 请求失败」，
+# 而这类失败既可能是出口连不上，也可能是浏览器侧被拦（CSP、代理只对部分请求生效）。
+# 从 Python 侧用裸 socket 探只能证明「出口能连」，不能证明「浏览器能连」——
+# 2026-10-15 星见雅就是裸 socket 全通、浏览器里 hCaptcha 始终初始化失败。
+CAPTCHA_REACH_JS = """async (hosts) => {
+    const out = {};
+    for (const h of hosts) {
+        const url = 'https://' + h + '/';
+        const t0 = Date.now();
+        try {
+            await fetch(url, { mode: 'no-cors', cache: 'no-store' });
+            out[h] = 'ok ' + (Date.now() - t0) + 'ms';
+        } catch (e) {
+            out[h] = 'FAIL ' + String((e && e.message) || e).slice(0, 60);
+        }
+    }
+    return out;
+}"""
+
 
 # 补 SDK：只补缺的那几家。hCaptcha 对 createElement 注入的脚本照样能用（2026-09-27 实测）。
 CAPTCHA_INJECT_JS = """(specs) => {
@@ -2634,6 +2687,7 @@ async def selfmounted_captcha_checkin(
     tokens = {}
     clicks = 0
     rebuilds = 0
+    error_resets = 0
     state = {}
     while time.monotonic() < deadline:
         await page.wait_for_timeout(1500)
@@ -2641,8 +2695,10 @@ async def selfmounted_captcha_checkin(
         tokens = state.get("tokens") or {}
         if all(tokens.get(v["vendor"]) for v in vendors):
             break
+        errs = state.get("errors") or {}
         # 哪家的全局 API 或 iframe 没了就补哪家（不整批重挂，避免把已拿到的 token 弄丢）
         need = []
+        reset = []
         for sp in specs:
             if tokens.get(sp["vendor"]):
                 continue
@@ -2651,6 +2707,23 @@ async def selfmounted_captcha_checkin(
                 need.append(sp)
             elif not (state.get("iframes") or {}).get(sp["vendor"]):
                 need.append(sp)
+            elif errs.get(sp["vendor"]):
+                # 组件自己报了错（hCaptcha 的 network-error / challenge-error 就是
+                # 「iframe 初始化失败」）→ 光等不会好，reset 后重挂一次。
+                # 2026-10-15 星见雅实测：不 reset 的话组件报错后一直不出 token，
+                # 90s 预算全烧在空等上。
+                reset.append(sp)
+        if reset and error_resets < 3:
+            error_resets += 1
+            log(
+                f"  ♻️ {name}: 组件报错（{[sp['vendor'] + '=' + str(errs.get(sp['vendor']))[:40] for sp in reset]}），"
+                f"reset 后重挂（第 {error_resets} 次）"
+            )
+            await page.evaluate(CAPTCHA_REMOUNT_JS, reset)
+            await page.wait_for_timeout(1500)
+            await page.evaluate(CAPTCHA_INJECT_JS, reset)
+            await page.evaluate(CAPTCHA_MOUNT_JS, reset)
+            need = []
         if need:
             rebuilds += 1
             if rebuilds <= 3:
@@ -2670,16 +2743,38 @@ async def selfmounted_captcha_checkin(
     missing = [v["label"] for v in vendors if not tokens.get(v["vendor"])]
     if missing:
         errs = state.get("errors") or {}
+        # 在**页面内**探一遍缺失厂商的域名可达性，把结果写进文案。
+        # 只有这样才能区分「出口连不上」与「浏览器侧被拦」：Python 侧裸 socket 探通
+        # 不代表浏览器能加载（2026-10-15 星见雅就是裸 socket 全通、浏览器里 hCaptcha
+        # 始终初始化失败，光看「组件报错=network-error」无从判断）。
+        reach = {}
+        probe_hosts = sorted(
+            {
+                h
+                for v in vendors
+                if not tokens.get(v["vendor"])
+                for h in CAPTCHA_VENDORS[v["vendor"]].get("hosts", ())
+            }
+        )
+        if probe_hosts:
+            try:
+                reach = await asyncio.wait_for(
+                    page.evaluate(CAPTCHA_REACH_JS, probe_hosts), timeout=40
+                )
+            except Exception as e:  # noqa: BLE001
+                reach = {"(探测失败)": str(e)[:60]}
         return {
             "name": name,
             "ok": False,
             "message": (
                 f"自挂 {labels} 组件 {RECAPTCHA_BUDGET_S}s 内没出 token："
-                f"缺 {'/'.join(missing)}（点了 {clicks} 次、重建 {rebuilds} 次，"
-                f"组件报错={errs}）。重建次数>0 多半是站点页面在重渲染（ErrorBoundary）"
-                "把组件清掉了；重建 0 次仍失败则多半是弹了图片题或该出口 IP 被判高风险"
-                "（Cloudflare 对机房 IP 常静默不签发挑战，需要住宅代理）"
-            )[:300],
+                f"缺 {'/'.join(missing)}（点了 {clicks} 次、重建 {rebuilds} 次、"
+                f"报错重置 {error_resets} 次，组件报错={errs}）。"
+                f"页面内可达性={reach}。"
+                "若可达性全 FAIL 则是出口/浏览器拦了验证码域名（换住宅出口）；"
+                "若可达性 ok 但组件仍报 challenge-error，说明 iframe 能连上却没初始化，"
+                "多半是该出口被 hCaptcha 判为高风险（换出口再试）"
+            )[:700],
         }
 
     got = {v["vendor"]: tokens[v["vendor"]] for v in vendors}
