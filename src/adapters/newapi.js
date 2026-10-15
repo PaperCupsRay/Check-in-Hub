@@ -298,6 +298,37 @@ function recaptchaRejected(data) {
   if (!/recaptcha|g-recaptcha/i.test(raw)) return false;
   return !/<!doctype html|<html[\s>]/i.test(raw);
 }
+/**
+ * 站点自己加了一层图片验证码时的拒绝判定（jianzhile.vip 这类 NewAPI 定制版）。
+ *
+ * 与 Turnstile / reCAPTCHA 都不同：这层是站点后端自己实现的图形验证码，既不挂
+ * Cloudflare 组件、也不挂 Google 组件，所以「自挂组件拿 token」「点站点勾选框」
+ * 两条路都走不通 —— 唯一的解法是取图 → OCR → 带 captcha_id 提交，见
+ * scripts/browser-checkin.py 的 captcha_checkin()。
+ *
+ * 2026-10-15 在 jianzhile.vip 实测（NewAPI local-0.0.29）：
+ *   · /api/status 的 turnstile_check 是 false，站点前端也看不到任何验证码组件；
+ *   · 但 /api/user/checkin 的状态回话里有 captcha_enabled: true；
+ *   · 签到接口**只认浏览器会话**：带访问令牌（Bearer + New-Api-User）一律回
+ *     「请打开网站后再签到」，换成 session cookie 立刻返回验证码图片；
+ *   · 状态查询两种凭证都认 —— 所以「状态查得到、签到报请打开网站」正是这道闸门的
+ *     特征，不是令牌过期，别去引导用户重新生成访问令牌。
+ */
+function captchaRejected(data) {
+  const raw = responseTextHint(data);
+  if (/<!doctype html|<html[\s>]/i.test(raw)) return false;
+  return /请打开网站后再签到|请输入验证码|验证码错误|验证码不正确|验证码已失效|请刷新后重试/.test(
+    raw
+  );
+}
+
+const CAPTCHA_GUIDE =
+  "该站在签到接口上自己加了一层图片验证码（/api/user/checkin 的状态回话里 " +
+  "captcha_enabled=true），纯 HTTP 通道产不出答案，且该接口只认浏览器会话、" +
+  "不认访问令牌。已转 GitHub Actions · 浏览器通道：脚本会在页面上下文里取验证码图片、" +
+  "OCR 识别后带 captcha_id 提交，答错自动换一张重试。注意该站的 Cookie 栏必须填" +
+  "浏览器里已登录的 session（访问令牌对签到接口无效，状态查询仍可用）。";
+
 
 const RECAPTCHA_GUIDE =
   "该站用 Google reCAPTCHA v2 保护签到，纯 HTTP 通道产不出 token：必须真实浏览器点一次" +
@@ -353,6 +384,12 @@ function httpErrorMessage(action, res) {
   // 引导去重配凭证。
   if (recaptchaRejected(data)) {
     return `${serverMsg || "reCAPTCHA 校验未通过"} · ${RECAPTCHA_GUIDE}`;
+  }
+  // 图片验证码同样要排在鉴权/CF 分支前面：它的回话是「请打开网站后再签到」，
+  // 而那句话看着像凭证问题，实际是站点在要求浏览器会话 + 图形验证码。
+  // 排后面会被 needsAccessTokenHint 或 CF 分支抢走，把用户引向重配令牌。
+  if (captchaRejected(data)) {
+    return `${serverMsg || "需要图片验证码"} · ${CAPTCHA_GUIDE}`;
   }
   // 再判鉴权：应用层返回的 JSON 401 是凭证问题，跟 Cloudflare 无关，
   // 否则会被下面的 CF 分支误报成「出口 IP 不匹配」。
@@ -438,6 +475,9 @@ function normalizeStatus(payload) {
     minQuota: d.min_quota ?? null,
     maxQuota: d.max_quota ?? null,
     month: d.month || null,
+    // 站点自己加的图片验证码开关（jianzhile.vip 实测有）。带上它，日志/面板才能
+    // 一眼看出「签到要过图形验证码」，而不是把它当成凭证或 CF 问题。
+    captchaEnabled: d.captcha_enabled === true,
     raw: d,
   };
 }
@@ -929,10 +969,10 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
-        // reCAPTCHA v2 换出口无解：纯 HTTP 通道无论从 Worker 还是 GHA 发出都拿不到
-        // token，标 needsBrowser 让 src/index.js 直接分发到 gha_browser，
-        // 省掉一次注定失败的 gha_api 运行。
-        ...(recaptchaRejected(data) ? { needsBrowser: true } : {}),
+        // reCAPTCHA v2 / 图片验证码换出口都无解：纯 HTTP 通道无论从 Worker 还是
+        // GHA 发出都产不出答案，标 needsBrowser 让 src/index.js 直接分发到
+        // gha_browser，省掉一次注定失败的 gha_api 运行。
+        ...(recaptchaRejected(data) || captchaRejected(data) ? { needsBrowser: true } : {}),
         result: normalized,
         status: preStatus,
         raw: data,
@@ -945,7 +985,7 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
-        ...(recaptchaRejected(data) ? { needsBrowser: true } : {}),
+        ...(recaptchaRejected(data) || captchaRejected(data) ? { needsBrowser: true } : {}),
         result: normalized,
         status: preStatus,
         raw: data,

@@ -26,9 +26,12 @@
 """
 
 import asyncio
+import base64
+import contextlib
 import contextlib
 import contextlib
 import datetime
+import io
 import json
 import os
 import re
@@ -1365,6 +1368,420 @@ async def inpage_checkin(page, token, ts_token):
         }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
         [ts_token, auth],
     )
+# ---------------- NewAPI 图片验证码闸门 ----------------
+#
+# 站点：jianzhile.vip（NewAPI local-0.0.29 定制版）。2026-10-15 实测：
+#
+#   · /api/status 的 turnstile_check 是 false，但 /api/user/checkin 的回话里有
+#     captcha_enabled: true —— 这是站点自己加的一层图片验证码，与 Turnstile /
+#     reCAPTCHA 完全无关，所以既不能自挂组件，也不能靠点勾选框。
+#   · 流程（站点前端 bundle 实测）：
+#       POST /api/user/checkin/captcha → {captcha_id, captcha_image: "data:image/png;base64,…"}
+#       POST /api/user/checkin         → {captcha_id, captcha_answer}
+#   · **签到接口只认浏览器会话**：带访问令牌（Bearer + New-Api-User）一律回
+#     「请打开网站后再签到」；同一请求换成 session cookie 立刻返回验证码图片。
+#     而状态查询两种凭证都认 —— 所以「状态查得到、签到报请打开网站」正是这个闸门的
+#     特征，不是凭证过期，别去引导用户重配访问令牌。
+#   · 回话判据（逐条实测）：
+#       答对且未签     → success:true + data.quota_awarded / checkin_date
+#       答对但今天已签 → success:false +「今日已签到」
+#                        （**验证码先于已签判定**，所以这句反过来证明答案是**对的**，
+#                          不能当成失败，否则重试会一直烧到预算用尽）
+#       答错           → 「验证码错误，请重试」
+#       id 过期/复用   → 「验证码已失效，请刷新后重试」
+#       没带验证码     → 「请输入验证码」
+#       没有会话       → 「请打开网站后再签到」
+#   · 服务端**区分大小写**：同一答案原样提交 9/12 通过、翻转大小写 0/12 通过（实测）。
+#     所以 OCR 的大小写不能归一化，只能靠重试。
+#
+# 识别率与重试：本机实测单轮通过率约 70–75%（每次取新验证码独立重试），
+# 六次尝试的失败概率约 0.3^6 ≈ 0.07%，对每日签到足够。
+
+CAPTCHA_ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+CAPTCHA_BG = (252, 250, 248)  # 画布背景（BGR）
+CAPTCHA_CELL_X0 = 16  # 第一个字形左边界
+CAPTCHA_CELL_W = 26  # 字形间距
+CAPTCHA_CELLS = 5  # 字形个数
+CAPTCHA_ATTEMPTS = int(os.environ.get("CHECKIN_CAPTCHA_ATTEMPTS") or 6)
+# 字形笔画距背景 427..670；干扰色带只有 146..247。阈值取在两者之间。
+CAPTCHA_INK_THRESH = 320
+# 单字裁剪的预处理：(pad, scale)。这三个是离线基准里唯一不拖后腿的组合 ——
+# 把 colour / gray / pad20_s2 之类混进置信度竞争会让整串准确率下降
+# （读错的字可以带着更高的置信度压过读对的字）。
+CAPTCHA_VARIANTS = ((10, 3), (10, 1), (4, 4))
+
+CAPTCHA_WRONG_RE = re.compile(r"验证码错误|验证码不正确|验证码有误")
+CAPTCHA_EXPIRED_RE = re.compile(r"验证码已失效|请刷新后重试|验证码过期")
+CAPTCHA_MISSING_RE = re.compile(r"请输入验证码")
+CAPTCHA_NEEDS_SESSION_RE = re.compile(r"请打开网站后再签到|请打开网站")
+
+
+def classify_captcha_reply(body, status):
+    """把签到回话归到一个动作上：ok / already / wrong / expired / missing /
+    no_session / other。
+
+    提成纯函数是为了能离线回归（scripts/test-captcha.py）—— 判据错一个方向就有代价：
+    把「今日已签到」当成失败会无限重试烧光预算，把「验证码错误」当成成功会让用户
+    以为签上了。注意「今日已签到」必须排在「验证码错误」之前判：站点是先校验验证码、
+    再判是否已签，所以这句只会在答案正确时出现。
+    """
+    if not isinstance(body, dict):
+        return "other"
+    msg = str(body.get("message") or "")
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    if status == 200 and body.get("success") is True:
+        return "ok"
+    if ALREADY_RE.search(msg) or data.get("already_checked_in") is True:
+        return "already"
+    if CAPTCHA_EXPIRED_RE.search(msg):
+        return "expired"
+    if CAPTCHA_WRONG_RE.search(msg):
+        return "wrong"
+    if CAPTCHA_MISSING_RE.search(msg):
+        return "missing"
+    if CAPTCHA_NEEDS_SESSION_RE.search(msg):
+        return "no_session"
+    return "other"
+
+
+def _captcha_deps():
+    """按需导入 OCR 依赖，缺了就给一句能照做的提示，而不是 ImportError 堆栈。"""
+    try:
+        import cv2  # noqa: PLC0415
+        import ddddocr  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+        from PIL import Image  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        return None, (
+            f"缺少图片验证码识别依赖（{e}）。浏览器通道需要 ddddocr + opencv-python + "
+            f"pillow + numpy：pip install ddddocr opencv-python pillow numpy"
+        )
+    return (cv2, ddddocr, np, Image), ""
+
+
+_CAPTCHA_OCR = None
+
+
+def _captcha_ocr():
+    """进程内复用同一个 ddddocr 实例（模型加载要几百毫秒，别每次签到都重来）。"""
+    global _CAPTCHA_OCR
+    if _CAPTCHA_OCR is None:
+        deps, err = _captcha_deps()
+        if deps is None:
+            raise RuntimeError(err)
+        ocr = deps[1].DdddOcr(show_ad=False)
+        # 收窄到字母数字：默认字符集含几千个汉字，本验证码只出 alnum，
+        # 放开会让 ddddocr 把 'b' 读成「日」这类形近字（实测）。
+        ocr.set_ranges(CAPTCHA_ALNUM)
+        _CAPTCHA_OCR = ocr
+    return _CAPTCHA_OCR
+
+
+def captcha_cell_masks(bgr, np):
+    """把验证码切成 5 个字形掩码，返回长度 5 的列表（读不出字形的位为 None）。
+
+    单独提出来是为了能离线回归（scripts/test-captcha.py 用合成图测几何）：
+    ddddocr 装不上时也要能验证"切分对不对"，因为切错位是整串必错的原因。
+
+    版面实测（jianzhile.vip，2026-10-15）：
+      · 画布 160x58，背景 BGR (252,250,248)；
+      · 一条浅色干扰色带横穿整幅，距背景仅 146..247 —— 阈值必须高于它；
+      · 5 个字形落在 x = 16 + 26*i，每个约 12x18，笔画距背景 427..670。
+    按固定网格切而不是按连通域/颜色聚类：连通域会被色带切断（一个字形裂成两三块），
+    颜色聚类会把两种偏红的字形并成一簇（实测距离只有 126），两者都会少字。
+    """
+    bg = np.array(CAPTCHA_BG, dtype=int)
+    height, width = bgr.shape[:2]
+    out = []
+    for i in range(CAPTCHA_CELLS):
+        x0 = CAPTCHA_CELL_X0 + CAPTCHA_CELL_W * i
+        sub = bgr[:, x0 : min(width, x0 + CAPTCHA_CELL_W)]
+        dist = np.abs(sub.astype(int) - bg).sum(axis=2)
+        mask = (dist > CAPTCHA_INK_THRESH).astype(np.uint8)
+        ys, xs = np.nonzero(mask)
+        # 太少的像素不是字形（多半是色带残渣）
+        if len(xs) < 15:
+            out.append(None)
+            continue
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        xa, xb = int(xs.min()), int(xs.max()) + 1
+        # 尺寸不合理时同样放弃：宁可留 '?' 让上层换一张图，也别把残渣当字读
+        if not (6 <= (y1 - y0) <= 34 and 4 <= (xb - xa) <= 24):
+            out.append(None)
+            continue
+        out.append(mask[y0:y1, xa:xb])
+    return out
+
+
+def solve_image_captcha(png_bytes):
+    """识别 5 位图片验证码，返回字符串（读不出的位留 '?'）。
+
+    版面是固定的，按固定网格切比按连通域切稳：
+      · 画布 160x58，背景 BGR (252,250,248)；
+      · 一条浅色干扰色带（距背景 146..247）横穿整幅，必须靠阈值滤掉；
+      · 5 个字形落在 x = 16 + 26*i，每个约 12x18，笔画距背景 427..670。
+    曾经试过按字形颜色聚类切分：每个字形确实各用一种饱和色，但两种偏红的颜色
+    距离只有 126，会被并成一个簇（整串少一位），所以改用固定网格。
+
+    每个字格跑 CAPTCHA_VARIANTS 里的几种预处理，取置信度最高的那个读数 ——
+    比多数投票更准：变体之间经常只有 2:1 的分歧，而对的那个置信度明显更高。
+    """
+    deps, err = _captcha_deps()
+    if deps is None:
+        raise RuntimeError(err)
+    cv2, _ddddocr, np, Image = deps
+    ocr = _captcha_ocr()
+
+    img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return ""
+    bgr = img[:, :, :3]
+    chars = []
+    for crop in captcha_cell_masks(bgr, np):
+        if crop is None:
+            chars.append("?")
+            continue
+        binary = np.full((*crop.shape, 3), 255, np.uint8)
+        binary[crop == 1] = (0, 0, 0)
+
+        best, best_conf = "", 0.0
+        for pad, scale in CAPTCHA_VARIANTS:
+            canvas = cv2.copyMakeBorder(
+                binary, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+            )
+            canvas = cv2.resize(
+                canvas,
+                (canvas.shape[1] * scale, canvas.shape[0] * scale),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+            buf = io.BytesIO()
+            Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)).save(buf, format="PNG")
+            try:
+                read = ocr.classification(buf.getvalue(), probability=True)
+            except Exception:  # noqa: BLE001
+                continue
+            text = (read or {}).get("text") or ""
+            if len(text) != 1:
+                continue
+            conf = 1.0
+            try:
+                for pos in (read or {}).get("probabilities") or []:
+                    conf *= float(np.asarray(pos, dtype=float).max())
+            except Exception:  # noqa: BLE001
+                conf = 0.5
+            if conf > best_conf:
+                best, best_conf = text, conf
+        chars.append(best or "?")
+    return "".join(chars)
+
+
+async def captcha_status_enabled(page, token):
+    """读 /api/user/checkin?month= 的 captcha_enabled，判断站点是否开了图片验证码。
+
+    用状态接口而不是"先空手 POST 一枪看回话"：状态查询是只读的、不消耗验证码，
+    也不会在站点留下一次失败记录。读不到时返回 None（未知），由调用方决定怎么办。
+    """
+    headers_js = auth_headers_js(token)
+    try:
+        got = await asyncio.wait_for(
+            page.evaluate(
+                ("""async (headersJs) => {
+                    MERGE_AUTH
+                    const month = new Date().toISOString().slice(0, 7);
+                    const res = await fetch('/api/user/checkin?month=' + month, {
+                        credentials: 'include', headers: __h,
+                    });
+                    let b = null; try { b = await res.json(); } catch (e) {}
+                    const d = (b && b.data) || {};
+                    return {
+                        status: res.status,
+                        enabled: !!d.enabled,
+                        captcha: d.captcha_enabled === true,
+                        checkedInToday: !!(d.stats && d.stats.checked_in_today),
+                        message: (b && b.message) || '',
+                    };
+                }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
+                headers_js,
+            ),
+            timeout=STATUS_QUERY_TIMEOUT_S,
+        )
+        return got if isinstance(got, dict) else None
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ 验证码状态查询失败: {str(e)[:100]}")
+        return None
+
+
+async def fetch_captcha(page, token):
+    """页内 POST /api/user/checkin/captcha，返回 {captcha_id, captcha_image} 或 None。"""
+    headers_js = auth_headers_js(token)
+    try:
+        got = await asyncio.wait_for(
+            page.evaluate(
+                ("""async (headersJs) => {
+                    MERGE_AUTH
+                    const res = await fetch('/api/user/checkin/captcha', {
+                        method: 'POST', credentials: 'include', headers: __h,
+                    });
+                    let b = null; try { b = await res.json(); } catch (e) {}
+                    const d = (b && b.data) || {};
+                    return {
+                        status: res.status,
+                        success: !!(b && b.success),
+                        message: (b && b.message) || '',
+                        captcha_id: d.captcha_id || '',
+                        captcha_image: d.captcha_image || '',
+                    };
+                }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
+                headers_js,
+            ),
+            timeout=STATUS_QUERY_TIMEOUT_S,
+        )
+        return got if isinstance(got, dict) else None
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠️ 取验证码失败: {str(e)[:100]}")
+        return None
+
+
+async def submit_captcha(page, token, captcha_id, answer):
+    """页内 POST /api/user/checkin {captcha_id, captcha_answer}，返回 {status, body}。"""
+    headers_js = auth_headers_js(token)
+    return await page.evaluate(
+        ("""async ([cid, ans, headersJs]) => {
+            MERGE_AUTH
+            const res = await fetch('/api/user/checkin', {
+                method: 'POST', credentials: 'include',
+                headers: { ...__h, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ captcha_id: cid, captcha_answer: ans }),
+            });
+            let body = null; try { body = await res.json(); } catch (e) {}
+            return { status: res.status, body };
+        }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
+        [captcha_id, answer, headers_js],
+    )
+
+
+async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS):
+    """图片验证码签到：取图 → OCR → 提交，答错就换一张重来。
+
+    为什么要重试而不是一次定生死：单轮识别率实测约 70–75%，每次都是独立的新验证码，
+    六次的失败概率约 0.07%。重试的代价只有一次 HTTP 往返（~1.5s），远低于换代理重试。
+
+    为什么要先 GET 一次状态：站点是「验证码先校验、再判是否已签」，所以已经签过的
+    日子答对也会回「今日已签到」。先查状态就能在已签时直接返回，省掉取图 + OCR，
+    也避免把「今日已签到」误读成需要重试。
+    """
+    deps, err = _captcha_deps()
+    if deps is None:
+        return {"name": name, "ok": False, "retryable": False, "message": err}
+
+    st = await captcha_status_enabled(page, token)
+    if st and st.get("checkedInToday"):
+        return {
+            "name": name,
+            "ok": True,
+            "message": "今日已签到（状态查询确认，未消耗验证码）",
+        }
+
+    last_msg = ""
+    for attempt in range(1, attempts + 1):
+        got = await fetch_captcha(page, token)
+        if not got or not got.get("captcha_id") or not got.get("captcha_image"):
+            reason = (got or {}).get("message") or "接口未返回验证码"
+            # 没有会话时这个接口就是这个回话：说明渠道缺 session cookie，
+            # 换出口 / 重试都没用，直接给出可照做的指引。
+            if CAPTCHA_NEEDS_SESSION_RE.search(str(reason)):
+                return {
+                    "name": name,
+                    "ok": False,
+                    "retryable": False,
+                    "message": (
+                        "签到接口要求浏览器会话，但渠道里没有可用的 session cookie，"
+                        "服务端回「请打开网站后再签到」。请在该渠道的 Cookie 栏粘贴浏览器里"
+                        "已登录的 session（F12 → Application → Cookies）；访问令牌对签到接口"
+                        "无效（状态查询仍可用）。"
+                    ),
+                }
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": f"取验证码失败：{reason}",
+            }
+
+        cid = got["captcha_id"]
+        raw_b64 = str(got["captcha_image"]).split(",", 1)[-1]
+        try:
+            png = base64.b64decode(raw_b64)
+        except Exception as e:  # noqa: BLE001
+            return {"name": name, "ok": False, "retryable": False, "message": f"验证码图片解码失败：{e}"}
+        try:
+            answer = solve_image_captcha(png)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": f"验证码识别失败：{str(e)[:160]}",
+            }
+        if "?" in answer:
+            # 有字格没读出东西，这一枪必错，别浪费一次提交
+            log(f"  🔁 {name}: 第 {attempt} 次识别不完整（{answer}），换一张")
+            continue
+
+        res = await submit_captcha(page, token, cid, answer)
+        body = res.get("body") if isinstance(res, dict) else None
+        verdict = classify_captcha_reply(body, (res or {}).get("status"))
+        srv = str((body or {}).get("message") or "")[:80]
+        log(f"  🧩 {name}: 第 {attempt} 次 OCR={answer} → {verdict} {srv}")
+
+        if verdict == "ok":
+            return {
+                "name": name,
+                "ok": True,
+                "message": checkin_message(True, body, res.get("status")),
+                "raw": body,
+            }
+        if verdict == "already":
+            # 站点先校验验证码再判已签，所以这句本身就是「答案对了」的证据
+            return {
+                "name": name,
+                "ok": True,
+                "message": "今日已签到（服务端在验证码通过后回「今日已签到」）",
+                "raw": body,
+            }
+        if verdict in ("wrong", "expired", "missing"):
+            last_msg = srv or verdict
+            continue
+        if verdict == "no_session":
+            return {
+                "name": name,
+                "ok": False,
+                "retryable": False,
+                "message": (
+                    f"服务端回「{srv or '请打开网站后再签到'}」：渠道里的 session cookie "
+                    "无效或已过期，请重新从浏览器复制 session 后更新该渠道。"
+                ),
+            }
+        return {
+            "name": name,
+            "ok": False,
+            "retryable": False,
+            "message": f"签到未成功：{srv or verdict}",
+            "raw": body,
+        }
+
+    return {
+        "name": name,
+        "ok": False,
+        # 识别率问题换出口没用，标不可重试，免得把 job 预算烧在换代理上
+        "retryable": False,
+        "message": (
+            f"验证码连续 {attempts} 次识别 / 提交未通过（最后一次：{last_msg or '验证码错误'}）。"
+            f"单轮通过率约七成，可调大 CHECKIN_CAPTCHA_ATTEMPTS 再试。"
+        ),
+    }
+
+
 
 
 async def attach_quota(page, result, token):
@@ -2102,6 +2519,24 @@ async def checkin_one(channel, proxy=None) -> dict:
             )
 
         await seed_localstorage_auth(page, token, user_id)
+        # 图片验证码闸门（jianzhile.vip 这类 NewAPI 定制站）必须排在 Turnstile 前面：
+        # 它们的 /api/status 里 turnstile_check 是 false，下面那套自挂组件 + 空 token
+        # 探针在它们身上只会白等 45s，最后把「请打开网站后再签到」当成不可重试的失败。
+        # 判据取 /api/user/checkin 状态里的 captcha_enabled —— 只读、不消耗验证码。
+        # 渠道可用 options.captchaCheckin 显式覆盖（true 强制走、false 强制跳过）。
+        captcha_hint = (channel.get("options") or {}).get("captchaCheckin")
+        if captcha_hint is not True:
+            cst = await captcha_status_enabled(page, token)
+            want_captcha = bool(cst and cst.get("captcha"))
+            if captcha_hint is False:
+                want_captcha = False
+            if want_captcha:
+                log(f"  🔐 {name}: 站点启用了签到图片验证码，走验证码通道（最多 {CAPTCHA_ATTEMPTS} 次）")
+                res = await captcha_checkin(page, name, base, token, tz)
+                if res.get("ok"):
+                    await attach_quota(page, res, token)
+                return res
+
 
         # 站点用 Google reCAPTCHA 时必须在这里分流。下面的 Turnstile 流程会先自挂
         # 组件死等 TOKEN_WAIT_S(45s) 才去探针，而 reCAPTCHA 站上 Turnstile 组件永远
@@ -2249,6 +2684,23 @@ async def checkin_one(channel, proxy=None) -> dict:
             if re.search(r"recaptcha|g-recaptcha", pmsg + str(pb)[:200], re.I):
                 log(f"  🧩 {name}: 探针回话点名 reCAPTCHA，改走站点 UI 驱动")
                 return await recaptcha_site_ui_checkin(page, name, base, token, tz)
+            # 兜底：状态查询没看出 captcha_enabled（例如渠道缺 session，状态接口直接
+            # 401），但空 token POST 的回话点名了验证码 —— 仍然按图片验证码站处理。
+            # 「请打开网站后再签到」也要认：它就是本站缺会话时签到接口的固定话术，
+            # 而它不含「验证码」二字，不显式匹配就会掉进下面「与 Turnstile 无关」的
+            # 分支被判成不可重试，当天直接漏签。
+            if (
+                re.search(r"验证码", pmsg)
+                or CAPTCHA_NEEDS_SESSION_RE.search(pmsg)
+                or CAPTCHA_WRONG_RE.search(pmsg)
+                or CAPTCHA_EXPIRED_RE.search(pmsg)
+            ):
+                log(f"  🔐 {name}: 探针回话点名图片验证码，改走验证码通道")
+                res = await captcha_checkin(page, name, base, token, tz)
+                if res.get("ok"):
+                    await attach_quota(page, res, token)
+                return res
+
             if not re.search(r"turnstile|challenge|人机|校验|验证", pmsg + str(pb)[:200], re.I):
                 # 与 Turnstile 无关的失败：站点不会因此挂 widget，别再白等几十秒。
                 # 也显式标不可重试 —— 额度/凭证/风控类拒绝换出口没用，而每次尝试要烧

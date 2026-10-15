@@ -236,6 +236,105 @@ await scenario(
   }
 );
 
+// 9b) 站点自建图片验证码（jianzhile.vip）：同样是「HTTP 200 + success:false」，
+//     但解法既不是自挂 Turnstile 组件、也不是点 reCAPTCHA 勾选框 —— 只能取图 OCR
+//     再带 captcha_id 提交。最容易踩的坑有两个：
+//       ① 不标 needsBrowser → 被丢进 gha_api 再失败一次（纯 HTTP 换出口无解）；
+//       ② 把「请打开网站后再签到」当成访问令牌过期 → 引导用户去重新生成令牌，
+//          而真正缺的是 session cookie（该接口只认会话，不认令牌）。
+const CAPTCHA_CHANNEL = {
+  id: "ch_captcha",
+  name: "简直了",
+  type: "newapi",
+  baseUrl: "https://jianzhile.vip",
+  enabled: true,
+  // 占位凭据：这里只需要"有值"以复现带令牌请求的形态，别把真令牌写进仓库
+  auth: { userId: "25341", token: "FAKE_ACCESS_TOKEN_FOR_TEST" },
+  options: {},
+};
+await scenario(
+  "图片验证码站拒绝签到 → 标 needsBrowser 并降级浏览器通道",
+  {
+    channel: CAPTCHA_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, {
+          success: true,
+          data: {
+            enabled: true,
+            captcha_enabled: true,
+            min_quota: 5000000,
+            max_quota: 5000000,
+            stats: { checked_in_today: false, checkin_count: 3, records: [] },
+          },
+        }),
+      // 2026-10-15 实测：带访问令牌调签到接口就是这个回话
+      checkinNewapi: () => json(200, { success: false, message: "请打开网站后再签到" }),
+    },
+  },
+  ({ result, via, payloads }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+    check("文案点名图片验证码", /图片验证码/.test(result.message || ""), result.message);
+    check(
+      "文案说明需要 session cookie（别把人引去重配访问令牌）",
+      /session/.test(result.message || ""),
+      result.message
+    );
+    check("dispatch 走浏览器通道", JSON.stringify(payloads[0]?.runners) === '["gha_browser"]');
+  }
+);
+
+// 9c) 答错验证码的回话同样是「HTTP 200 + success:false」，也必须走浏览器通道
+await scenario(
+  "验证码答错 → 同样标 needsBrowser",
+  {
+    channel: CAPTCHA_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, { success: true, data: { enabled: true, captcha_enabled: true, stats: { checked_in_today: false } } }),
+      checkinNewapi: () => json(200, { success: false, message: "验证码错误，请重试" }),
+    },
+  },
+  ({ result, via }) => {
+    check("降级到 gha_browser", via === "gha_browser", `via=${via}`);
+    check("结果标 needsBrowser", result.needsBrowser === true);
+  }
+);
+
+// 9d) 状态查询说今天已签 → 必须直接成功返回，不再 POST（该站签到 POST 会消耗验证码，
+//     而且「今日已签到」在答对时也会出现，重复 POST 只会把预算烧在 OCR 上）
+await scenario(
+  "图片验证码站今日已签 → 状态查询即结论，不发起 POST",
+  {
+    channel: CAPTCHA_CHANNEL,
+    fetch: {
+      checkinStatusNewapi: () =>
+        json(200, {
+          success: true,
+          data: {
+            enabled: true,
+            captcha_enabled: true,
+            stats: {
+              checked_in_today: true,
+              checkin_count: 4,
+              records: [{ checkin_date: "2026-10-15", quota_awarded: 5000000 }],
+            },
+          },
+        }),
+      checkinNewapi: () => {
+        throw new Error("不该发起签到 POST");
+      },
+    },
+  },
+  ({ result, via, calls }) => {
+    check("worker 直接成功", result.ok === true && via === "worker", `via=${via}`);
+    check("未发起签到 POST", !calls.some((c) => c.url.includes("/api/user/checkin") && !c.url.includes("month=")));
+    check("文案带上今日奖励", /\$10/.test(result.message || ""), result.message);
+  }
+);
+
+
 // 10) cookie 栏有值但不含 session（多租户面板的 server_name_session 之类）+ 配了账密
 //     → ensureSession 必须用账密换一个，而不是直接信任那个无效 cookie。
 //     线上踩过：星见雅的 cookie 看着有值，实则 /api/user/self 直接 401。

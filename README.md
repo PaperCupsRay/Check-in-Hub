@@ -82,7 +82,7 @@ cp .dev.vars.example .dev.vars
 | 类型 | 样例站点 | 鉴权 | 签到方式 |
 |------|----------|------|----------|
 | `sub2api` | Sub2API 系站点 | Bearer JWT | `POST /api/v1/check-in` |
-| `newapi` | NewAPI / OneAPI 系 | Cookie + `New-Api-User` | `POST /api/user/checkin` |
+| `newapi` | NewAPI / OneAPI 系 | Cookie + `New-Api-User`；带图片验证码的定制站**必须**有 `session=` | `POST /api/user/checkin`（有验证码时先 `POST /api/user/checkin/captcha` 取图） |
 | `agentrouter` | AgentRouter 等同系 | Cookie / 账密（登录前先 logout） | 查询用户信息自动签到，兼容 `sign_in` / `checkin` |
 | `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后，页面内 `POST /api/attendance?random=true`（收益=鸡腿） |
 | `linuxsb` | linux.sb（烧饼社区） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后打开首页触发服务端自动签到；另有「抽称号」动作 |
@@ -99,6 +99,11 @@ cp .dev.vars.example .dev.vars
 
 - 账密站点：用户名 + 密码
 - OAuth 站点：从浏览器 Application → Cookies 复制 Cookie，并填写用户 ID
+- **带图片验证码的定制站（如 jianzhile.vip）**：必须填 Cookie（含 `session=`），
+  且**不能只填访问令牌**。这类站的签到接口只认浏览器会话，带访问令牌会回
+  「请打开网站后再签到」；而状态查询两种凭证都认，所以「状态查得到、签到报请打开
+  网站」正是这道闸门的特征，不是令牌过期。签到由浏览器通道取图 + OCR + 带
+  `captcha_id` 提交完成，答错自动换一张重试（见下文）
 
 **AgentRouter**
 
@@ -252,6 +257,29 @@ curl -X POST https://<your-worker>/api/cron/run \
   → 点站点自己的签到按钮 → 点 `api2/anchor` 里的勾选框 → 轮询权威状态确认，全程不接触
   token（站点前端拿到 token 后自己 `POST /api/user/checkin?recaptcha=<token>`）。
   渠道编辑弹窗里的「该站用 Google reCAPTCHA v2」可强制走这条分支，留空则自动探测。
+- **站点自建的图片验证码**（jianzhile.vip，NewAPI local-0.0.29 定制版）是第三种形态，
+  **既不是 Turnstile 也不是 reCAPTCHA**：站点后端自己画 5 位图形验证码，页面上不挂任何
+  第三方组件，所以「自挂组件拿 token」和「点站点勾选框」两条路都走不通。2026-10-15 实测：
+  - 判据：`/api/status` 的 `turnstile_check` 是 **false**，但 `/api/user/checkin` 的状态
+    回话里有 `captcha_enabled: true`。适配器把状态里的这个开关带进 `status.captchaEnabled`，
+    浏览器通道则用它决定要不要走验证码分支（只读查询，不消耗验证码）
+  - **签到接口只认浏览器会话**：带访问令牌（`Bearer` + `New-Api-User`）一律回
+    「请打开网站后再签到」，同一请求换成 session cookie 立刻返回验证码图片。而**状态查询
+    两种凭证都认** —— 所以「状态查得到、签到报请打开网站」是这道闸门的特征，**不是令牌过期**，
+    别去重新生成访问令牌（渠道的 Cookie 栏必须填含 `session=` 的浏览器 Cookie）
+  - 流程：`POST /api/user/checkin/captcha` 取图（`captcha_id` + base64 PNG）→ 本地 OCR
+    → `POST /api/user/checkin {captcha_id, captcha_answer}`。回话判据逐条实测：
+    答对且未签 = `success:true`；**答对但今天已签 = 「今日已签到」**（站点先校验验证码、
+    再判已签，所以这句反过来是「答案对了」的证据，不能当失败）；答错 = 「验证码错误，请重试」；
+    id 过期/复用 = 「验证码已失效」
+  - OCR：ddddocr 收窄到字母数字字符集，按固定网格切成 5 个字格，每格跑 3 种预处理取
+    置信度最高的读数。**单轮通过率实测约 70–75%**，所以做成重试循环（默认 6 次，
+    失败概率约 0.07%），答错就换一张重来；有字格读不出来时直接换图，不浪费一次提交。
+    注意服务端**区分大小写**（实测：原样提交 9/12 通过，翻转大小写 0/12 通过），
+    所以不能把大小写归一化
+  - 依赖：浏览器通道需要 `ddddocr opencv-python pillow numpy`（workflow 里已装）
+  - 回归：`python scripts/test-captcha.py`（判据 + 版面几何，不联网、不依赖 ddddocr）
+
 - **社区站（NodeSeek / linux.sb）也吃这条降级链**：它们走纯 HTTP 时会被 Cloudflare 拦住
   （Worker 出口 NodeSeek 302 / linux.sb 403，Azure 出口两站都是 403 挑战页），适配器会把
   这类失败标成 `needsBrowser`，于是渠道即使配的是 `worker` 也会降到 `gha_browser`；
@@ -334,9 +362,9 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
-| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 |
+| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + 图片验证码判据 |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
-| `npm run test:browser` | 只跑浏览器通道社区站流程的纯函数判据（`python scripts/test-forum-browser.py`，不联网、不开浏览器） |
+| `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py`，不联网、不开浏览器、不依赖 ddddocr） |
 
 ---
 

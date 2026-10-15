@@ -91,10 +91,13 @@ jobs:
       # Cloudflare 的 JS 挑战，于是「POST /api/attendance?random=false」这一枪不必开浏览器
       # （2026-10-13 实测：机房出口直接 200 + 签到成功，秒级完成）。没装它时脚本会自动
       # 跳过该路径、照常走真浏览器，不会因此失败。
-      - name: Install Camoufox + cloudscraper
+      # ddddocr 是站点自建图片验证码（jianzhile.vip 这类 NewAPI 定制版）要用的：
+      # 取图后在本地 OCR 出 5 位字符再带 captcha_id 提交。它自带 onnxruntime，
+      # 但 opencv-python / pillow / numpy 要显式装（ddddocr 的依赖里版本可能过旧）。
+      - name: Install Camoufox + cloudscraper + ddddocr
         run: |
           python -m pip install --upgrade pip
-          pip install 'camoufox[geoip]' cloudscraper
+          pip install 'camoufox[geoip]' cloudscraper ddddocr opencv-python pillow numpy
           python -m camoufox fetch
 
       # 浏览器内完成 Turnstile 解证 + 页面内 fetch 签到。
