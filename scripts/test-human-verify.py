@@ -220,6 +220,20 @@ ok(
     "声明里含 reCAPTCHA 时仍走站点 UI 驱动（v2 的 token 与页面 origin 绑定，自挂会被判低分）",
 )
 
+print("\n[18] 浏览器要关掉跟踪保护名单（否则 hCaptcha 的 API 域名被拦）")
+ok('"firefox_user_prefs"' in SOURCE, "Camoufox 启动参数里设了 firefox_user_prefs")
+for _pref in (
+    "privacy.trackingprotection.enabled",
+    "privacy.trackingprotection.fingerprinting.enabled",
+    "privacy.trackingprotection.cryptomining.enabled",
+    "privacy.annotate_channels.strict_list.enabled",
+):
+    ok(f'"{_pref}": False' in SOURCE, f"{_pref} 关掉")
+ok(
+    "api.hcaptcha.com" in SOURCE and "落在「跟踪器/指纹识别器」名单里" in SOURCE,
+    "注释写明为什么（供后来人判断能不能删）",
+)
+
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")
 i_probe = SOURCE.find("if human_verification_missing(pb):")
 i_unrelated = SOURCE.find("与 Turnstile 无关的失败")
