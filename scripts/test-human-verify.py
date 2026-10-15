@@ -229,9 +229,18 @@ for _pref in (
     "privacy.annotate_channels.strict_list.enabled",
 ):
     ok(f'"{_pref}": False' in SOURCE, f"{_pref} 关掉")
+ok("CAPTCHA_REACH_JS" in SOURCE and "页面内可达性=" in SOURCE, "失败文案带上页面内探测结果")
 ok(
-    "api.hcaptcha.com" in SOURCE and "落在「跟踪器/指纹识别器」名单里" in SOURCE,
-    "注释写明为什么（供后来人判断能不能删）",
+    "mode: 'no-cors'" in mod.CAPTCHA_REACH_JS,
+    "用 no-cors fetch 探域名（只看能不能连上，不看响应内容）",
+)
+ok(
+    "checksiteconfig" in mod.CAPTCHA_REACH_JS and "(真实接口" in mod.CAPTCHA_REACH_JS,
+    "另外再打一次真实 CORS 接口 —— 裸域名 / 会 302，no-cors 下可能被 ORB 拦出假阴性",
+)
+ok(
+    "await page.bring_to_front()" in SOURCE,
+    "挂组件前把页面激活（hCaptcha 的勾选框流程会看页面是否在前台）",
 )
 
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")

@@ -2310,14 +2310,15 @@ async def click_captcha_checkbox(page):
 #     不带 token / 只带一家            → 「人机验证 token 为空」
 #     turnstile + hcaptcha 都带假的    → 「Turnstile 校验失败，请刷新重试！」
 # 即：先要求「齐」，再按 Turnstile → hCaptcha 的顺序校验。站点前端也是这么干的 ——
-# 注入 SDK 后等它就绪的上限。api.js 是异步加载的，注入完立刻 render 会拿到
-# 「xxx 不可用」—— 线上踩过（2026-10-15 首次多厂商运行就是这么误报失败的）。
-CAPTCHA_SDK_WAIT_S = int(os.environ.get("CHECKIN_CAPTCHA_SDK_WAIT_S") or 25)
-
 # 把启用的 token 全部 append 到同一个 query 上（站点 bundle 的 URLSearchParams 逻辑）：
 #     POST /api/user/checkin?turnstile=<ts>&hcaptcha=<hc>
 # 所以这里必须支持**多家同时**，不能像以前那样在 hCaptcha / reCAPTCHA 之间二选一
 # —— 二选一必然漏一家，表现为「token 为空」而反复重试。
+#
+# 注入 SDK 后等它就绪的上限。api.js 是异步加载的，注入完立刻 render 会拿到
+# 「xxx 不可用」—— 线上踩过（2026-10-15 首次多厂商运行就是这么误报失败的）。
+CAPTCHA_SDK_WAIT_S = int(os.environ.get("CHECKIN_CAPTCHA_SDK_WAIT_S") or 25)
+
 CAPTCHA_VENDORS = {
     "turnstile": {
         "flag": "checkin_turnstile_check",
@@ -2336,9 +2337,15 @@ CAPTCHA_VENDORS = {
         "sdk": "https://js.hcaptcha.com/1/api.js?render=explicit",
         "sdk_match": "hcaptcha.com/1/api.js",
         "label": "hCaptcha",
-        # 三个域名缺一不可：js 是 SDK、newassets 是勾选框/challenge iframe、
-        # api 是 checksiteconfig/getcaptcha。只探一个会得出错误结论。
-        "hosts": ("js.hcaptcha.com", "newassets.hcaptcha.com", "api.hcaptcha.com"),
+        # 四个域名各有用途，缺一不可：js=SDK、newassets=勾选框/challenge iframe、
+        # api=checksiteconfig/getcaptcha、api2=API 的备用域名（hCaptcha 自己也用它兜底）。
+        # 只探一个会得出错误结论；api2 一起探是为了知道「换备用域名能不能绕开」。
+        "hosts": (
+            "js.hcaptcha.com",
+            "newassets.hcaptcha.com",
+            "api.hcaptcha.com",
+            "api2.hcaptcha.com",
+        ),
     },
     "recaptcha": {
         "flag": "checkin_recaptcha_check",
@@ -2505,7 +2512,7 @@ CAPTCHA_REMOUNT_JS = """(specs) => {
 # 而这类失败既可能是出口连不上，也可能是浏览器侧被拦（CSP、代理只对部分请求生效）。
 # 从 Python 侧用裸 socket 探只能证明「出口能连」，不能证明「浏览器能连」——
 # 2026-10-15 星见雅就是裸 socket 全通、浏览器里 hCaptcha 始终初始化失败。
-CAPTCHA_REACH_JS = """async (hosts) => {
+CAPTCHA_REACH_JS = """async ([hosts, apiUrl]) => {
     const out = {};
     for (const h of hosts) {
         const url = 'https://' + h + '/';
@@ -2515,6 +2522,22 @@ CAPTCHA_REACH_JS = """async (hosts) => {
             out[h] = 'ok ' + (Date.now() - t0) + 'ms';
         } catch (e) {
             out[h] = 'FAIL ' + String((e && e.message) || e).slice(0, 60);
+        }
+    }
+    // 再打一次**真实接口**。上面那种「裸域名 + no-cors」的探法不可靠：hCaptcha 的
+    // / 会 302，no-cors 下跟随跨域跳转可能被 ORB 拦掉，于是给出假阴性 ——
+    // 2026-10-15 就差点据此下错结论。checksiteconfig 是 CORS 接口，能拿到响应
+    // 才说明「浏览器里这个 API 真的可用」。
+    if (apiUrl) {
+        try {
+            const t0 = Date.now();
+            const r = await fetch(apiUrl, { cache: 'no-store' });
+            const txt = await r.text();
+            out['(真实接口 checksiteconfig)'] =
+                'HTTP ' + r.status + ' ' + (Date.now() - t0) + 'ms len=' + txt.length;
+        } catch (e) {
+            out['(真实接口 checksiteconfig)'] =
+                'FAIL ' + String((e && e.message) || e).slice(0, 60);
         }
     }
     return out;
@@ -2668,6 +2691,15 @@ async def selfmounted_captcha_checkin(
         for i, v in enumerate(vendors)
     ]
 
+    # 挂之前先把页面激活：hCaptcha 的勾选框流程会看页面是否在前台/有焦点，
+    # GHA 的 Xvfb 窗口默认可能不在前台。Turnstile 不看这个（所以它一直能出 token），
+    # 这正好解释「同一页面上 Turnstile 成、hCaptcha 不成」。失败也无所谓，忽略异常。
+    try:
+        await page.bring_to_front()
+        await page.evaluate("() => { try { window.focus(); } catch (e) {} }")
+    except Exception:  # noqa: BLE001
+        pass
+
     # 注入 SDK 后**必须等它就绪再挂**：api.js 是异步加载的，注入完立刻 render 会拿到
     # 「turnstile/hcaptcha 不可用」。线上踩过（2026-10-15 星见雅首次多厂商运行）：
     # 注入后直接挂一次、失败就判死，报「自挂 Turnstile/hCaptcha 组件失败：
@@ -2776,10 +2808,20 @@ async def selfmounted_captcha_checkin(
                 for h in CAPTCHA_VENDORS[v["vendor"]].get("hosts", ())
             }
         )
+        # 真实接口 URL：hCaptcha 的 checksiteconfig 是 CORS 接口，用它当「API 到底通不通」
+        # 的判据（见 CAPTCHA_REACH_JS 里的说明）。
+        api_url = ""
+        hc = next((v for v in vendors if v["vendor"] == "hcaptcha" and not tokens.get("hcaptcha")), None)
+        if hc and hc.get("sitekey"):
+            site_host = base.split("//", 1)[-1].split("/", 1)[0]
+            api_url = (
+                "https://api.hcaptcha.com/checksiteconfig"
+                f"?host={site_host}&sitekey={hc['sitekey']}&sc=1&swa=1"
+            )
         if probe_hosts:
             try:
                 reach = await asyncio.wait_for(
-                    page.evaluate(CAPTCHA_REACH_JS, probe_hosts), timeout=40
+                    page.evaluate(CAPTCHA_REACH_JS, [probe_hosts, api_url]), timeout=40
                 )
             except Exception as e:  # noqa: BLE001
                 reach = {"(探测失败)": str(e)[:60]}
