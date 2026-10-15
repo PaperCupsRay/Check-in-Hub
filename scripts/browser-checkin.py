@@ -2269,6 +2269,10 @@ async def click_captcha_checkbox(page):
 #     不带 token / 只带一家            → 「人机验证 token 为空」
 #     turnstile + hcaptcha 都带假的    → 「Turnstile 校验失败，请刷新重试！」
 # 即：先要求「齐」，再按 Turnstile → hCaptcha 的顺序校验。站点前端也是这么干的 ——
+# 注入 SDK 后等它就绪的上限。api.js 是异步加载的，注入完立刻 render 会拿到
+# 「xxx 不可用」—— 线上踩过（2026-10-15 首次多厂商运行就是这么误报失败的）。
+CAPTCHA_SDK_WAIT_S = int(os.environ.get("CHECKIN_CAPTCHA_SDK_WAIT_S") or 25)
+
 # 把启用的 token 全部 append 到同一个 query 上（站点 bundle 的 URLSearchParams 逻辑）：
 #     POST /api/user/checkin?turnstile=<ts>&hcaptcha=<hc>
 # 所以这里必须支持**多家同时**，不能像以前那样在 hCaptcha / reCAPTCHA 之间二选一
@@ -2570,18 +2574,36 @@ async def selfmounted_captcha_checkin(
         for i, v in enumerate(vendors)
     ]
 
+    # 注入 SDK 后**必须等它就绪再挂**：api.js 是异步加载的，注入完立刻 render 会拿到
+    # 「turnstile/hcaptcha 不可用」。线上踩过（2026-10-15 星见雅首次多厂商运行）：
+    # 注入后直接挂一次、失败就判死，报「自挂 Turnstile/hCaptcha 组件失败：
+    # ['turnstile:turnstile 不可用', 'hcaptcha:hcaptcha 不可用']」—— 其实只是脚本还没到。
+    # 旧单厂商实现有这段等待（最多 20s），改多厂商时漏掉了，这里补回来。
     await page.evaluate(CAPTCHA_INJECT_JS, specs)
-    mounted = await page.evaluate(CAPTCHA_MOUNT_JS, specs)
+    mounted = {"mounted": [], "failed": []}
+    sdk_deadline = time.monotonic() + CAPTCHA_SDK_WAIT_S
+    while time.monotonic() < sdk_deadline:
+        mounted = await page.evaluate(CAPTCHA_MOUNT_JS, specs)
+        if mounted.get("mounted"):
+            break
+        await page.wait_for_timeout(1200)
+        # 脚本标签可能也被 SPA 清掉，每轮补一次
+        await page.evaluate(CAPTCHA_INJECT_JS, specs)
     log(f"  🧩 {name}: 挂载结果 {mounted}")
     if not mounted.get("mounted"):
         return {
             "name": name,
             "ok": False,
             "message": (
-                f"自挂 {labels} 组件失败：{mounted.get('failed') or '未知'}"
+                f"自挂 {labels} 组件失败（等了 {CAPTCHA_SDK_WAIT_S}s）："
+                f"{mounted.get('failed') or '未知'}。多半是站点 CSP 拦了 SDK 脚本，"
+                f"或出口访问不到 challenges.cloudflare.com / js.hcaptcha.com"
                 f"（why={why or '无'}）"
             )[:300],
         }
+    if mounted.get("failed"):
+        # 部分挂上也要继续：等 token 的那一轮会按缺失的厂商重挂
+        log(f"  ⚠️ {name}: 部分组件暂未挂上 {mounted.get('failed')}，等 token 时会重试")
 
     # 等 token。每轮都要**重新确认组件还在** —— 2026-09-27 实测踩过：站点页面崩在
     # ErrorBoundary 上，SPA 会重渲染 / 换路由，我们挂上去的 div 与 script 标签**当场被

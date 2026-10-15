@@ -218,6 +218,34 @@ ok(
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")
 i_probe = SOURCE.find("if human_verification_missing(pb):")
 i_unrelated = SOURCE.find("与 Turnstile 无关的失败")
+print("\n[13] 注入 SDK 后必须等它就绪再挂（线上踩过：立刻挂 → 误报「xxx 不可用」）")
+i_inject = SOURCE.find("await page.evaluate(CAPTCHA_INJECT_JS, specs)")
+i_wait = SOURCE.find("sdk_deadline = time.monotonic() + CAPTCHA_SDK_WAIT_S")
+i_mount_loop = SOURCE.find("mounted = await page.evaluate(CAPTCHA_MOUNT_JS, specs)", i_wait)
+i_fail_ret = SOURCE.find("自挂 {labels} 组件失败（等了", i_wait)
+ok(i_inject > 0, "先注入 SDK")
+ok(i_wait > 0, "注入后有等待循环（sdk_deadline）")
+ok(
+    0 < i_inject < i_wait,
+    "等待循环排在注入之后",
+)
+ok(
+    i_wait < i_mount_loop < i_fail_ret,
+    "循环里反复挂载，只有超时后才报失败 —— 否则 api.js 还没到就判死",
+)
+ok(
+    mod.CAPTCHA_SDK_WAIT_S >= 10,
+    f"等待上限 {mod.CAPTCHA_SDK_WAIT_S}s 足够（旧单厂商实现是 20s）",
+)
+ok(
+    "while time.monotonic() < sdk_deadline" in SOURCE,
+    "是循环等待而不是固定睡一觉",
+)
+ok(
+    "部分组件暂未挂上" in SOURCE,
+    "部分挂上时继续（等 token 那轮会按缺失的厂商重挂），不整批判死",
+)
+
 ok(i_probe > 0, "存在该兜底分支")
 ok(
     0 < i_probe < i_unrelated,
