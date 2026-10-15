@@ -446,7 +446,11 @@ MAX_PROXY_TRIES = 3
 # 只有「疑似出口 IP 导致」的失败才值得换代理重试。凭证缺失/表单找不到这类
 # 换出口也一样失败，重试纯属浪费 45s。
 RETRYABLE_VIA_PROXY = re.compile(
-    r"Turnstile|token 为空|超时|timeout|挂载失败|ERR_|拒绝|blocked|403|\b5\d\d\b|challenge",
+    # 「没出 token」「network-error」显式写上：多厂商那条失败文案里虽然含 "Turnstile"
+    # 能侥幸命中，但缺 hCaptcha 时真正的原因是 hCaptcha 的网络错误，靠别的词匹配到
+    # 属于巧合 —— 巧合一旦被文案改动打破，就会变成「不重试、当天漏签」。
+    r"Turnstile|hCaptcha|token 为空|没出 token|network-error|超时|timeout|挂载失败|"
+    r"ERR_|拒绝|blocked|403|\b5\d\d\b|challenge",
     re.I,
 )
 
@@ -613,6 +617,23 @@ def mask_proxy(url):
         return f"{scheme}://{hostport}"
     except Exception:  # noqa: BLE001
         return "(proxy)"
+
+def attempt_reason(msg):
+    """把一次出口尝试的失败文案压成一小段，用于「各出口：A → …；B → …」并列展示。
+
+    多厂商那条失败文案里最有信息量的是「没出 token：缺 X（…）」，所以优先截它；
+    截不到就退回前 70 字。压缩是必要的：面板只显示一条 message，四个出口的原话
+    拼起来会超长，反而看不清。
+    """
+    s = str(msg or "")
+    m = re.search(r"没出 token：([^（]*)", s)
+    if m:
+        return m.group(1).strip()[:50]
+    m = re.search(r"组件失败[^：]*：([^（]*)", s)
+    if m:
+        return m.group(1).strip()[:50]
+    return s[:70]
+
 
 
 def _proxy_tunnel_socket(host, port, proxy=None, timeout=15):
@@ -5026,6 +5047,11 @@ async def main():
             log(f"  ⏭️ {name}: job 时间预算用尽，跳过（未执行）")
             results.append({"name": name, "ok": False, "message": "job 时间预算用尽，本次未执行"})
             continue
+        # 每次出口的结果都留一份：全部失败时拼进文案。没有它，面板上只能看到
+        # 「最后一次尝试」的失败原因，看不出到底试过哪些出口、各自卡在哪 ——
+        # 2026-10-15 星见雅多厂商那次就是这样，hCaptcha 报 network-error 但
+        # 无从判断是直连还是某个代理，只能靠猜。
+        attempt_log = []
         for i, proxy in enumerate(attempts):
             via = "直连" if proxy is None else f"代理 {mask_proxy(proxy)}"
             if i:
@@ -5055,10 +5081,11 @@ async def main():
                 }
             except Exception as e:  # noqa: BLE001
                 r = {"name": name, "ok": False, "message": f"{via}异常: {str(e)[:120]}"}
-            if r.get("ok"):
                 if i:
                     r["message"] = f"{r.get('message', '')}（经{via}）"
+                attempt_log.append((via, True, ""))
                 break
+            attempt_log.append((via, False, attempt_reason(r.get("message"))))
             # 结果里显式标了不可重试的直接停：这类失败换出口也解决不了，而每次尝试要烧
             # 45s+40s，重试三次足以把 JOB_BUDGET_S 吃光，尾部渠道当天就漏签了。
             if r.get("retryable") is False:
@@ -5067,6 +5094,10 @@ async def main():
             # 只有「拿不到 token / 网络层失败」才值得换出口；凭证类错误换 IP 也白搭
             if not RETRYABLE_VIA_PROXY.search(str(r.get("message", ""))):
                 break
+        # 试过多个出口且最终失败时，把每个出口的结果并列出来（面板只看得到最后一条）
+        if not r.get("ok") and len(attempt_log) > 1:
+            tried = "；".join(f"{v} → {m}" for v, ok, m in attempt_log if not ok)
+            r["message"] = f"{r.get('message', '')} ｜ 各出口：{tried}"[:700]
         log(f"  {'✅' if r['ok'] else '❌'} {r['name']}: {r['message']}")
         results.append(r)
     report_results(results)

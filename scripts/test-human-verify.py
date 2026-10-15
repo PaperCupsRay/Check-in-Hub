@@ -218,6 +218,43 @@ ok(
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")
 i_probe = SOURCE.find("if human_verification_missing(pb):")
 i_unrelated = SOURCE.find("与 Turnstile 无关的失败")
+print("\n[14] 各出口诊断：失败文案要能看出试过哪些出口、各自卡在哪")
+ok(
+    mod.attempt_reason("自挂 Turnstile/hCaptcha 组件 90s 内没出 token：缺 hCaptcha（点了 54 次）")
+    == "缺 hCaptcha",
+    "优先截「没出 token：…」里的关键片段",
+)
+ok(
+    mod.attempt_reason("自挂 Turnstile/hCaptcha 组件失败（等了 25s）：['hcaptcha:hcaptcha 不可用']")
+    == "['hcaptcha:hcaptcha 不可用']",
+    "挂载失败也截得出来",
+)
+ok(mod.attempt_reason(None) == "", "None 不抛异常")
+ok(len(mod.attempt_reason("x" * 300)) <= 70, "长文案被压到 70 字以内（面板只显示一条）")
+ok("attempt_log" in SOURCE and "各出口：" in SOURCE, "存在「各出口」汇总")
+ok(
+    "if not r.get(\"ok\") and len(attempt_log) > 1:" in SOURCE,
+    "只在试过多个出口且最终失败时才拼汇总（单出口不啰嗦）",
+)
+
+print("\n[15] 多厂商失败必须可重试（RETRYABLE_VIA_PROXY 要显式命中）")
+_multi_fail = (
+    "自挂 Turnstile/hCaptcha 组件 90s 内没出 token：缺 hCaptcha"
+    "（点了 54 次、重建 1 次，组件报错={'hcaptcha': 'network-error'}）"
+)
+ok(
+    bool(mod.RETRYABLE_VIA_PROXY.search(_multi_fail)),
+    "线上那条真实失败文案命中可重试（否则不换出口、当天漏签）",
+)
+ok(
+    bool(mod.RETRYABLE_VIA_PROXY.search("自挂 hCaptcha 组件 90s 内没出 token：缺 hCaptcha")),
+    "只缺 hCaptcha（文案里没有 Turnstile）时也要命中 —— 靠显式写 hCaptcha/没出 token",
+)
+ok(
+    bool(mod.RETRYABLE_VIA_PROXY.search("组件报错={'hcaptcha': 'network-error'}")),
+    "network-error 单独也命中",
+)
+
 print("\n[13] 注入 SDK 后必须等它就绪再挂（线上踩过：立刻挂 → 误报「xxx 不可用」）")
 i_inject = SOURCE.find("await page.evaluate(CAPTCHA_INJECT_JS, specs)")
 i_wait = SOURCE.find("sdk_deadline = time.monotonic() + CAPTCHA_SDK_WAIT_S")
