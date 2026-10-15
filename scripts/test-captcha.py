@@ -204,6 +204,16 @@ else:
                 return self.submissions[min(len(self.submitted) - 1, len(self.submissions) - 1)]
             raise AssertionError(f"unexpected JS: {js[:80]}")
 
+        class _Ctx:
+            async def add_cookies(self, cookies):
+                self.added = list(cookies)
+
+        @property
+        def context(self):
+            if not hasattr(self, "_ctx"):
+                self._ctx = self._Ctx()
+            return self._ctx
+
     # 一个最小的合法 PNG（1x1），让 base64 解码走得通；OCR 会被下面替换掉
     PNG_B64 = (
         "data:image/png;base64,"
@@ -305,6 +315,54 @@ else:
     ok(res.get("retryable") is False, "标不可重试")
     ok("3" in (res.get("message") or ""), "文案说明尝试次数", res.get("message"))
 
+    # 5g) 会话失效 + 渠道存了账密 → 自动换 session 后重试成功，并把新 cookie 回传
+    mod.solve_image_captcha = lambda png: "abcde"
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [
+            # 第一次取图被拒：会话已失效
+            {"status": 200, "success": False, "message": "请打开网站后再签到", "captcha_id": "", "captcha_image": ""},
+            CAPTCHA_REPLY,
+        ],
+        [{"status": 200, "body": {"success": True, "data": {"quota_awarded": 5000000}}}],
+    )
+    login_calls = []
+
+    async def fake_login(pg, nm, bs, u, p, uid=""):
+        login_calls.append({"user": u, "pass": p, "uid": uid})
+        return {"session": True, "cookie": "session=FRESH; other=1", "userId": "25341", "why": ""}
+
+    real_login = mod.login_for_session
+    mod.login_for_session = fake_login
+    res = run(
+        mod.captcha_checkin(
+            page,
+            "t",
+            "https://jianzhile.vip",
+            "tok",
+            "Asia/Shanghai",
+            {"auth": {"username": "u", "password": "p", "userId": "25341"}},
+        )
+    )
+    ok(res.get("ok") is True, "会话失效 → 账密换 session 后签到成功", str(res)[:200])
+    ok(len(login_calls) == 1, f"只登录一次（实际 {len(login_calls)}）")
+    ok(page.fetched == 2, f"换会话后重新取图（实际 {page.fetched}）")
+    ok(res.get("newTokens", {}).get("cookie") == "session=FRESH; other=1", "把新 cookie 回传（面板写回 KV）")
+    ok("刷新 Cookie" in (res.get("message") or ""), "文案说明已刷新 Cookie", res.get("message"))
+
+    # 5h) 会话失效但渠道没有账密 → 不空转，直接给出可照做的指引
+    mod.solve_image_captcha = lambda png: "abcde"
+    page = FakePage(
+        STATUS_NOT_CHECKED,
+        [{"status": 200, "success": False, "message": "请打开网站后再签到", "captcha_id": "", "captcha_image": ""}],
+        [],
+    )
+    res = run(mod.captcha_checkin(page, "t", "https://jianzhile.vip", "tok", "Asia/Shanghai", {"auth": {}}))
+    ok(res.get("ok") is False, "无账密时失败")
+    ok(page.fetched == 1, "不反复取图空转")
+    ok("账密" in (res.get("message") or ""), "文案提示可补账密", res.get("message"))
+
+    mod.login_for_session = real_login
     mod.solve_image_captcha = real_solver
 
 print(f"\n{'=' * 60}")

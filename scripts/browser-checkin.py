@@ -1403,7 +1403,6 @@ CAPTCHA_CELL_X0 = 16  # 第一个字形左边界
 CAPTCHA_CELL_W = 26  # 字形间距
 CAPTCHA_CELLS = 5  # 字形个数
 CAPTCHA_ATTEMPTS = int(os.environ.get("CHECKIN_CAPTCHA_ATTEMPTS") or 6)
-# 字形笔画距背景 427..670；干扰色带只有 146..247。阈值取在两者之间。
 CAPTCHA_INK_THRESH = 320
 # 单字裁剪的预处理：(pad, scale)。这三个是离线基准里唯一不拖后腿的组合 ——
 # 把 colour / gray / pad20_s2 之类混进置信度竞争会让整串准确率下降
@@ -1511,20 +1510,12 @@ def captcha_cell_masks(bgr, np):
             continue
         out.append(mask[y0:y1, xa:xb])
     return out
-
-
 def solve_image_captcha(png_bytes):
     """识别 5 位图片验证码，返回字符串（读不出的位留 '?'）。
 
-    版面是固定的，按固定网格切比按连通域切稳：
-      · 画布 160x58，背景 BGR (252,250,248)；
-      · 一条浅色干扰色带（距背景 146..247）横穿整幅，必须靠阈值滤掉；
-      · 5 个字形落在 x = 16 + 26*i，每个约 12x18，笔画距背景 427..670。
-    曾经试过按字形颜色聚类切分：每个字形确实各用一种饱和色，但两种偏红的颜色
-    距离只有 126，会被并成一个簇（整串少一位），所以改用固定网格。
-
     每个字格跑 CAPTCHA_VARIANTS 里的几种预处理，取置信度最高的那个读数 ——
     比多数投票更准：变体之间经常只有 2:1 的分歧，而对的那个置信度明显更高。
+    切分见 captcha_cell_masks()。
     """
     deps, err = _captcha_deps()
     if deps is None:
@@ -1660,7 +1651,7 @@ async def submit_captcha(page, token, captcha_id, answer):
     )
 
 
-async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS):
+async def captcha_checkin(page, name, base, token, tz, channel=None, attempts=CAPTCHA_ATTEMPTS):
     """图片验证码签到：取图 → OCR → 提交，答错就换一张重来。
 
     为什么要重试而不是一次定生死：单轮识别率实测约 70–75%，每次都是独立的新验证码，
@@ -1669,10 +1660,50 @@ async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS
     为什么要先 GET 一次状态：站点是「验证码先校验、再判是否已签」，所以已经签过的
     日子答对也会回「今日已签到」。先查状态就能在已签时直接返回，省掉取图 + OCR，
     也避免把「今日已签到」误读成需要重试。
+
+    会话自愈：该站的签到接口只认 session cookie（访问令牌无效），而 session 有有效期。
+    渠道里存了账密时，一旦服务端回「请打开网站后再签到」就用账密换一个新 session 并
+    重试 —— 换到的 cookie 经 newTokens 回传，面板写回 KV，之后直接复用，用户不必手抄。
+    没存账密时给出可照做的指引，而不是含糊地报一句失败。
     """
     deps, err = _captcha_deps()
     if deps is None:
         return {"name": name, "ok": False, "retryable": False, "message": err}
+
+    auth = (channel or {}).get("auth") or {}
+    username = auth.get("username") or auth.get("email") or ""
+    password = auth.get("password") or ""
+    user_id = str(auth.get("userId") or auth.get("newApiUser") or "").strip()
+    fresh_cookie = ""
+    renew_tried = False
+
+    async def renew_session():
+        """会话被拒时用账密换一个新 session；返回 True 表示可以重试。"""
+        nonlocal fresh_cookie, renew_tried
+        if renew_tried or not (username and password):
+            return False
+        renew_tried = True
+        got = await login_for_session(page, name, base, username, password, user_id)
+        if not got.get("session"):
+            log(f"  ⚠️ {name}: 会话失效且账密登录未换到 session（{got.get('why') or '未知'}）")
+            return False
+        fresh_cookie = got["cookie"]
+        pairs = parse_cookie_pairs(fresh_cookie)
+        if pairs:
+            host = base.split("//", 1)[1].split("/", 1)[0]
+            domain = host[4:] if host.startswith("www.") else host
+            await page.context.add_cookies(
+                [{"name": n, "value": v, "domain": domain, "path": "/"} for n, v in pairs]
+            )
+        log(f"  🔑 {name}: 会话失效，已用账密换到新 session，重试")
+        return True
+
+    def finish(res):
+        """成功时把新换到的 cookie 一起回传（面板会写回 KV）。"""
+        if res.get("ok") and fresh_cookie:
+            res["message"] = f"{res.get('message', '')} · 已用账密登录刷新 Cookie"[:300]
+            res["newTokens"] = {"cookie": fresh_cookie}
+        return res
 
     st = await captcha_status_enabled(page, token)
     if st and st.get("checkedInToday"):
@@ -1683,13 +1714,18 @@ async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS
         }
 
     last_msg = ""
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         got = await fetch_captcha(page, token)
         if not got or not got.get("captcha_id") or not got.get("captcha_image"):
             reason = (got or {}).get("message") or "接口未返回验证码"
-            # 没有会话时这个接口就是这个回话：说明渠道缺 session cookie，
-            # 换出口 / 重试都没用，直接给出可照做的指引。
+            # 没有会话时这个接口就是这个回话：先试账密自愈，换不到再给出可照做的指引。
+            # 换出口 / 重试都没用，所以标不可重试。
             if CAPTCHA_NEEDS_SESSION_RE.search(str(reason)):
+                if await renew_session():
+                    attempt -= 1  # 换会话不算一次识别机会
+                    continue
                 return {
                     "name": name,
                     "ok": False,
@@ -1697,8 +1733,8 @@ async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS
                     "message": (
                         "签到接口要求浏览器会话，但渠道里没有可用的 session cookie，"
                         "服务端回「请打开网站后再签到」。请在该渠道的 Cookie 栏粘贴浏览器里"
-                        "已登录的 session（F12 → Application → Cookies）；访问令牌对签到接口"
-                        "无效（状态查询仍可用）。"
+                        "已登录的 session（F12 → Application → Cookies），或补上账密让脚本"
+                        "自动换会话；访问令牌对签到接口无效（状态查询仍可用）。"
                     ),
                 }
             return {
@@ -1735,33 +1771,41 @@ async def captcha_checkin(page, name, base, token, tz, attempts=CAPTCHA_ATTEMPTS
         log(f"  🧩 {name}: 第 {attempt} 次 OCR={answer} → {verdict} {srv}")
 
         if verdict == "ok":
-            return {
-                "name": name,
-                "ok": True,
-                "message": checkin_message(True, body, res.get("status")),
-                "raw": body,
-            }
+            return finish(
+                {
+                    "name": name,
+                    "ok": True,
+                    "message": checkin_message(True, body, res.get("status")),
+                    "raw": body,
+                }
+            )
         if verdict == "already":
             # 站点先校验验证码再判已签，所以这句本身就是「答案对了」的证据
-            return {
-                "name": name,
-                "ok": True,
-                "message": "今日已签到（服务端在验证码通过后回「今日已签到」）",
-                "raw": body,
-            }
-        if verdict in ("wrong", "expired", "missing"):
-            last_msg = srv or verdict
-            continue
+            return finish(
+                {
+                    "name": name,
+                    "ok": True,
+                    "message": "今日已签到（服务端在验证码通过后回「今日已签到」）",
+                    "raw": body,
+                }
+            )
         if verdict == "no_session":
+            if await renew_session():
+                attempt -= 1  # 换会话不算一次识别机会
+                continue
             return {
                 "name": name,
                 "ok": False,
                 "retryable": False,
                 "message": (
                     f"服务端回「{srv or '请打开网站后再签到'}」：渠道里的 session cookie "
-                    "无效或已过期，请重新从浏览器复制 session 后更新该渠道。"
+                    "无效或已过期，且没有可用的账密来自动续期。请重新从浏览器复制 session "
+                    "后更新该渠道，或补上账密。"
                 ),
             }
+        if verdict in ("wrong", "expired", "missing"):
+            last_msg = srv or verdict
+            continue
         return {
             "name": name,
             "ok": False,
@@ -2532,7 +2576,7 @@ async def checkin_one(channel, proxy=None) -> dict:
                 want_captcha = False
             if want_captcha:
                 log(f"  🔐 {name}: 站点启用了签到图片验证码，走验证码通道（最多 {CAPTCHA_ATTEMPTS} 次）")
-                res = await captcha_checkin(page, name, base, token, tz)
+                res = await captcha_checkin(page, name, base, token, tz, channel)
                 if res.get("ok"):
                     await attach_quota(page, res, token)
                 return res
@@ -2696,7 +2740,7 @@ async def checkin_one(channel, proxy=None) -> dict:
                 or CAPTCHA_EXPIRED_RE.search(pmsg)
             ):
                 log(f"  🔐 {name}: 探针回话点名图片验证码，改走验证码通道")
-                res = await captcha_checkin(page, name, base, token, tz)
+                res = await captcha_checkin(page, name, base, token, tz, channel)
                 if res.get("ok"):
                     await attach_quota(page, res, token)
                 return res
