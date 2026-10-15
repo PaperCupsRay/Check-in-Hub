@@ -277,10 +277,20 @@ curl -X POST https://<your-worker>/api/cron/run \
     失败概率约 0.07%），答错就换一张重来；有字格读不出来时直接换图，不浪费一次提交。
     注意服务端**区分大小写**（实测：原样提交 9/12 通过，翻转大小写 0/12 通过），
     所以不能把大小写归一化
-  - **会话自愈**：session 有有效期，过期后服务端同样回「请打开网站后再签到」。渠道里存了
-    账密时，脚本会用 `POST /api/user/login` 换一个新 session 再重试（该站登录接口不挂人机
-    校验，实测可用），换到的 cookie 经 `newTokens` 回传、面板写回 KV，之后直接复用；
-    没存账密才提示手动更新
+  - **会话自动刷新（主动）**：session 有有效期，过期后服务端同样回「请打开网站后再签到」。
+    渠道里存了账密时，脚本进页面后先用 `session_alive()` 只读探一次会话，失效就立刻用
+    `POST /api/user/login` 换一个新 session 再开始签到（该站登录接口不挂人机校验，实测可用）；
+    换到的 cookie 经 `newTokens` 回传、面板写回 KV，之后直接复用，用户不必手抄。
+    **续期成功但签到失败时也会回写**，所以不会每次重跑都重新登录。没存账密才提示手动更新。
+  - **签到接口的请求头要求**（2026-10-15 逐条实测，浏览器通道的页内 fetch 天然满足）：
+
+    | 头 | 要求 | 缺了会怎样 |
+    |----|------|-----------|
+    | `Cookie: session=…` | **必需** | 只带访问令牌 → 「请打开网站后再签到」 |
+    | `New-Api-User: <用户ID>` | **必需** | 401「Unauthorized, New-Api-User header not provided」——**对有效会话也照回**，所以探测会话时必须带上它 |
+    | `Origin` **或** `Referer`（指向本站） | **必需** | 「请从网站页面发起签到」；Referer 指向别的站点同样被拒 |
+    | `Authorization: Bearer …` | 可选 | 与 session 并存无妨，但**不能替代** session |
+    | `User-Agent` / `sec-ch-ua` / `sec-fetch-*` / `Accept-Language` | 不校验 | 带与不带结果相同（实测） |
   - 依赖：浏览器通道需要 `ddddocr opencv-python pillow numpy`（workflow 里已装）
   - 回归：`python scripts/test-captcha.py`（判据 + 版面几何，不联网、不依赖 ddddocr）
 

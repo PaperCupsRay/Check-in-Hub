@@ -1612,13 +1612,18 @@ async def captcha_status_enabled(page, token):
         return None
 
 async def session_alive(page):
-    """只带 session cookie（故意不带 Authorization）问一次 /api/user/self，
-    判断会话是否还有效。
+    """只带 session cookie 问一次 /api/user/self，判断会话是否还有效。
 
-    为什么要这样探：该站的**状态查询两种凭证都认**，所以带令牌的状态查询在会话失效时
-    照样 200 —— 用它判断会话等于没判。而 /api/user/self 不带 Authorization 时只可能靠
-    session 通过：有效 → 200，失效 → 401「not logged in and no access token provided」
-    （2026-10-15 实测：真 session 200 / 伪造 session 401）。
+    两个头必须这样配，缺一不可（2026-10-15 逐条实测）：
+      · **带** New-Api-User：该站把它当强制头，缺了直接 401
+        「Unauthorized, New-Api-User header not provided」—— 与 session 好坏无关。
+        踩过这个坑：探测漏发该头时，一个**完全有效**的 session 也被判成失效，
+        于是每次运行都白登录一次。所以这里用 MERGE_AUTH 从 localStorage.user.id 取它。
+      · **不带** Authorization：这是探测的全部意义。该站状态查询两种凭证都认，
+        带令牌的查询在会话失效时照样 200，用它判断会话等于没判；而不带 Authorization
+        时只可能靠 session 通过 —— 有效 → 200，失效 → 401
+        「not logged in and no access token provided」（实测：真 session 200 /
+        伪造 session 401）。
 
     这是只读请求，不消耗验证码、不在站点留失败记录，所以可以在签到前先探一次，
     会话过期就主动换新的 —— 比"等签到接口拒绝再补救"少一次往返，也不依赖拒绝文案
@@ -1630,8 +1635,12 @@ async def session_alive(page):
     try:
         got = await asyncio.wait_for(
             page.evaluate(
-                """async () => {
-                    const res = await fetch('/api/user/self', { credentials: 'include' });
+                # headersJs 传空对象：MERGE_AUTH 只补 New-Api-User，绝不带 Authorization
+                ("""async (headersJs) => {
+                    MERGE_AUTH
+                    const res = await fetch('/api/user/self', {
+                        credentials: 'include', headers: __h,
+                    });
                     let b = null; try { b = await res.json(); } catch (e) {}
                     return {
                         status: res.status,
@@ -1639,7 +1648,8 @@ async def session_alive(page):
                         id: (b && b.data && b.data.id) || null,
                         message: (b && b.message) || '',
                     };
-                }"""
+                }""").replace("MERGE_AUTH", JSFUNC_MERGE_AUTH),
+                "{}",
             ),
             timeout=STATUS_QUERY_TIMEOUT_S,
         )

@@ -206,11 +206,15 @@ else:
             self.fetched = 0
             self.submitted = []
             self.probed = 0
+            self.probe_arg = None
 
         async def evaluate(self, js, arg=None):
             if "/api/user/self" in js:
-                # session_alive() 的只读探测：不带 Authorization，只可能靠 session 通过
+                # session_alive() 的只读探测。它必须带 New-Api-User（站点强制头，
+                # 缺了连有效会话都回 401），且**绝不能**带 Authorization
+                # （带了的话会话失效时也 200，探测就白做了）。
                 self.probed += 1
+                self.probe_arg = arg
                 if self.self_alive is not None:
                     return self.self_alive
                 return {"status": 200, "success": True, "id": 25341, "message": ""}
@@ -392,6 +396,19 @@ else:
     ok(res.get("ok") is True, "会话有效 → 正常签到")
     ok(not login_calls, "会话有效时不登录")
     ok(page.probed == 1, "仍会探一次会话（只读，成本极低）")
+    # 探测的请求头形状：必须带 New-Api-User、绝不能带 Authorization。
+    # 这条断言是踩坑换来的：探测漏发 New-Api-User 时，站点对**有效**会话也回
+    # 401「New-Api-User header not provided」，于是每次运行都误判会话失效、
+    # 白登录一次（线上 GHA 实测到过）。
+    ok(
+        isinstance(page.probe_arg, str) and "Authorization" not in page.probe_arg,
+        "会话探测不带 Authorization（否则失效会话也会 200，探测失效）",
+        str(page.probe_arg),
+    )
+    ok(
+        "New-Api-User" in mod.JSFUNC_MERGE_AUTH,
+        "会话探测用 MERGE_AUTH 补 New-Api-User（站点强制头，缺了有效会话也 401）",
+    )
 
     # 5g3) 探测不通（网络异常）时不得误判成会话失效：照常往下走
     login_calls.clear()
