@@ -274,6 +274,15 @@ curl -X POST https://<your-worker>/api/cron/run \
   自挂会被判低分。
 
   Cloudflare 对机房出口常静默不签发 Turnstile 挑战，所以这个渠道建议保留住宅代理。
+
+  **当前状态（2026-10-15）**：Turnstile 那一半已经打通（真机运行能拿到 token），
+  hCaptcha 那一半卡在**浏览器侧**——`api.hcaptcha.com` / `api2.hcaptcha.com` /
+  `newassets.hcaptcha.com` 在 Camoufox 里一律 `NetworkError`，而只有 SDK
+  （`js.hcaptcha.com`，脚本加载不受 CORS/ORB 约束）能通。同一批出口用裸 socket 发
+  **真实 HTTP 请求**（含经代理）这三个域名全是 302/200 正常，所以拦的不是出口。
+  已排除：CSP（站点两页都没有）、跟踪保护名单（关掉后复测无改善，改动已回退）、
+  出口 IP（直连 + 3 个住宅出口结果相同）。失败文案里会带上「页面内可达性」与
+  「各出口」两段实测数据，便于下次直接看结论。星见雅渠道暂时保持停用。
 - **Google reCAPTCHA v2**（星见雅等）单独处理，**不能照搬 Turnstile 的自挂组件**：
   reCAPTCHA v2 的 token 与渲染它的那个页面 origin 绑定，自挂 widget 拿到的 token 会被
   判低分。所以浏览器通道对这类站改成**驱动站点自己的 UI** —— 打开 `/console/personal`
