@@ -306,7 +306,7 @@ async function handleCheckin(request, env) {
     return json({ ok: false, error: "channel.baseUrl must start with http(s)://" }, 400);
   }
 
-  const allowed = new Set(["login", "me", "status", "checkin", "refresh", "gacha"]);
+  const allowed = new Set(["login", "me", "status", "checkin", "refresh", "gacha", "claim"]);
   if (!allowed.has(action)) {
     return json({ ok: false, error: `unsupported action: ${action}` }, 400);
   }

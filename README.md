@@ -2,7 +2,7 @@
 
 多渠道自动签到面板，一键部署到 **Cloudflare Workers**。
 
-在浏览器里管理 Sub2API / NewAPI / AgentRouter 等 API 站点，以及 NodeSeek / linux.sb / NodeLoc 等社区论坛的签到，支持签到、状态查询、用户信息、批量并发签到，以及导入导出配置。
+在浏览器里管理 Sub2API / NewAPI / AgentRouter 等 API 站点，以及 NodeSeek / linux.sb / NodeLoc 等社区论坛、Obsidian Arc（Axis AI）等自建 AI 站的签到，支持签到、状态查询、用户信息、批量并发签到，以及导入导出配置。
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
@@ -11,7 +11,7 @@
 
 ## ✨ 功能特性
 
-- **多渠道适配**：内置 `sub2api` / `newapi` / `agentrouter` / `nodeseek` / `linux.sb` / `nodeloc`，可继续扩展
+- **多渠道适配**：内置 `sub2api` / `newapi` / `agentrouter` / `nodeseek` / `linux.sb` / `nodeloc` / `onyxaxis`，可继续扩展
 - **卡片式首页**：所有渠道直接展示，支持按类型筛选与多种排序
 - **弹窗编辑**：新增 / 编辑渠道使用模态框，不打断列表浏览
 - **并发签到**：全部签到使用 `Promise.allSettled` 并发执行
@@ -87,6 +87,7 @@ cp .dev.vars.example .dev.vars
 | `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后，页面内 `POST /api/attendance?random=true`（收益=鸡腿） |
 | `linuxsb` | linux.sb（烧饼社区） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后打开首页触发服务端自动签到；另有「抽称号」动作 |
 | `nodeloc` | NodeLoc（www.nodeloc.com，Discourse） | Cookie + CSRF | `POST /checkin`（form 编码 + `X-Checkin-Nonce`） |
+| `onyxaxis` | Obsidian Arc 系自建 AI 站（ai.onyxaxis.org 等） | 会话 Cookie（`obsidian_session`）或账密登录 | `POST /api/checkin`（body `{}`，需带同源 `Origin`）；另有「领里程碑」动作 |
 
 ### 填写建议
 
@@ -109,6 +110,21 @@ cp .dev.vars.example .dev.vars
 
 - 用户名 + 密码（会先清理脏 session）
 - 或完整 Cookie；建议填写 `New-Api-User`
+
+**Obsidian Arc（Axis AI / ai.onyxaxis.org 等自建站）**
+
+- 站点是自建 AI 站（开源实现 [ObsidianArc](https://github.com/OnyxAxisOwO/ObsidianArc)），
+  签到只认**服务端会话 Cookie**（默认名 `obsidian_session`），没有 API 令牌能签到
+- 推荐填「用户名 / 邮箱 + 密码」：Worker 侧直接 `POST /api/auth/login` 换会话 Cookie，
+  换到的 Cookie 会自动写回渠道，不必手抄
+- 或手抄 Cookie：浏览器登录后 F12 → Application → Cookies 复制 `obsidian_session`
+- 账号开了**二次验证**、或站点把登录接口挂上 Turnstile 时自动登录走不通（脚本不代填
+  6 位动态码），这时改用 Cookie 方式即可 —— 签到接口本身不挂人机验证
+- **里程碑奖励（如连续 5 天的「签到重置卡」）**：卡片上有 **「领里程碑」** 按钮，一键领取
+  当前所有已达成的里程碑；没达成时会显示进度（如「签到重置卡 1/5」），不会报红
+- 想让每日签到**顺带领**（连续天数刚涨上去，正是最容易忘的时刻）：渠道里加一条
+  `options.autoClaim = true`（默认 false，与 linux.sb 的 `autoGacha` 同规矩）；
+  领取失败不会推翻签到结论，只在日志里追加说明
 
 **NodeSeek / linux.sb / NodeLoc（社区论坛）**
 
@@ -387,7 +403,8 @@ checkin-hub/
         ├── forum.js         # NodeSeek / linux.sb 共用的签到工厂
         ├── nodeseek.js
         ├── linuxsb.js
-        └── nodeloc.js       # Discourse discourse-checkin
+        ├── nodeloc.js       # Discourse discourse-checkin
+        └── onyxaxis.js      # Obsidian Arc（Axis AI）：会话 Cookie / 账密登录
 ```
 
 ---
@@ -408,8 +425,9 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
-| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + 图片验证码判据 |
+| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + Obsidian Arc 适配器 + 图片验证码判据 |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
+| `npm run test:onyxaxis` | 只跑 Obsidian Arc（onyxaxis）适配器的离线回归测试 |
 | `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py` + `python scripts/test-human-verify.py`，不联网、不开浏览器、不依赖 ddddocr） |
 
 ---

@@ -5,6 +5,7 @@ import { anyrouterAdapter } from "./anyrouter.js";
 import { nodeseekAdapter } from "./nodeseek.js";
 import { linuxsbAdapter } from "./linuxsb.js";
 import { nodelocAdapter } from "./nodeloc.js";
+import { onyxaxisAdapter } from "./onyxaxis.js";
 
 export const adapters = {
   sub2api: sub2apiAdapter,
@@ -15,6 +16,7 @@ export const adapters = {
   nodeseek: nodeseekAdapter, // POST /api/attendance?random=true
   linuxsb: linuxsbAdapter, // 打开页面即自动签到；另有「抽称号」动作
   nodeloc: nodelocAdapter, // Discourse + discourse-checkin：POST /checkin
+  onyxaxis: onyxaxisAdapter, // Obsidian Arc（Axis AI）：会话 Cookie 或账密登录
 };
 
 export function listAdapters() {

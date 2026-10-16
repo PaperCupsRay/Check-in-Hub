@@ -1686,6 +1686,16 @@
           "warn"
         );
       }
+      // Obsidian Arc（Axis AI）同理：账密能在 Worker 侧直接换会话 Cookie（onyxaxis 适配器），
+      // 所以「填了账密」也要放行；两样都没有时才是真的测不了。
+      const onyxCreds = ch.type === "onyxaxis" && !!ch.auth?.identifier && !!ch.auth?.password;
+      if (ch.type === "onyxaxis" && !ch.auth?.cookie && !onyxCreds) {
+        return showToast(
+          "请先填写凭证",
+          "Obsidian Arc 需要「用户名 / 邮箱 + 密码」自动登录换 Cookie，或手抄 obsidian_session Cookie",
+          "warn"
+        );
+      }
       // 临时跑当前表单，不强制写入列表
       const tempId = ch.id || uid();
       ch.id = tempId;
