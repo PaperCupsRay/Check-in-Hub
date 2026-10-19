@@ -1027,6 +1027,218 @@ def parse_cookie_pairs(raw):
     return out
 
 
+# 抽奖（sub2api 系：林夕 k40 / 百倍 100xlabs）。口径与 Worker 侧
+# src/adapters/sub2api.js 完全一致，两处改动要一起改：
+#   · 默认只花免费额度（cost_type=free）；活动分/余额是用户真实资产，
+#     只有把渠道选项 lotteryCost 设成 auto / all 才会动；
+#   · 每抽一次都用新的 idempotency_key（重复用同一个会被服务端去重，等于白抽）；
+#   · 抽几次以服务端回的 today_remaining 为准，抽完即停；单次上限 30；
+#   · 中途失败保留已抽到的结果，只把失败原因写进文案。
+LOTTERY_HARD_CAP = 30
+
+# 页内抽奖：状态查询 → 逐次 POST /api/v1/lottery → 回结构化结果（文案在 Python 侧拼）。
+# 必须在页面里发请求：站点认同源 Origin/Referer，且 Bearer 与登录时是同一套。
+JSFUNC_SUB2API_LOTTERY = """
+async ([access, mode, cap]) => {
+    const H = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + access };
+    const out = { ok: false, skipped: false, reason: '', failure: '', stop: '', draws: [], status: {} };
+    const LABEL = { free: '免费额度', activity: '活动分', paid: '余额' };
+    let st = null;
+    try {
+        const r = await fetch('/api/v1/lottery/status?timezone=Asia/Shanghai', { headers: H });
+        const b = await r.json().catch(() => null);
+        if (!b || b.code !== 0 || !b.data) {
+            out.skipped = true;
+            out.reason = '状态查询失败 HTTP ' + r.status;
+            return out;
+        }
+        st = b.data;
+    } catch (e) {
+        out.skipped = true;
+        out.reason = '状态查询异常 ' + ((e && e.message) || e);
+        return out;
+    }
+    const costs = st.costs || {};
+    const bal = { free: Number(st.free_balance), activity: Number(st.activity_score), paid: Number(st.balance) };
+    out.status = {
+        today_draws: st.today_draws,
+        daily_draw_limit: st.daily_draw_limit,
+        today_remaining: st.today_remaining,
+        free_balance: st.free_balance,
+        activity_score: st.activity_score,
+        balance: st.balance,
+    };
+    if (st.enabled === false) { out.skipped = true; out.reason = '站点未开启抽奖活动'; return out; }
+    if (st.window_open === false) { out.skipped = true; out.reason = '抽奖窗口未开放'; return out; }
+    if (!st.can_draw) { out.skipped = true; out.reason = '站点当前不允许抽奖（can_draw=false）'; return out; }
+    let remaining = Number(st.today_remaining || 0);
+    if (!(remaining > 0)) {
+        out.skipped = true;
+        out.reason = '今日次数已用完（' + st.today_draws + '/' + (st.daily_draw_limit == null ? '?' : st.daily_draw_limit) + '）';
+        return out;
+    }
+    const order = mode === 'all' ? ['free', 'activity', 'paid'] : (mode === 'auto' ? ['free', 'activity'] : ['free']);
+    const pick = () => {
+        const why = [];
+        for (const k of order) {
+            const c = costs[k] || {};
+            const amt = Number(c.amount);
+            if (!c.enabled) { why.push(LABEL[k] + '未开放'); continue; }
+            if (!(amt > 0)) { why.push(LABEL[k] + '消耗额未配置'); continue; }
+            if (!(bal[k] >= amt)) { why.push(LABEL[k] + '不足（需 ' + amt + '，现有 ' + bal[k] + '）'); continue; }
+            return { type: k, amount: amt, why: '' };
+        }
+        return { type: null, amount: 0, why: why.join('；') || '没有可用的消耗方式' };
+    };
+    let cost = pick();
+    if (!cost.type) { out.skipped = true; out.reason = cost.why; return out; }
+    const budget = Math.min(remaining, cap > 0 ? cap : 30);
+    for (let i = 0; i < budget; i++) {
+        if (i > 0) {
+            const next = pick();
+            if (!next.type) { out.stop = next.why; break; }
+            cost = next;
+        }
+        let b = null;
+        let status = 0;
+        try {
+            const r = await fetch('/api/v1/lottery', {
+                method: 'POST',
+                headers: H,
+                body: JSON.stringify({
+                    cost_type: cost.type,
+                    // 页面里 crypto 就是 window.crypto；用 typeof 兜一层，
+                    // 免得在非浏览器环境（离线用例）里直接 ReferenceError
+                    idempotency_key: (typeof crypto !== 'undefined' && crypto.randomUUID)
+                        ? crypto.randomUUID()
+                        : String(Date.now()) + '-' + String(Math.random()).slice(2),
+                    boost: false,
+                }),
+            });
+            status = r.status;
+            b = await r.json().catch(() => null);
+        } catch (e) {
+            out.failure = '抽奖请求异常 ' + ((e && e.message) || e);
+            break;
+        }
+        if (!b || b.code !== 0 || status >= 400) {
+            out.failure = (b && (b.message || b.reason)) || ('HTTP ' + status);
+            break;
+        }
+        const d = b.data || {};
+        if (d.draw) out.draws.push(d.draw);
+        if (d.today_remaining != null) remaining = Number(d.today_remaining);
+        if (d.free_balance != null) bal.free = Number(d.free_balance);
+        if (d.activity_score != null) bal.activity = Number(d.activity_score);
+        if (d.balance != null) bal.paid = Number(d.balance);
+        if (d.today_draws != null) out.status.today_draws = d.today_draws;
+        out.status.today_remaining = remaining;
+        out.status.free_balance = bal.free;
+        out.status.activity_score = bal.activity;
+        out.status.balance = bal.paid;
+        if (!(remaining > 0)) break;
+    }
+    out.ok = out.draws.length > 0;
+    return out;
+}
+"""
+
+
+def lottery_amount_text(kind, amount) -> str:
+    """抽奖额度文案：free 是站点额度、paid 是美元、activity 是活动分"""
+    try:
+        n = float(amount or 0)
+    except (TypeError, ValueError):
+        n = 0.0
+    if kind == "paid":
+        return f"${n:.4f}" if 0 < abs(n) < 0.01 else f"${n:.2f}"
+    if kind == "activity":
+        return f"活动分 {n:g}"
+    if kind == "free":
+        return f"免费额度 {n:g}"
+    return f"{n:g}"
+
+
+def lottery_note_text(res) -> str:
+    """把页内抽奖结果拼成一句话（与 Worker 侧 lotterySummaryText 同一套口径）"""
+    if not res:
+        return ""
+    if res.get("skipped"):
+        return f"未抽奖：{res.get('reason') or '没有可用的消耗方式'}"
+    draws = res.get("draws") or []
+    if not draws:
+        return f"抽奖失败：{res.get('failure') or '未知原因'}"
+    wins = 0
+    misses = 0
+    rows = {}
+    cost = {"free": 0.0, "activity": 0.0, "paid": 0.0}
+    for d in draws:
+        kind = str(d.get("prize_type") or "none")
+        try:
+            amount = float(d.get("prize_amount_actual") or d.get("prize_amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        row = rows.setdefault((kind, amount), {"wins": 0})
+        row["wins"] += 1
+        if kind == "none" or amount <= 0:
+            misses += 1
+        else:
+            wins += 1
+        for k in cost:
+            try:
+                cost[k] += float(d.get("cost_" + k) or 0)
+            except (TypeError, ValueError):
+                pass
+    parts = [f"抽奖 {len(draws)} 次：中奖 {wins} 次"]
+    won = sorted(
+        [(k, v) for k, v in rows.items() if k[0] != "none" and k[1] > 0],
+        key=lambda kv: (-kv[0][1], -kv[1]["wins"]),
+    )
+    if won:
+        parts.append("获得 " + "、".join(f"{lottery_amount_text(k, a)}×{v['wins']}" for (k, a), v in won))
+    if misses:
+        parts.append(f"未中奖 {misses} 次")
+    spent = "、".join(lottery_amount_text(k, v) for k, v in cost.items() if v > 0)
+    if spent:
+        parts.append(f"消耗 {spent}")
+    st = res.get("status") or {}
+    if st.get("daily_draw_limit") is not None:
+        parts.append(f"今日 {st.get('today_draws')}/{st.get('daily_draw_limit')}")
+    if res.get("stop"):
+        parts.append(f"提前结束：{res['stop']}")
+    if res.get("failure"):
+        parts.append(f"中途失败：{res['failure']}")
+    return "，".join(parts)
+
+
+async def auto_lottery_note(page, name, access, channel) -> str:
+    """签到顺带自动抽奖（渠道选项 autoLottery，默认关）。
+
+    整段包在 try 里：抽奖出任何问题都只追加一句说明，绝不推翻签到结论
+    （与 Worker 侧 autoLotteryNote、linux.sb 的 autoGacha 同规矩）。
+    """
+    opt = channel.get("options") or {}
+    if str(opt.get("autoLottery", "")).strip().lower() not in ("1", "true", "yes", "on"):
+        return ""
+    mode = str(opt.get("lotteryCost", "")).strip().lower()
+    if mode not in ("free", "auto", "all"):
+        mode = "free"
+    try:
+        cap = int(str(opt.get("lotteryMaxDraws", "")).strip() or 0)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        cap = LOTTERY_HARD_CAP
+    try:
+        res = await page.evaluate(JSFUNC_SUB2API_LOTTERY, [access, mode, cap])
+    except Exception as e:  # noqa: BLE001
+        return f"抽奖异常：{str(e)[:120]}"
+    note = lottery_note_text(res)
+    if note:
+        log(f"  🎰 {name}: {note}")
+    return note
+
+
 async def sub2api_login_checkin(channel, proxy=None) -> dict:
     """sub2api 站（百倍等）：账密登录 + 页面内真实签到。
 
@@ -1237,6 +1449,11 @@ async def sub2api_login_checkin(channel, proxy=None) -> dict:
             rmsg += f"，奖励 ${reward}"
         if bal is not None:
             rmsg += f"，余额 ${bal}"
+        # 5) 签到顺带自动抽奖（渠道选项 autoLottery，默认关）。
+        #    与 Worker 侧同一套口径；抽奖出问题只追加说明，不推翻签到结论。
+        lot_note = await auto_lottery_note(page, name, access, channel)
+        if lot_note:
+            rmsg += f" · {lot_note}"
         log(f"  ✅ {name}: {rmsg}")
         return {
             "name": name,

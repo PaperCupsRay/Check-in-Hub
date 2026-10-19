@@ -124,6 +124,8 @@ async function runOne(channel, runner) {
       message: r.message || (r.ok ? "ok" : "failed"),
       httpStatus: r.httpStatus ?? null,
       needsBrowser: !!r.needsBrowser,
+      // 签到顺带的抽奖结论（适配器放在 result.lottery 里）：回传后 TG 报告单独占一行
+      lottery: r.result?.lottery || null,
       quotaInfo: qi,
       ms: Date.now() - started,
     };

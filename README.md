@@ -81,7 +81,7 @@ cp .dev.vars.example .dev.vars
 
 | 类型 | 样例站点 | 鉴权 | 签到方式 |
 |------|----------|------|----------|
-| `sub2api` | Sub2API 系站点 | Bearer JWT | `POST /api/v1/check-in` |
+| `sub2api` | Sub2API 系站点（林夕 k40 / 百倍 100xlabs 等） | Bearer JWT | `POST /api/v1/check-in`；另有「抽奖」动作与「自动抽奖」开关（`POST /api/v1/lottery`） |
 | `newapi` | NewAPI / OneAPI 系 | Cookie + `New-Api-User`；带图片验证码的定制站**必须**有 `session=` | `POST /api/user/checkin`（有验证码时先 `POST /api/user/checkin/captcha` 取图） |
 | `agentrouter` | AgentRouter 等同系 | Cookie / 账密（登录前先 logout） | 查询用户信息自动签到，兼容 `sign_in` / `checkin` |
 | `nodeseek` | NodeSeek（www.nodeseek.com） | Cookie | **`gha_browser` 通道**：真浏览器过 CF 挑战后，页面内 `POST /api/attendance?random=true`（收益=鸡腿） |
@@ -95,6 +95,27 @@ cp .dev.vars.example .dev.vars
 
 - 推荐：邮箱 + 密码（Worker 会登录并必要时 refresh）
 - 或直接填 Access Token / Refresh Token
+
+**Sub2API 系站点的抽奖（林夕 k40 / 百倍 100xlabs 等）**
+
+- 站点是「免费额度 / 活动分 / 余额」三选一消耗后抽奖。渠道卡片上有 **抽奖** 按钮
+  （一键抽完今日剩余次数），另有 **自动抽奖** 开关：打开后每次签到成功会顺带抽完
+  当天剩余次数，结果随签到一起进面板日志与 TG 推送（`🎰` 一行，不会被签到文案的
+  90 字上限截断）
+- **默认只花免费额度**（`cost_type=free`）。活动分（`activity_score`）与余额是真实资产，
+  只有把渠道选项 `options.lotteryCost` 设成 `auto`（免费额度→活动分）或 `all`
+  （再加余额）才会动 —— 自动任务不该悄悄花用户的钱
+- 「今日已签到」这条路径**也会抽**：定时任务常在用户手动签过的日子拿到这个回话，
+  而抽奖次数与签到是两回事
+- 抽几次以服务端回的 `today_remaining` 为准，抽完即停；单次上限 30 次
+  （Workers 免费版单次请求子请求上限 50，签到自身还要用掉几个），可用
+  `options.lotteryMaxDraws` 调小。每次抽奖都带新的 `idempotency_key` ——
+  重复用同一个会被服务端去重，等于白抽
+- 抽奖失败**不推翻签到结论**，只追加说明；中途失败会保留已抽到的结果（奖品是真实
+  到账的）。跳过时也会写清原因（活动未开启 / 窗口未开放 / 今日次数已用完 /
+  额度不足（需 88，现有 N））
+- 浏览器通道（`gha_browser`）走的是同一套口径：脚本在页面里用登录拿到的 Bearer
+  发 `POST /api/v1/lottery`（见 `scripts/browser-checkin.py` 的 `auto_lottery_note`）
 
 **NewAPI**
 
@@ -425,9 +446,10 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
-| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + Obsidian Arc 适配器 + 图片验证码判据 |
+| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + Obsidian Arc 适配器 + Sub2API 抽奖 + 图片验证码判据 |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
 | `npm run test:onyxaxis` | 只跑 Obsidian Arc（onyxaxis）适配器的离线回归测试 |
+| `npm run test:lottery` | 只跑 Sub2API 抽奖（含浏览器通道页内抽奖 JS）的离线回归测试 |
 | `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py` + `python scripts/test-human-verify.py`，不联网、不开浏览器、不依赖 ddddocr） |
 
 ---

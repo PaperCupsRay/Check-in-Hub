@@ -7,9 +7,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "test": "node scripts/test-auth-fallback.mjs && node scripts/test-forum-adapters.mjs && node scripts/test-onyxaxis.mjs && python scripts/test-captcha.py && python scripts/test-human-verify.py",
+    "test": "node scripts/test-auth-fallback.mjs && node scripts/test-forum-adapters.mjs && node scripts/test-onyxaxis.mjs && node scripts/test-lottery.mjs && python scripts/test-captcha.py && python scripts/test-human-verify.py",
     "test:forum": "node scripts/test-forum-adapters.mjs",
     "test:onyxaxis": "node scripts/test-onyxaxis.mjs",
+    "test:lottery": "node scripts/test-lottery.mjs",
     "test:browser": "python scripts/test-forum-browser.py && python scripts/test-captcha.py && python scripts/test-human-verify.py"
   },
   "devDependencies": {

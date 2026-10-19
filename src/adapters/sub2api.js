@@ -253,10 +253,209 @@ function failureMessage(data, fallback) {
   return msg || reason || fallback;
 }
 
+/* ------------------------------------------------------------------ *
+ * 抽奖（林夕 k40 / 百倍 100xlabs 等同系站点）
+ *
+ * 接口（2026-10-19 线上实测 + 用户 HAR，Bearer 鉴权与签到同一套 token）：
+ *   GET  /api/v1/lottery/status?timezone=Asia/Shanghai
+ *        → enabled / window_open / can_draw / today_draws / daily_draw_limit /
+ *          today_remaining / activity_score / balance / free_balance /
+ *          costs{free,activity,paid}{enabled,amount} / prizes[]
+ *        device_id 是站点前端自己塞的统计参数，实测可省（带与不带回同一份数据）。
+ *   POST /api/v1/lottery  { cost_type, idempotency_key, boost }
+ *        → data.draw{...} + activity_score / balance / free_balance /
+ *          today_draws / today_remaining
+ *   GET  /api/v1/lottery/draws?page=&page_size=     → 历史记录
+ *   GET  /api/v1/lottery/summary?timezone=          → 累计统计
+ *
+ * 站点是「免费额度 / 活动分 / 余额」三选一消耗后抽奖，所以自动抽奖必须自己决定
+ * 花哪一种：默认只花免费额度（签到发的额度，花掉不影响别的资产）。活动分
+ * （activity_score，上限 100，站点另有「增益」用途）与余额是用户真实资产，
+ * 只有显式把 options.lotteryCost 设成 auto / all 才会动 —— 自动任务不该悄悄
+ * 花用户的钱。
+ * ------------------------------------------------------------------ */
+
+const LOTTERY_PATH = "/api/v1/lottery";
+/** 单次自动抽奖的硬上限：Workers 免费版单次请求子请求上限 50，签到自身还要用掉几个 */
+const LOTTERY_HARD_CAP = 30;
+const LOTTERY_COST_LABEL = { free: "免费额度", activity: "活动分", paid: "余额" };
+const LOTTERY_COST_MODES = new Set(["free", "auto", "all"]);
+
+/** 自动抽奖开关（照 linux.sb 的 autoGacha / onyxaxis 的 autoClaim 惯例，默认关） */
+function autoLotteryOn(channel) {
+  const v = channel.options?.autoLottery ?? channel.auth?.autoLottery;
+  return v === true || v === "true" || v === 1 || v === "1";
+}
+
+/** 消耗方式：free=只花免费额度（默认）；auto=免费额度→活动分；all=再退到余额 */
+function lotteryCostMode(channel) {
+  const v = String(channel.options?.lotteryCost ?? "").trim().toLowerCase();
+  return LOTTERY_COST_MODES.has(v) ? v : "free";
+}
+
+function lotteryBudget(channel, remaining) {
+  const cap = Number(channel.options?.lotteryMaxDraws);
+  const limit = Number.isFinite(cap) && cap > 0 ? Math.min(Math.floor(cap), LOTTERY_HARD_CAP) : LOTTERY_HARD_CAP;
+  return Math.max(0, Math.min(remaining, limit));
+}
+
+function numOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeLotteryStatus(payload) {
+  const d = payload?.data || payload || {};
+  const costs = d.costs || {};
+  const cost = (key) => ({
+    enabled: !!costs[key]?.enabled,
+    amount: numOrNull(costs[key]?.amount),
+  });
+  return {
+    enabled: d.enabled !== false,
+    windowOpen: d.window_open !== false,
+    canDraw: !!d.can_draw,
+    title: d.title || "",
+    activityScore: numOrNull(d.activity_score),
+    activityCap: numOrNull(d.activity_cap),
+    balance: numOrNull(d.balance),
+    freeBalance: numOrNull(d.free_balance),
+    bonusDraws: numOrNull(d.bonus_draws) ?? 0,
+    todayDraws: numOrNull(d.today_draws) ?? 0,
+    dailyDrawLimit: numOrNull(d.daily_draw_limit),
+    todayRemaining: numOrNull(d.today_remaining) ?? 0,
+    quotaResetHour: numOrNull(d.quota_reset_hour),
+    costs: { free: cost("free"), activity: cost("activity"), paid: cost("paid") },
+    prizes: Array.isArray(d.prizes) ? d.prizes : [],
+    batchDraw: d.batch_draw || null,
+    boost: d.boost || null,
+    raw: d,
+  };
+}
+
+/** 抽奖额度文案：free 是站点额度、paid 是美元、activity 是活动分 */
+function lotteryAmountText(type, amount) {
+  const n = numOrNull(amount) ?? 0;
+  if (type === "paid") return `$${n.toFixed(Math.abs(n) < 0.01 && n !== 0 ? 4 : 2)}`;
+  if (type === "activity") return `活动分 ${n}`;
+  if (type === "free") return `免费额度 ${n}`;
+  return String(n);
+}
+
+/**
+ * 挑本次抽奖的消耗方式。按 mode 给出的顺序取第一个「已开放 + 余额够」的：
+ * 免费额度看 free_balance，活动分看 activity_score，余额看 balance。
+ * 一个都不可用时把每个候选的原因拼出来，面板上要能看出「为什么不抽」。
+ */
+function pickLotteryCost(status, mode) {
+  const order = mode === "all" ? ["free", "activity", "paid"] : mode === "auto" ? ["free", "activity"] : ["free"];
+  const balanceOf = { free: status.freeBalance, activity: status.activityScore, paid: status.balance };
+  const why = [];
+  for (const key of order) {
+    const label = LOTTERY_COST_LABEL[key];
+    const c = status.costs[key];
+    const bal = balanceOf[key];
+    if (!c.enabled) {
+      why.push(`${label}未开放`);
+      continue;
+    }
+    if (c.amount == null || c.amount <= 0) {
+      why.push(`${label}消耗额未配置`);
+      continue;
+    }
+    if (bal == null || bal < c.amount) {
+      why.push(`${label}不足（需 ${c.amount}，现有 ${bal == null ? "?" : bal}）`);
+      continue;
+    }
+    return { type: key, amount: c.amount, reason: "" };
+  }
+  return { type: null, amount: null, reason: why.join("；") || "没有可用的消耗方式" };
+}
+
+/** 用一次抽奖的响应更新状态（服务端是权威：余额与剩余次数都以它为准） */
+function statusAfterDraw(status, data) {
+  const d = data?.data || data || {};
+  return {
+    ...status,
+    activityScore: numOrNull(d.activity_score) ?? status.activityScore,
+    balance: numOrNull(d.balance) ?? status.balance,
+    freeBalance: numOrNull(d.free_balance) ?? status.freeBalance,
+    todayDraws: numOrNull(d.today_draws) ?? status.todayDraws,
+    todayRemaining: numOrNull(d.today_remaining) ?? status.todayRemaining,
+  };
+}
+
+/** 汇总本轮所有抽奖记录：中奖/未中奖、按奖品聚合、各类消耗 */
+function summarizeDraws(draws) {
+  const rows = new Map();
+  const cost = { free: 0, activity: 0, paid: 0 };
+  const prize = { free: 0, activity: 0, paid: 0 };
+  let wins = 0;
+  let misses = 0;
+  for (const d of draws) {
+    const type = String(d?.prize_type || "none");
+    const amount = numOrNull(d?.prize_amount_actual ?? d?.prize_amount) ?? 0;
+    const key = `${type}:${amount}`;
+    const row = rows.get(key) || { type, amount, wins: 0, total: 0 };
+    row.wins += 1;
+    row.total += amount;
+    rows.set(key, row);
+    if (type === "none" || amount <= 0) misses += 1;
+    else wins += 1;
+    cost.free += numOrNull(d?.cost_free) ?? 0;
+    cost.activity += numOrNull(d?.cost_activity) ?? 0;
+    cost.paid += numOrNull(d?.cost_paid) ?? 0;
+    if (prize[type] != null) prize[type] += amount;
+  }
+  const byPrize = [...rows.values()].sort((a, b) => b.amount - a.amount || b.wins - a.wins);
+  return { count: draws.length, wins, misses, cost, prize, byPrize };
+}
+
+/** 消耗文案：只列真正花掉的那几类 */
+function lotteryCostText(cost) {
+  const parts = [];
+  for (const key of ["free", "activity", "paid"]) {
+    const v = cost?.[key] || 0;
+    if (v > 0) parts.push(lotteryAmountText(key, v));
+  }
+  return parts.join("、");
+}
+
+/** 本轮抽奖的一句话结论（面板日志 / TG 推送共用） */
+function lotterySummaryText(summary, status, stopReason = "") {
+  const parts = [`抽奖 ${summary.count} 次：中奖 ${summary.wins} 次`];
+  const won = summary.byPrize.filter((r) => r.type !== "none" && r.amount > 0);
+  if (won.length) {
+    parts.push(`获得 ${won.map((r) => `${lotteryAmountText(r.type, r.amount)}×${r.wins}`).join("、")}`);
+  }
+  if (summary.misses) parts.push(`未中奖 ${summary.misses} 次`);
+  const costText = lotteryCostText(summary.cost);
+  if (costText) parts.push(`消耗 ${costText}`);
+  if (status?.dailyDrawLimit != null) parts.push(`今日 ${status.todayDraws}/${status.dailyDrawLimit}`);
+  else if (status?.todayDraws != null) parts.push(`今日已抽 ${status.todayDraws} 次`);
+  if (stopReason) parts.push(`提前结束：${stopReason}`);
+  return parts.join("，");
+}
+
+/** 抽奖前的跳过原因（活动关着 / 窗口没开 / 今日抽完），没有则返回空串 */
+function lotterySkipReason(status) {
+  if (!status.enabled) return "站点未开启抽奖活动";
+  if (!status.windowOpen) return "抽奖窗口未开放";
+  if (!status.canDraw) return "站点当前不允许抽奖（can_draw=false）";
+  if (status.todayRemaining <= 0) {
+    return `今日次数已用完（${status.todayDraws}/${status.dailyDrawLimit ?? "?"}）`;
+  }
+  return "";
+}
+
 export const sub2apiAdapter = {
   id: "sub2api",
   name: "Sub2API",
-  description: "JWT Bearer 鉴权（k40 / 100xlabs 等同系）",
+  description: "JWT Bearer 鉴权（k40 / 100xlabs 等同系）；支持自动抽奖",
+  // 面板按这个数组在渠道卡片上多渲染一个按钮（见 src/ui.html 的 extraButtons）。
+  // 卡片上的「自动抽奖」开关读的也是这里 —— 有 lottery 动作才显示（见 ui.html）。
+  actions: [{ action: "lottery", label: "抽奖", title: "立即抽完今日剩余次数（默认只花免费额度）" }],
   fields: [
     { key: "baseUrl", label: "站点地址", placeholder: "https://k40.example.com", required: true },
     { key: "auth.email", label: "邮箱", placeholder: "user@example.com" },
@@ -264,6 +463,16 @@ export const sub2apiAdapter = {
     { key: "auth.accessToken", label: "Access Token（可选，优先于账密）", type: "password" },
     { key: "auth.refreshToken", label: "Refresh Token（可选）", type: "password" },
     { key: "options.timezone", label: "时区", placeholder: "Asia/Shanghai" },
+    {
+      key: "options.autoLottery",
+      label: "签到后自动抽奖（今日剩余次数一次抽完，结果随签到一起推送）",
+      type: "checkbox",
+    },
+    {
+      key: "options.lotteryCost",
+      label: "抽奖消耗方式（free=只花免费额度，默认；auto=免费额度→活动分；all=再退到余额）",
+      placeholder: "free",
+    },
   ],
 
   async request(channel, path, { method = "GET", body, token } = {}) {
@@ -401,7 +610,9 @@ export const sub2apiAdapter = {
     // POST /api/v1/check-in —— 重复签到请求，且第二次通常报「今日已签到」覆盖真实奖励。
     if (!authExpired(result)) {
       // 签到接口自己要求人机验证（message 含 turnstile 之类）也算「只有浏览器能解」
-      if (ensured.tokens) result.tokens = ensured.tokens;
+      // 登录换来的 token 与 runner 自己刷出来的 token 合并：runner 的更晚，优先它
+      // （checkin 里顺带的抽奖就可能刷出新 token，不能被登录那份旧的盖回去）
+      if (ensured.tokens) result.tokens = { ...ensured.tokens, ...(result.tokens || {}) };
       return withBrowserHint(result);
     }
 
@@ -505,6 +716,216 @@ export const sub2apiAdapter = {
     });
   },
 
+  /**
+   * 抽奖状态（只读）：活动开关、今日剩余次数、可用消耗方式、余额。
+   * 与站点前端一致只带 timezone —— device_id 实测可省。
+   */
+  async lotteryStatus(channel, token = "") {
+    const run = async (tk) => {
+      const tz = encodeURIComponent(timezoneOf(channel));
+      const res = await this.request(channel, `/api/v1/lottery/status?timezone=${tz}`, { token: tk });
+      const data = res.data || {};
+      if (res.status >= 400 || data.code !== 0) {
+        return {
+          ok: false,
+          httpStatus: res.status,
+          message: failureMessage(data, `获取抽奖状态失败 HTTP ${res.status}`),
+          raw: data,
+        };
+      }
+      return {
+        ok: true,
+        httpStatus: res.status,
+        status: normalizeLotteryStatus(data),
+        message: data.message || "ok",
+        raw: data,
+      };
+    };
+    // 调用方（checkin 的顺带抽奖）已经拿着刚签到时用的 token，别再走一遍刷新/登录
+    if (token) return run(token);
+    return this.withAuthRetry(channel, (tk) => run(tk));
+  },
+
+  /**
+   * 抽奖：把今日剩余次数一次抽完（面板「抽奖」按钮与签到后的自动抽奖都走这里）。
+   *
+   * 循环口径：
+   *   · 每抽一次都以服务端回的 today_remaining 为准，抽完即停；
+   *   · 每抽一次都用最新余额重新挑消耗方式 —— 免费额度抽干了，mode=auto/all 时
+   *     能顺势退到活动分/余额，mode=free（默认）则停下并说明原因；
+   *   · 单次上限 LOTTERY_HARD_CAP（可用 options.lotteryMaxDraws 调小）；
+   *   · 中途失败保留已抽到的结果，把失败原因一并报出来（抽到的奖品是真实到账的，
+   *     不能因为后面一次失败就当成整体失败）。
+   * 每次抽奖都带新的 idempotency_key：重复用同一个 key 会被服务端去重，等于白抽。
+   */
+  async lottery(channel) {
+    return this.withAuthRetry(channel, async (token, authVia) => {
+      const statusRes = await this.lotteryStatus(channel, token);
+      if (!statusRes.ok) {
+        return { ok: false, httpStatus: statusRes.httpStatus, message: statusRes.message, raw: statusRes.raw };
+      }
+      let status = statusRes.status;
+      const mode = lotteryCostMode(channel);
+      const base = {
+        enabled: status.enabled,
+        canDraw: status.canDraw,
+        todayDraws: status.todayDraws,
+        dailyDrawLimit: status.dailyDrawLimit,
+        todayRemaining: status.todayRemaining,
+        costs: status.costs,
+        balance: status.balance,
+        freeBalance: status.freeBalance,
+        activityScore: status.activityScore,
+      };
+
+      const skip = lotterySkipReason(status);
+      if (skip) {
+        return {
+          ok: true,
+          skipped: true,
+          httpStatus: statusRes.httpStatus,
+          message: `未抽奖：${skip}`,
+          result: { skipped: true, reason: skip, summary: null, draws: [], status: base },
+          raw: statusRes.raw,
+        };
+      }
+
+      let cost = pickLotteryCost(status, mode);
+      if (!cost.type) {
+        return {
+          ok: true,
+          skipped: true,
+          httpStatus: statusRes.httpStatus,
+          message: `未抽奖：${cost.reason}（消耗方式 ${mode}）`,
+          result: { skipped: true, reason: cost.reason, costMode: mode, summary: null, draws: [], status: base },
+          raw: statusRes.raw,
+        };
+      }
+
+      const budget = lotteryBudget(channel, status.todayRemaining);
+      const draws = [];
+      let stopReason = "";
+      let failure = null;
+      let lastRaw = statusRes.raw;
+      for (let i = 0; i < budget; i += 1) {
+        if (i > 0) {
+          // 上一抽之后余额可能已经不够了：重新挑一次，挑不到就停
+          const next = pickLotteryCost(status, mode);
+          if (!next.type) {
+            stopReason = next.reason;
+            break;
+          }
+          cost = next;
+        }
+        const res = await this.request(channel, LOTTERY_PATH, {
+          method: "POST",
+          token,
+          body: { cost_type: cost.type, idempotency_key: crypto.randomUUID(), boost: false },
+        });
+        const data = res.data || {};
+        if (res.status >= 400 || data.code !== 0) {
+          failure = {
+            httpStatus: res.status,
+            message: failureMessage(data, `抽奖失败 HTTP ${res.status}`),
+            raw: data,
+          };
+          break;
+        }
+        lastRaw = data;
+        const draw = data.data?.draw || null;
+        if (draw) draws.push(draw);
+        status = statusAfterDraw(status, data);
+        if (status.todayRemaining <= 0) break;
+      }
+
+      const summary = summarizeDraws(draws);
+      const finalStatus = {
+        ...base,
+        todayDraws: status.todayDraws,
+        todayRemaining: status.todayRemaining,
+        balance: status.balance,
+        freeBalance: status.freeBalance,
+        activityScore: status.activityScore,
+      };
+      const result = {
+        count: summary.count,
+        wins: summary.wins,
+        misses: summary.misses,
+        cost: summary.cost,
+        prize: summary.prize,
+        byPrize: summary.byPrize,
+        draws: draws.map((d) => ({
+          id: d.id,
+          prize_type: d.prize_type,
+          prize_amount: d.prize_amount,
+          prize_amount_actual: d.prize_amount_actual,
+          cost_type: d.cost_type,
+          cost_free: d.cost_free,
+          cost_activity: d.cost_activity,
+          cost_paid: d.cost_paid,
+          status: d.status,
+          created_at: d.created_at,
+        })),
+        costMode: mode,
+        costType: cost.type,
+        stopReason: stopReason || null,
+        failure: failure ? { httpStatus: failure.httpStatus, message: failure.message } : null,
+        status: finalStatus,
+      };
+
+      // 一次都没抽成（第一抽就失败）才算失败；抽到过奖品就是成功，失败原因写进文案
+      if (!draws.length && failure) {
+        return {
+          ok: false,
+          httpStatus: failure.httpStatus,
+          message: `抽奖失败：${failure.message}`,
+          result,
+          raw: failure.raw,
+          authVia,
+        };
+      }
+      let message = lotterySummaryText(summary, finalStatus, stopReason);
+      if (failure) message += `；中途失败：${failure.message}`;
+      return {
+        ok: true,
+        httpStatus: lastRaw === statusRes.raw ? statusRes.httpStatus : 200,
+        message,
+        result,
+        raw: lastRaw,
+        authVia,
+      };
+    });
+  },
+
+  /**
+   * 签到顺带自动抽奖（渠道选项 options.autoLottery，默认关）。
+   * 抽奖失败不推翻签到结论，只追加说明（与 linux.sb 的 autoGacha 同规矩）；
+   * 顺带把抽奖过程中刷新出来的 token 交回给调用方持久化。
+   */
+  async autoLotteryNote(channel, token) {
+    if (!autoLotteryOn(channel)) return { note: "", tokens: null, lottery: null };
+    let r;
+    try {
+      r = await this.lottery({
+        ...channel,
+        auth: { ...(channel.auth || {}), accessToken: token || channel.auth?.accessToken || "" },
+      });
+    } catch (err) {
+      return { note: ` · 抽奖异常：${err.message || String(err)}`, tokens: null, lottery: { ok: false, message: err.message || String(err) } };
+    }
+    const lottery = {
+      ok: !!r.ok,
+      skipped: !!r.skipped,
+      message: r.message || "",
+      result: r.result || null,
+    };
+    return {
+      note: r.ok ? ` · ${r.message}` : ` · 抽奖失败：${r.message}`,
+      tokens: r.tokens || null,
+      lottery,
+    };
+  },
+
   async checkin(channel) {
     return this.withAuthRetry(channel, async (token, authVia) => {
       const auth = pickAuth(channel);
@@ -535,14 +956,20 @@ export const sub2apiAdapter = {
           raw: data,
         };
       }
+      // 签到成功后顺带自动抽奖（渠道选项 options.autoLottery，默认关）。
+      // 「今日已签到」这条路径也要抽：定时任务常在用户手动签过的日子拿到这个回话，
+      // 而抽奖次数与签到是两回事（与 onyxaxis 的 autoClaim 同规矩）。
+      // 抽奖失败不推翻签到结论，只追加说明。
+      const lot = await this.autoLotteryNote(channel, token);
       return {
         ok: true,
         httpStatus: res.status,
-        result: normalized,
+        result: lot.lottery ? { ...normalized, lottery: lot.lottery } : normalized,
         // 自行拼装的结论优先于服务端的 "success" 套话，否则日志只剩「渠道名：success」
-        message: `${AUTH_VIA_LABEL[authVia] || ""}${normalized.message || data.message || "签到成功"}`,
+        message: `${AUTH_VIA_LABEL[authVia] || ""}${normalized.message || data.message || "签到成功"}${lot.note}`,
         raw: data,
         authVia: authVia || null,
+        tokens: lot.tokens || undefined,
       };
     });
   },

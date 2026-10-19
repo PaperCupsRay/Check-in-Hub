@@ -954,6 +954,16 @@
             <textarea data-field="${key}" rows="4" placeholder="${ph}" style="width:100%;min-height:88px;font-family:var(--mono);font-size:.8rem;line-height:1.4;"></textarea>
           `;
         }
+        // 开关型选项（如 sub2api 的 options.autoLottery）：勾上写 "true"，取消则删掉该 key
+        if (type === "checkbox") {
+          const id = `fld_${key.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+          return `
+            <div class="check-row">
+              <input type="checkbox" id="${id}" data-field="${key}" />
+              <label for="${id}">${label}</label>
+            </div>
+          `;
+        }
         return `
           <label>${label}</label>
           <input data-field="${key}" type="${type}" placeholder="${ph}" />
@@ -990,6 +1000,21 @@
       return ch == null || ch.enabled !== false;
     }
 
+    /** 渠道里的开关型选项存的是字符串 "true"（UI 勾选）或 true（导入的 JSON） */
+    function isFlagOn(val) {
+      if (val === true || val === 1) return true;
+      return ["1", "true", "yes", "on"].includes(String(val ?? "").trim().toLowerCase());
+    }
+
+    /** 该渠道类型是否支持抽奖（适配器自报 lottery 动作，见 adapters/sub2api.js） */
+    function supportsLottery(type) {
+      return (adapterOf(type)?.actions || []).some((x) => x.action === "lottery");
+    }
+
+    function autoLotteryOnCh(ch) {
+      return isFlagOn(ch?.options?.autoLottery);
+    }
+
     function readForm() {
       const type = currentType();
       const channel = {
@@ -1006,6 +1031,13 @@
       const clearedKeys = [];
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");
+        // 开关型字段：勾上写 "true"，取消则记进 _clearedKeys（= 删掉这个 key），
+        // 与「留空 = 要删掉」的文本字段同一套语义
+        if (el.type === "checkbox") {
+          if (el.checked) setByPath(channel, key, "true");
+          else clearedKeys.push(key);
+          return;
+        }
         let val = el.value;
         if (key === "auth.cookie" || key.endsWith(".cookie") || key.endsWith(".session")) {
           val = normalizeCookieInput(val);
@@ -1060,6 +1092,10 @@
       document.querySelectorAll("[data-field]").forEach((el) => {
         const key = el.getAttribute("data-field");
         const val = getByPath(ch, key);
+        if (el.type === "checkbox") {
+          el.checked = isFlagOn(val);
+          return;
+        }
         el.value = val == null ? "" : String(val);
       });
     }
@@ -1074,7 +1110,10 @@
       if (tsk) tsk.value = "";
       if ($("channelEnabled")) $("channelEnabled").checked = true;
       renderFields();
-      document.querySelectorAll("[data-field]").forEach((el) => { el.value = ""; });
+      document.querySelectorAll("[data-field]").forEach((el) => {
+        if (el.type === "checkbox") el.checked = false;
+        else el.value = "";
+      });
     }
 
     function numOrNull(v) {
@@ -1253,6 +1292,11 @@
       }
 
       if (result.alreadyCheckedIn) parts.push("今日已签到");
+      // 签到顺带的抽奖结论（适配器放在 result.lottery 里）：单独一段，别和签到文案混在一起。
+      // 服务端 message 里通常已经带了同一段（适配器追加的），那种情况就别重复一遍。
+      if (result.lottery?.message && !msg.includes(result.lottery.message)) {
+        parts.push(`${result.lottery.ok === false ? "抽奖失败" : "抽奖"}：${result.lottery.message}`);
+      }
       if (result.reward != null) {
         const usd = moneyLabel(result.reward, perUnit);
         if (usd) parts.push(`奖励 ${usd}`);
@@ -1413,6 +1457,14 @@
                   <input type="checkbox" data-enable-toggle ${enabled ? "checked" : ""} />
                   启用
                 </label>
+                ${
+                  supportsLottery(ch.type)
+                    ? `<label title="签到成功后自动把今日剩余次数一次抽完；结果随签到一起推送（默认只花免费额度）">
+                  <input type="checkbox" data-lottery-toggle ${autoLotteryOnCh(ch) ? "checked" : ""} />
+                  自动抽奖
+                </label>`
+                    : ""
+                }
               </div>
             </div>
             <div class="actions">
@@ -1782,17 +1834,35 @@
     });
 
     $("channelList").addEventListener("change", (ev) => {
-      const input = ev.target.closest("input[data-enable-toggle]");
-      if (!input) return;
-      const card = input.closest(".channel");
+      const card = ev.target.closest(".channel");
       const id = card?.dataset.id;
       if (!id) return;
       const idx = channels.findIndex((c) => c.id === id);
       if (idx < 0) return;
-      channels[idx] = { ...channels[idx], enabled: !!input.checked };
-      saveChannels({ immediateKv: true });
-      log(`${channels[idx].name} → ${input.checked ? "已启用" : "已停用"}（批量/定时将跳过停用项）`, "info");
-      showToast(input.checked ? "已启用渠道" : "已停用渠道", channels[idx].name, "info");
+      const enableInput = ev.target.closest("input[data-enable-toggle]");
+      const lotteryInput = ev.target.closest("input[data-lottery-toggle]");
+      if (enableInput) {
+        channels[idx] = { ...channels[idx], enabled: !!enableInput.checked };
+        saveChannels({ immediateKv: true });
+        log(`${channels[idx].name} → ${enableInput.checked ? "已启用" : "已停用"}（批量/定时将跳过停用项）`, "info");
+        showToast(enableInput.checked ? "已启用渠道" : "已停用渠道", channels[idx].name, "info");
+        return;
+      }
+      if (lotteryInput) {
+        // 抽奖开关存成 options.autoLottery："true" / 删掉（与表单里的复选框同一套语义）
+        const prev = channels[idx];
+        const options = { ...(prev.options || {}) };
+        if (lotteryInput.checked) options.autoLottery = "true";
+        else delete options.autoLottery;
+        channels[idx] = { ...prev, options };
+        saveChannels({ immediateKv: true });
+        log(
+          `${prev.name} → 自动抽奖${lotteryInput.checked ? "已开启" : "已关闭"}` +
+            (lotteryInput.checked ? "（签到成功后自动抽完今日剩余次数，结果随签到推送）" : ""),
+          "info"
+        );
+        showToast(lotteryInput.checked ? "已开启自动抽奖" : "已关闭自动抽奖", prev.name, "info");
+      }
     });
 
     $("btnRunAll").addEventListener("click", async () => {

@@ -306,7 +306,8 @@ async function handleCheckin(request, env) {
     return json({ ok: false, error: "channel.baseUrl must start with http(s)://" }, 400);
   }
 
-  const allowed = new Set(["login", "me", "status", "checkin", "refresh", "gacha", "claim"]);
+  // lottery = 手动/自动抽奖（sub2api 系站点，见 adapters/sub2api.js）
+  const allowed = new Set(["login", "me", "status", "checkin", "refresh", "gacha", "claim", "lottery"]);
   if (!allowed.has(action)) {
     return json({ ok: false, error: `unsupported action: ${action}` }, 400);
   }
@@ -325,7 +326,12 @@ async function handleCheckin(request, env) {
       await sendTelegram(
         env,
         formatCheckinReport("📌 单渠道签到", [
-          { name: channel.name, ok: !!result?.ok, message: result?.message || (result?.ok ? "ok" : "failed") },
+          {
+            name: channel.name,
+            ok: !!result?.ok,
+            message: result?.message || (result?.ok ? "ok" : "failed"),
+            lottery: result?.result?.lottery || null,
+          },
         ])
       );
     }
@@ -407,7 +413,12 @@ async function handleBatch(request, env) {
       env,
       formatCheckinReport(
         "📋 全部签到报告",
-        results.map(({ name, ok, message }) => ({ name, ok, message }))
+        results.map(({ name, ok, message, result: res }) => ({
+          name,
+          ok,
+          message,
+          lottery: res?.lottery || null,
+        }))
       )
     );
   }
@@ -723,6 +734,8 @@ async function runScheduled(env) {
       baseUrl: item.baseUrl,
       ok: !!result.ok,
       message: result.message,
+      // 签到顺带的抽奖结论（适配器放在 result.lottery 里）也要进 TG 报告
+      ...(result.result?.lottery ? { lottery: result.result.lottery } : {}),
       ...(via !== "worker" ? { via } : {}),
     });
   }
@@ -739,7 +752,10 @@ async function runScheduled(env) {
   // TG 通知（未配置 secrets 时静默跳过）
   const tg = await sendTelegram(
     env,
-    formatCheckinReport("📋 定时签到报告", results.map(({ name, ok, message }) => ({ name, ok, message })))
+    formatCheckinReport(
+      "📋 定时签到报告",
+      results.map(({ name, ok, message, lottery }) => ({ name, ok, message, lottery }))
+    )
   );
   if (!tg.ok && !tg.skipped) console.log("TG 通知失败:", tg.error || tg.status);
   return { ok: true, results, skipped, lastRun, tg };
@@ -950,7 +966,7 @@ async function handleGhResult(request, env) {
     merged++;
   }
   if (merged) await putChannels(env, channels);
-  const flat = results.map((r) => ({ name: r.name, ok: !!r.ok, message: r.message }));
+  const flat = results.map((r) => ({ name: r.name, ok: !!r.ok, message: r.message, lottery: r.lottery || null }));
   await putLastRun(env, {
     at: new Date().toISOString(),
     runner: "github-actions",

@@ -420,12 +420,15 @@ try {
     ok(/直接点「签到」/.test(fresh.message), "提示直接签到即可", fresh.message);
   }
 
-  console.log("\n[22] 适配器自报动作：只有 linux.sb 有「抽称号」");
+  console.log("\n[22] 适配器自报动作：linux.sb 抽称号、sub2api 抽奖，其余没有");
   {
     const { listAdapters } = await import("../src/adapters/index.js");
     const map = Object.fromEntries(listAdapters().map((a) => [a.id, a.actions]));
     ok(map.linuxsb?.some((x) => x.action === "gacha" && x.label === "抽称号"), "linux.sb 上报 gacha", JSON.stringify(map.linuxsb));
-    for (const id of ["nodeseek", "nodeloc", "newapi", "sub2api"]) {
+    // sub2api 系（林夕 k40 / 百倍 100xlabs）2026-10-19 起支持抽奖：
+    // 面板按这个动作渲染「抽奖」按钮，卡片上的「自动抽奖」开关也以它为准
+    ok(map.sub2api?.some((x) => x.action === "lottery"), "sub2api 上报 lottery", JSON.stringify(map.sub2api));
+    for (const id of ["nodeseek", "nodeloc", "newapi"]) {
       ok(!map[id]?.length, `${id} 没有额外动作`, JSON.stringify(map[id]));
     }
   }
