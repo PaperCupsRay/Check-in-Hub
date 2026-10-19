@@ -257,14 +257,32 @@
     .tag.quota { background: #0c1a33; color: #93c5fd; border-color: #1d4ed8; }
     .channel .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 12px; }
     .channel .actions button { padding: 7px 10px; font-size: .85rem; }
-    /* 「抽几次」数字框：与按钮同高，窄一点，别抢按钮的视觉重量 */
-    .channel .actions input.action-count {
-      width: 68px;
-      padding: 7px 8px;
-      font-size: .85rem;
-      text-align: center;
+
+    /* 抽奖弹窗：状态行 + 次数选择 + 逐次结果日志 */
+    .lottery-status {
+      display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center;
+      padding: 10px 12px; margin: 10px 0 12px;
+      background: #0a1120; border: 1px solid var(--border); border-radius: 12px;
+      font-size: .85rem; color: var(--muted);
     }
-    .channel .actions input.action-count::placeholder { color: var(--muted); }
+    .lottery-status b { color: #e2e8f0; }
+    .lottery-status .warn-text { color: #fde68a; }
+    .lottery-status .err-text { color: #fca5a5; }
+    .lottery-count { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .lottery-count input[type="number"] { width: 92px; text-align: center; }
+    .lottery-count .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .lottery-count .chips button { padding: 6px 12px; font-size: .82rem; }
+    .lottery-count .chips button.on { border-color: var(--accent2); color: #fff; }
+    #lotteryLog {
+      min-height: 132px; max-height: 300px; overflow: auto;
+      background: #070d18; border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px; font-family: var(--mono); font-size: .82rem; line-height: 1.5;
+    }
+    #lotteryLog .log-line { margin-bottom: .35rem; }
+    #lotteryLog .log-line:last-child { margin-bottom: 0; }
+    .lottery-actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+    .lottery-actions .spacer { flex: 1; }
+    .lottery-progress { font-size: .82rem; color: var(--muted); }
     pre {
       margin: 0; white-space: pre-wrap; word-break: break-word;
       font-family: var(--mono); font-size: .8rem; line-height: 1.45;
@@ -505,6 +523,42 @@
     </section>
   </div>
 
+  <!-- 抽奖弹窗：点卡片上的「抽奖」打开。选抽几次、逐次看结果 -->
+  <div class="modal-backdrop" id="lotteryBackdrop"></div>
+  <div class="modal" id="lotteryModal" aria-modal="true" role="dialog" aria-labelledby="lotteryTitle">
+    <section class="modal-card">
+      <div class="modal-head">
+        <h2 id="lotteryTitle">抽奖</h2>
+        <button id="btnCloseLottery" class="secondary icon" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="hint" id="lotteryHint">正在读取抽奖状态…</div>
+
+      <div class="lottery-status" id="lotteryStatus"></div>
+
+      <div class="lottery-count">
+        <label for="lotteryCount" style="margin:0">抽几次</label>
+        <input type="number" id="lotteryCount" min="1" step="1" inputmode="numeric" placeholder="全部" />
+        <div class="chips" id="lotteryChips"></div>
+        <span class="lottery-progress" id="lotteryProgress"></span>
+      </div>
+
+      <div id="lotteryLog" aria-live="polite"></div>
+
+      <div class="lottery-actions">
+        <button id="btnLotteryStart" class="success" type="button">开始抽奖</button>
+        <button id="btnLotteryStop" class="secondary" type="button" style="display:none">停止</button>
+        <span class="spacer"></span>
+        <button id="btnLotteryRefresh" class="ghost" type="button">刷新状态</button>
+        <button id="btnLotteryClose" class="ghost" type="button">关闭</button>
+      </div>
+      <div class="hint">
+        留空 = 抽完今日剩余次数。默认只花免费额度（<code>options.lotteryCost</code> 可改成
+        <code>auto</code>/<code>all</code>）。每次抽奖都带新的 <code>idempotency_key</code>，
+        结果同时进面板日志与 TG 推送。
+      </div>
+    </section>
+  </div>
+
   <div class="drawer-backdrop" id="logBackdrop"></div>
   <aside class="log-drawer" id="logDrawer" aria-label="运行日志">
     <div class="drawer-head">
@@ -611,10 +665,9 @@
     let kvState = { bound: false, ready: false, channelCount: null, lastRun: null, syncing: false };
     let kvPersistTimer = null;
     let kvHydrated = false;
-    // 「抽几次」数字框的值，按 渠道id:动作 存着。只活在页面内存里（不写 KV）：
-    // 保存/运行后 renderList() 会重建卡片，不记住的话填的数字每次都被清空。
-    const actionCounts = {};
-
+    // 抽奖弹窗的运行态（见 openLotteryModal）：一次只开一个弹窗，
+    // running 用来挡住「抽到一半又点一次开始」，stop 是「停止」按钮的旗标。
+    const lotteryState = { channelId: null, running: false, stop: false, done: 0, total: 0, maxDraws: 0, costType: "", costAmount: null };
 
     const $ = (id) => document.getElementById(id);
     const logEl = $("log");
@@ -1283,21 +1336,16 @@
     /**
      * 该渠道类型可用的额外按钮（linux.sb 的「抽称号」、sub2api 的「抽奖」）。
      *
-     * 动作自报了 count 时，按钮前面多一个数字框（抽几次）；留空 = 用适配器的
-     * 默认口径（抽奖就是抽完今日剩余次数）。值按 渠道id:动作 记住，见 actionCounts。
+     * 动作自报了 count 时，点它开的是抽奖弹窗（选几次 + 逐次结果日志），
+     * 见 openLotteryModal；其余动作照旧直接执行。
      */
-    function extraButtons(type, channelId) {
+    function extraButtons(type) {
       const a = adapterOf(type);
-      return (a?.actions || []).map((x) => {
-        const act = escapeHtml(x.action);
-        const btn = `<button data-act="${act}" class="secondary" title="${escapeHtml(x.title || x.label || "")}">${escapeHtml(x.label || x.action)}</button>`;
-        if (!x.count) return btn;
-        const key = `${channelId}:${x.action}`;
-        const val = actionCounts[key] ?? "";
-        return `<input type="number" class="action-count" data-count-for="${act}" min="1" step="1" inputmode="numeric"
-                  value="${escapeHtml(val)}" placeholder="${escapeHtml(x.count.placeholder || "")}"
-                  title="${escapeHtml(x.count.title || "")}" aria-label="${escapeHtml(x.count.title || "次数")}" />${btn}`;
-      }).join("");
+      return (a?.actions || [])
+        .map((x) =>
+          `<button data-act="${escapeHtml(x.action)}" class="secondary" title="${escapeHtml(x.title || x.label || "")}">${escapeHtml(x.label || x.action)}</button>`
+        )
+        .join("");
     }
 
     function buildSummary(action, data = {}) {
@@ -1607,7 +1655,7 @@
       }
     }
 
-    async function runChannel(id, action, extra = {}) {
+    async function runChannel(id, action) {
       const idx = channels.findIndex((c) => c.id === id);
       if (idx < 0) return;
       let ch = channels[idx];
@@ -1624,11 +1672,10 @@
       if ((action === "checkin" || action === "me") && runner !== "worker") {
         return runViaGha(ch, runner, action);
       }
-      const countText = extra.count ? `${extra.count} 次` : "";
-      log(`${ch.name} → ${actionLabel(action)}${countText ? `（${countText}）` : ""} ...`, "info");
+      log(`${ch.name} → ${actionLabel(action)} ...`, "info");
       showToast(`${ch.name}：${actionLabel(action)}中`, "完整过程可点 Log 查看", "info", 2200);
       try {
-        let data = await api(action, ch, extra);
+        let data = await api(action, ch);
         if (data.tokens) {
           ch = mergeTokens(ch, data.tokens);
         }
@@ -1715,6 +1762,273 @@
       }
     }
 
+    /* ---------------- 抽奖弹窗 ---------------- *
+     *
+     * 为什么抽奖单独做成弹窗而不是卡片上一个数字框：抽奖是「一次性消耗 + 逐次出结果」
+     * 的动作，用户要看的是「第几次抽到什么」。弹窗里能先看清今日剩余与消耗方式，
+     * 再决定抽几次，抽的过程中每出一条结果就追加一行，还能中途停。
+     *
+     * 循环放在面板侧（每次请求只抽 1 次），而不是一次请求抽 N 次：这样每条结果都是
+     * 真实到账后立刻显示，也能随时停；服务端仍然逐次校验（次数用完/额度不足都会回话）。
+     */
+
+    /** 弹窗里的一行日志（与侧边 Log 抽屉同款式，带时间戳） */
+    function lotteryLogLine(msg, level = "info") {
+      const box = $("lotteryLog");
+      const div = document.createElement("div");
+      div.className = "log-line";
+      div.innerHTML = `<span class="t">[${new Date().toLocaleTimeString()}]</span> <span class="${level}">${escapeHtml(msg)}</span>`;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function updateLotteryProgress() {
+      const { done, total } = lotteryState;
+      $("lotteryProgress").textContent = total ? `已抽 ${done} / ${total} 次` : "";
+    }
+
+    /** 弹窗里显示/记录用的消耗方式（来自 lotteryInfo，抽奖前先让用户看清花什么） */
+    function lotteryCostText() {
+      const t = lotteryState.costType;
+      if (!t) return "";
+      return `${lotteryCostLabel(t)} ${lotteryState.costAmount ?? ""}/次`;
+    }
+
+    function lotteryDrawText(draw) {
+      const type = String(draw.prize_type || "none");
+      const amount = Number(draw.prize_amount_actual ?? draw.prize_amount ?? 0);
+      let prize;
+      if (type === "none" || !(amount > 0)) prize = "未中奖";
+      else if (type === "paid") prize = `中奖 $${amount.toFixed(2)} 付费额度`;
+      else if (type === "free") prize = `中奖 免费额度 ${amount}`;
+      else if (type === "activity") prize = `中奖 活动分 ${amount}`;
+      else prize = `中奖 ${type} ${amount}`;
+      const cost = [];
+      if (Number(draw.cost_free) > 0) cost.push(`免费额度 ${draw.cost_free}`);
+      if (Number(draw.cost_activity) > 0) cost.push(`活动分 ${draw.cost_activity}`);
+      if (Number(draw.cost_paid) > 0) cost.push(`$${Number(draw.cost_paid).toFixed(2)}`);
+      return cost.length ? `${prize}（消耗 ${cost.join("、")}）` : prize;
+    }
+
+    function lotteryCostLabel(type) {
+      return { free: "免费额度", activity: "活动分", paid: "余额" }[type] || type || "";
+    }
+
+    function setLotteryRunning(running) {
+      lotteryState.running = running;
+      $("btnLotteryStart").disabled = running;
+      $("btnLotteryStart").textContent = running ? "抽奖中…" : "开始抽奖";
+      $("btnLotteryStop").style.display = running ? "" : "none";
+      $("btnLotteryRefresh").disabled = running;
+      $("lotteryCount").disabled = running;
+    }
+
+    function updateLotteryProgress() {
+      const { done, total } = lotteryState;
+      $("lotteryProgress").textContent = total ? `已抽 ${done} / ${total} 次` : "";
+    }
+
+    function openLotteryModal(id) {
+      const ch = channels.find((c) => c.id === id);
+      if (!ch) return;
+      lotteryState.channelId = id;
+      lotteryState.running = false;
+      lotteryState.stop = false;
+      lotteryState.done = 0;
+      lotteryState.total = 0;
+      lotteryState.maxDraws = 0;
+      $("lotteryTitle").textContent = `抽奖 · ${ch.name}`;
+      $("lotteryLog").innerHTML = "";
+      $("lotteryCount").value = "";
+      $("lotteryChips").innerHTML = "";
+      $("lotteryStatus").innerHTML = "";
+      $("lotteryProgress").textContent = "";
+      setLotteryRunning(false);
+      $("lotteryBackdrop").classList.add("show");
+      $("lotteryModal").classList.add("show");
+      lotteryLogLine(`渠道：${ch.name}（${ch.baseUrl}）`, "info");
+      loadLotteryStatus();
+    }
+
+    function closeLotteryModal() {
+      // 抽到一半要关：先把循环停掉，别让请求继续打出去（当前这一次会跑完）
+      if (lotteryState.running) lotteryState.stop = true;
+      $("lotteryBackdrop").classList.remove("show");
+      $("lotteryModal").classList.remove("show");
+    }
+
+    /** 状态行 + 次数快捷键（1/3/5/全部） */
+    function renderLotteryStatus(ch, data) {
+      const st = data.status || {};
+      const info = data.result || {};
+      lotteryState.maxDraws = Number(st.todayRemaining) || 0;
+      lotteryState.costType = info.costType || "";
+      lotteryState.costAmount = info.costAmount ?? null;
+      const row = [];
+      if (st.dailyDrawLimit != null) {
+        row.push(`今日 <b>${st.todayDraws ?? 0}/${st.dailyDrawLimit}</b>，剩余 <b>${st.todayRemaining ?? 0}</b> 次`);
+      } else {
+        row.push(`今日剩余 <b>${st.todayRemaining ?? 0}</b> 次`);
+      }
+      row.push(`免费额度 <b>${st.freeBalance ?? "?"}</b>`);
+      if (st.activityScore != null) row.push(`活动分 <b>${st.activityScore}</b>`);
+      if (st.balance != null) row.push(`余额 <b>$${Number(st.balance).toFixed(2)}</b>`);
+      if (info.costType) {
+        row.push(`本次消耗：<b>${escapeHtml(lotteryCostLabel(info.costType))}</b> ${escapeHtml(String(info.costAmount ?? ""))}/次`);
+      }
+      $("lotteryStatus").innerHTML = row.map((x) => `<span>${x}</span>`).join("");
+
+      if (info.canDraw) {
+        $("lotteryHint").innerHTML = `可以抽 <b>${lotteryState.maxDraws}</b> 次。选次数后点「开始抽奖」，每抽一次都会在这里留一行记录。`;
+      } else {
+        $("lotteryHint").innerHTML = `<span class="err-text">现在抽不了：${escapeHtml(info.reason || data.message || "未知原因")}</span>`;
+      }
+
+      const chips = [];
+      for (const n of [1, 3, 5]) {
+        if (lotteryState.maxDraws >= n) chips.push(`<button type="button" data-count="${n}">${n} 次</button>`);
+      }
+      if (lotteryState.maxDraws > 0) {
+        chips.push(`<button type="button" data-count="all">全部（${lotteryState.maxDraws}）</button>`);
+      }
+      $("lotteryChips").innerHTML = chips.join("");
+      $("btnLotteryStart").disabled = !info.canDraw || lotteryState.running;
+    }
+
+    async function loadLotteryStatus() {
+      const ch = channels.find((c) => c.id === lotteryState.channelId);
+      if (!ch) return;
+      $("lotteryHint").textContent = "正在读取抽奖状态…";
+      try {
+        const data = await api("lotteryInfo", ch);
+        if (!data.ok) {
+          $("lotteryHint").innerHTML = `<span class="err-text">读取抽奖状态失败：${escapeHtml(data.message || "")}</span>`;
+          $("lotteryStatus").innerHTML = "";
+          $("lotteryChips").innerHTML = "";
+          lotteryLogLine(`状态读取失败：${data.message || "未知原因"}`, "err");
+          return;
+        }
+        renderLotteryStatus(ch, data);
+      } catch (e) {
+        $("lotteryHint").innerHTML = `<span class="err-text">读取抽奖状态失败：${escapeHtml(e.message || String(e))}</span>`;
+        lotteryLogLine(`状态读取失败：${e.message || e}`, "err");
+      }
+    }
+
+    /** 抽奖主循环：每次请求只抽 1 次，逐条落日志；服务端说没次数了就停 */
+    async function runLottery() {
+      const ch = channels.find((c) => c.id === lotteryState.channelId);
+      if (!ch || lotteryState.running) return;
+
+      const raw = String($("lotteryCount").value || "").trim();
+      const want = raw === "" ? 0 : Math.floor(Number(raw));
+      if (raw !== "" && (!Number.isFinite(want) || want <= 0)) {
+        showToast("次数填得不对", "请填正整数，或留空表示抽完今日剩余次数", "warn");
+        return;
+      }
+      const max = lotteryState.maxDraws;
+      if (max <= 0) {
+        showToast("现在抽不了", "今日剩余次数为 0，或消耗方式不可用", "warn");
+        return;
+      }
+      const total = want > 0 ? Math.min(want, max) : max;
+      if (want > max) lotteryLogLine(`填了 ${want} 次，今日只剩 ${max} 次 —— 按 ${total} 次抽`, "warn");
+
+      lotteryState.total = total;
+      lotteryState.done = 0;
+      lotteryState.stop = false;
+      setLotteryRunning(true);
+      lotteryLogLine(`开始抽奖 ${total} 次${lotteryCostText() ? `（消耗 ${lotteryCostText()}）` : ""}`, "info");
+      updateLotteryProgress();
+
+      let wins = 0;
+      let misses = 0;
+      let failure = "";
+      const prizes = new Map();
+      for (let i = 0; i < total; i += 1) {
+        if (lotteryState.stop) {
+          lotteryLogLine(`已停止：抽了 ${lotteryState.done} 次`, "warn");
+          break;
+        }
+        let data;
+        try {
+          data = await api("lottery", ch, { count: 1 });
+        } catch (e) {
+          failure = e.message || String(e);
+          lotteryLogLine(`第 ${i + 1} 次请求失败：${failure}`, "err");
+          break;
+        }
+        if (data.tokens) {
+          Object.assign(ch, mergeTokens(ch, data.tokens));
+        }
+        const r = data.result || {};
+        const draw = (r.draws || [])[0];
+        if (data.ok && draw) {
+          lotteryState.done += 1;
+          const none = String(draw.prize_type) === "none" || !(Number(draw.prize_amount_actual ?? draw.prize_amount) > 0);
+          if (none) misses += 1;
+          else {
+            wins += 1;
+            const key = `${draw.prize_type}:${draw.prize_amount_actual ?? draw.prize_amount}`;
+            prizes.set(key, (prizes.get(key) || 0) + 1);
+          }
+          lotteryLogLine(`#${lotteryState.done} ${lotteryDrawText(draw)}`, none ? "warn" : "ok");
+        } else if (data.ok) {
+          // 跳过（今日抽完 / 额度不足）：不是错误，但得说清为什么没抽成
+          const reason = r.reason || data.message || "未知原因";
+          lotteryLogLine(`第 ${i + 1} 次跳过：${reason}`, "warn");
+          break;
+        } else {
+          // 真失败（鉴权失效 / 站点 5xx / 业务码非 0）：与「跳过」分开写，别混成一句
+          failure = r.reason || data.message || "未知原因";
+          lotteryLogLine(`第 ${i + 1} 次失败：${failure}`, "err");
+          break;
+        }
+        updateLotteryProgress();
+        const remain = Number(r.status?.todayRemaining);
+        if (Number.isFinite(remain) && remain <= 0) {
+          lotteryLogLine("今日次数已用完", "warn");
+          break;
+        }
+      }
+      setLotteryRunning(false);
+
+      const parts = [`抽奖 ${lotteryState.done} 次`];
+      if (wins) parts.push(`中奖 ${wins} 次`);
+      if (misses) parts.push(`未中奖 ${misses} 次`);
+      if (prizes.size) {
+        parts.push(
+          `获得 ${[...prizes.entries()]
+            .map(([k, n]) => `${lotteryCostLabel(k.split(":")[0])} ${k.split(":")[1]}×${n}`)
+            .join("、")}`
+        );
+      }
+      if (failure) parts.push(`失败：${failure}`);
+      const summary = parts.join("，");
+      lotteryLogLine(`完成：${summary}`, failure ? "err" : "ok");
+      updateLotteryProgress();
+
+      // 写回渠道卡片（字段与 runChannel 一致），侧边 Log 也留一条
+      const idx = channels.findIndex((c) => c.id === ch.id);
+      if (idx >= 0) {
+        channels[idx] = {
+          ...ch,
+          lastResult: {
+            ok: !failure,
+            action: "lottery",
+            short: `${lotteryState.done} 次 · 中奖 ${wins} 次`,
+            summary: `抽奖：${summary}`,
+            at: Date.now(),
+          },
+        };
+        saveChannels();
+      }
+      log(`${ch.name} 抽奖 → ${summary}`, failure ? "err" : "ok");
+      showToast(`${ch.name}：抽奖${failure ? "中断" : "完成"}`, summary, failure ? "err" : "ok", 4200);
+      await loadLotteryStatus();
+    }
+
+
     $("type").addEventListener("change", renderFields);
     $("filterType").addEventListener("change", (ev) => {
       filterType = ev.target.value;
@@ -1728,6 +2042,30 @@
     $("btnCloseModal").addEventListener("click", closeChannelModal);
     $("btnCancelModal").addEventListener("click", closeChannelModal);
     $("modalBackdrop").addEventListener("click", closeChannelModal);
+
+    /* 抽奖弹窗 */
+    $("btnCloseLottery").addEventListener("click", closeLotteryModal);
+    $("btnLotteryClose").addEventListener("click", closeLotteryModal);
+    $("lotteryBackdrop").addEventListener("click", closeLotteryModal);
+    $("btnLotteryStart").addEventListener("click", runLottery);
+    $("btnLotteryStop").addEventListener("click", () => {
+      lotteryState.stop = true;
+      $("btnLotteryStop").disabled = true;
+      lotteryLogLine("收到停止请求：本次抽完就停", "warn");
+    });
+    $("btnLotteryRefresh").addEventListener("click", loadLotteryStatus);
+    $("lotteryCount").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") runLottery();
+    });
+    // 次数快捷键：点一下就把数字填进输入框（"all" = 抽完今日剩余）
+    $("lotteryChips").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-count]");
+      if (!btn) return;
+      const v = btn.getAttribute("data-count");
+      $("lotteryCount").value = v === "all" ? "" : v;
+      for (const b of $("lotteryChips").querySelectorAll("button")) b.classList.toggle("on", b === btn);
+    });
+
     $("btnOpenLog").addEventListener("click", openLogDrawer);
     $("btnCloseLog").addEventListener("click", closeLogDrawer);
     $("logBackdrop").addEventListener("click", closeLogDrawer);
@@ -1735,6 +2073,7 @@
       if (ev.key === "Escape") {
         closeChannelModal();
         closeLogDrawer();
+        closeLotteryModal();
       }
     });
     $("btnReset").addEventListener("click", resetForm);
@@ -1862,36 +2201,17 @@
         openLogDrawer();
         return;
       }
-      // 「抽几次」数字框（动作自报 count 时才有）：留空 = 用适配器默认口径
-      const countEl = card.querySelector(`input[data-count-for="${act}"]`);
-      const rawCount = countEl ? String(countEl.value || "").trim() : "";
-      const count = Number(rawCount);
-      const extra = rawCount && Number.isFinite(count) && count > 0 ? { count: Math.floor(count) } : {};
-      if (countEl && rawCount && !extra.count) {
-        showToast("次数填得不对", "请填正整数，或留空表示抽完今日剩余次数", "warn");
+      // 动作自报了 count（抽奖）→ 开弹窗：在里面选抽几次、逐次看结果
+      const declared = (adapterOf(channels.find((c) => c.id === id)?.type)?.actions || []).find((x) => x.action === act);
+      if (declared?.count) {
+        openLotteryModal(id);
         return;
       }
       btn.disabled = true;
-      if (countEl) countEl.disabled = true;
-      try { await runChannel(id, act, extra); }
-      finally {
-        btn.disabled = false;
-        if (countEl) countEl.disabled = false;
-      }
+      try { await runChannel(id, act); }
+      finally { btn.disabled = false; }
     });
 
-    // 记住「抽几次」数字框的值：保存/运行后 renderList() 会重建卡片，
-    // 不记住的话填的数字每次都被清空（见 actionCounts 的说明）。
-    $("channelList").addEventListener("input", (ev) => {
-      const input = ev.target.closest("input[data-count-for]");
-      if (!input) return;
-      const id = input.closest(".channel")?.dataset.id;
-      if (!id) return;
-      const key = `${id}:${input.getAttribute("data-count-for")}`;
-      const val = String(input.value || "").trim();
-      if (val === "") delete actionCounts[key];
-      else actionCounts[key] = val;
-    });
 
     $("channelList").addEventListener("change", (ev) => {
       const card = ev.target.closest(".channel");

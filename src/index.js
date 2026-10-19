@@ -306,8 +306,18 @@ async function handleCheckin(request, env) {
     return json({ ok: false, error: "channel.baseUrl must start with http(s)://" }, 400);
   }
 
-  // lottery = 手动/自动抽奖（sub2api 系站点，见 adapters/sub2api.js）
-  const allowed = new Set(["login", "me", "status", "checkin", "refresh", "gacha", "claim", "lottery"]);
+  // lottery = 手动/自动抽奖；lotteryInfo = 抽奖弹窗用的只读状态（sub2api 系站点，见 adapters/sub2api.js）
+  const allowed = new Set([
+    "login",
+    "me",
+    "status",
+    "checkin",
+    "refresh",
+    "gacha",
+    "claim",
+    "lottery",
+    "lotteryInfo",
+  ]);
   if (!allowed.has(action)) {
     return json({ ok: false, error: `unsupported action: ${action}` }, 400);
   }

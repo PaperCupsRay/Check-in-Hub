@@ -675,6 +675,65 @@ try {
     const gacha = listAdapters().find((x) => x.id === "linuxsb")?.actions?.find((x) => x.action === "gacha");
     ok(!gacha?.count, "linux.sb 的抽称号没有 count（不渲染数字框）", JSON.stringify(gacha));
   }
+
+  console.log("\n[14] 抽奖弹窗的只读状态（lotteryInfo）：面板先看清再抽");
+  {
+    // 正常：能抽，给出次数与消耗方式
+    let calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+    });
+    let info = await sub2apiAdapter.lotteryInfo(ch());
+    ok(info.ok === true, "ok=true", info.message);
+    ok(info.result.canDraw === true, "canDraw=true", JSON.stringify(info.result));
+    ok(info.result.maxDraws === 11, "maxDraws=今日剩余 11", String(info.result.maxDraws));
+    ok(info.result.costType === "free", "costType=free（默认只花免费额度）", String(info.result.costType));
+    ok(info.result.costAmount === 88, "costAmount=88", String(info.result.costAmount));
+    ok(info.result.hardCap === 30, "hardCap=30 一并给出", String(info.result.hardCap));
+    ok(info.status.todayRemaining === 11, "status 透传给面板（今日剩余/余额一起显示）", String(info.status.todayRemaining));
+    ok(calls.length === 1 && calls[0].method === "GET", "只发一次只读请求（不消耗次数）", `${calls.length}`);
+    ok(calls[0].headers.Authorization === `Bearer ${TOKEN}`, "Bearer 正常", calls[0].headers.Authorization);
+
+    // 今日抽完：canDraw=false + 原因
+    mockFetch({ "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 0, today_draws: 12 })) });
+    info = await sub2apiAdapter.lotteryInfo(ch());
+    ok(info.result.canDraw === false, "抽完 → canDraw=false", JSON.stringify(info.result));
+    ok(/今日次数已用完/.test(info.result.reason), "给出原因", info.result.reason);
+
+    // 活动关闭 / 额度不足
+    mockFetch({ "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ enabled: false })) });
+    info = await sub2apiAdapter.lotteryInfo(ch());
+    ok(/站点未开启抽奖活动/.test(info.result.reason), "活动关闭 → 原因写清", info.result.reason);
+
+    mockFetch({ "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ free_balance: 10 })) });
+    info = await sub2apiAdapter.lotteryInfo(ch());
+    ok(/免费额度不足/.test(info.result.reason), "免费额度不够 → 原因写清", info.result.reason);
+
+    // 关键回归：走 runAction 时 extra 从第二个参数进来。lotteryStatus 的签名若还是
+    // 裸字符串 token，这里就会把 {} 拼成 "Bearer [object Object]"（站点回 401）。
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 5, today_draws: 7 })),
+    });
+    const viaAction = await runAction("sub2api", "lotteryInfo", ch());
+    ok(viaAction.ok === true, "runAction('lotteryInfo') 可用", viaAction.message);
+    ok(calls[0].headers.Authorization === `Bearer ${TOKEN}`, "鉴权头没被 extra 污染", calls[0].headers.Authorization);
+    ok(viaAction.result.maxDraws === 5, "次数经 runAction 也能拿到", String(viaAction.result.maxDraws));
+
+    // 鉴权失效时也要能自愈（弹窗打开时 token 刚过期）
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": (() => {
+        let n = 0;
+        return () => {
+          n += 1;
+          if (n === 1) return json(401, { code: "TOKEN_EXPIRED", message: "token expired" });
+          return json(200, STATUS_BODY({ today_remaining: 3, today_draws: 9 }));
+        };
+      })(),
+      "POST /api/v1/auth/refresh": () => json(200, { code: 0, data: { access_token: "fresh-token", refresh_token: "r2" } }),
+    });
+    info = await sub2apiAdapter.lotteryInfo(ch({ refreshToken: "r1" }));
+    ok(info.ok === true, "token 过期 → 刷新后拿到状态", info.message);
+    ok(info.result.maxDraws === 3, "刷新后次数正确", String(info.result.maxDraws));
+  }
 } finally {
   globalThis.fetch = restoreFetch;
 }

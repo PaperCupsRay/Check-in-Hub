@@ -475,13 +475,13 @@ export const sub2apiAdapter = {
   description: "JWT Bearer 鉴权（k40 / 100xlabs 等同系）；支持自动抽奖",
   // 面板按这个数组在渠道卡片上多渲染一个按钮（见 src/ui.html 的 extraButtons）。
   // 卡片上的「自动抽奖」开关读的也是这里 —— 有 lottery 动作才显示（见 ui.html）。
-  // count 表示这个动作在卡片上带一个「抽几次」数字框（留空 = 抽完今日剩余次数）；
-  // 面板按它渲染输入框并把值随请求发过来（见 src/ui.html 的 extraButtons / runChannel）。
+  // count 表示这个动作在卡片上点开的是一个「抽几次」弹窗（见 src/ui.html 的
+  // 抽奖弹窗）：面板据此决定要不要渲染次数选择与日志区。
   actions: [
     {
       action: "lottery",
       label: "抽奖",
-      title: "抽几次由旁边数字框决定；留空 = 抽完今日剩余次数（默认只花免费额度）",
+      title: "打开抽奖弹窗：选抽几次、看每一次的结果（默认只花免费额度）",
       count: { placeholder: "全部", title: "要抽几次（留空 = 抽完今日剩余次数）" },
     },
   ],
@@ -753,8 +753,12 @@ export const sub2apiAdapter = {
   /**
    * 抽奖状态（只读）：活动开关、今日剩余次数、可用消耗方式、余额。
    * 与站点前端一致只带 timezone —— device_id 实测可省。
+   *
+   * 第二个参数走对象（{ token }）而不是裸字符串：面板的抽奖弹窗会通过
+   * runAction 调它（extra 从第二个参数传进来），裸字符串签名会把 extra 对象
+   * 当成 token 拼成 "Bearer [object Object]"。
    */
-  async lotteryStatus(channel, token = "") {
+  async lotteryStatus(channel, { token = "" } = {}) {
     const run = async (tk) => {
       const tz = encodeURIComponent(timezoneOf(channel));
       const res = await this.request(channel, `/api/v1/lottery/status?timezone=${tz}`, { token: tk });
@@ -776,8 +780,34 @@ export const sub2apiAdapter = {
       };
     };
     // 调用方（checkin 的顺带抽奖）已经拿着刚签到时用的 token，别再走一遍刷新/登录
+    // 调用方（checkin 的顺带抽奖）已经拿着刚签到时用的 token，别再走一遍刷新/登录
     if (token) return run(token);
     return this.withAuthRetry(channel, (tk) => run(tk));
+  },
+
+  /** 面板抽奖弹窗用：状态 + 这次能抽几次（今日剩余与消耗方式都算好） */
+  async lotteryInfo(channel) {
+    const res = await this.lotteryStatus(channel);
+    if (!res.ok) return res;
+    const status = res.status;
+    const mode = lotteryCostMode(channel);
+    const cost = pickLotteryCost(status, mode);
+    const skip = lotterySkipReason(status);
+    return {
+      ...res,
+      message: skip || cost.reason || `可抽 ${lotteryBudget(channel, status.todayRemaining)} 次`,
+      status,
+      // 面板读的是 result（publicResult 只透传 result/status，别的顶层字段会被丢掉）
+      result: {
+        canDraw: !skip && !!cost.type,
+        reason: skip || cost.reason || "",
+        costMode: mode,
+        costType: cost.type,
+        costAmount: cost.amount,
+        maxDraws: lotteryBudget(channel, status.todayRemaining),
+        hardCap: LOTTERY_HARD_CAP,
+      },
+    };
   },
 
   /**
@@ -799,7 +829,7 @@ export const sub2apiAdapter = {
    */
   async lottery(channel, { count } = {}) {
     return this.withAuthRetry(channel, async (token, authVia) => {
-      const statusRes = await this.lotteryStatus(channel, token);
+      const statusRes = await this.lotteryStatus(channel, { token });
       if (!statusRes.ok) {
         return { ok: false, httpStatus: statusRes.httpStatus, message: statusRes.message, raw: statusRes.raw };
       }
