@@ -23,7 +23,7 @@ import fs from "node:fs";
 
 
 import { sub2apiAdapter } from "../src/adapters/sub2api.js";
-import { listAdapters } from "../src/adapters/index.js";
+import { listAdapters, runAction } from "../src/adapters/index.js";
 import { formatCheckinReport } from "../src/tg.js";
 
 let failures = 0;
@@ -577,6 +577,103 @@ try {
     });
     await lotteryInPage(["page-token", "free", 2]);
     ok(calls.filter((c) => c.method === "POST").length === 2, "cap 生效（lotteryMaxDraws 透传）", String(calls.filter((c) => c.method === "POST").length));
+  }
+
+  console.log("\n[13] 抽几次可选（面板数字框 → runAction extra.count）");
+  {
+    const seqOf = (n, start = 11) =>
+      drawSequence(Array.from({ length: n }, () => ({ type: "free", amount: 30 })), { startRemaining: start });
+    const drawCalls = (calls) => calls.filter((c) => c.method === "POST" && c.u.pathname === "/api/v1/lottery");
+
+    // 填 2 → 就抽 2 次（今日还剩 11 次也不多抽）
+    let calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+      "POST /api/v1/lottery": seqOf(20),
+    });
+    let r = await sub2apiAdapter.lottery(ch(), { count: 2 });
+    ok(drawCalls(calls).length === 2, "count=2 只抽 2 次", `draws=${drawCalls(calls).length}`);
+    ok(r.ok === true, "成功", r.message);
+    ok(/抽奖 2 次/.test(r.message), "文案写 2 次", r.message);
+    ok(r.result.requested === 2, "result.requested=2", String(r.result.requested));
+    ok(r.result.stopReason === null, "抽够了就不写「提前结束」", String(r.result.stopReason));
+
+    // 填 5、今日只剩 3 → 抽 3 次并说明原因
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 3, today_draws: 9 })),
+      "POST /api/v1/lottery": seqOf(10, 3),
+    });
+    r = await sub2apiAdapter.lottery(ch(), { count: 5 });
+    ok(drawCalls(calls).length === 3, "count=5 但只剩 3 次 → 抽 3 次", `draws=${drawCalls(calls).length}`);
+    ok(/提前结束：今日只剩 3 次/.test(r.message), "说明是被今日剩余次数卡住", r.message);
+
+    // 填 50 → 受硬上限 30 约束，并说明
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 99, today_draws: 0 })),
+      "POST /api/v1/lottery": seqOf(60, 99),
+    });
+    r = await sub2apiAdapter.lottery(ch(), { count: 50 });
+    ok(drawCalls(calls).length === 30, "count=50 → 硬上限 30 次", `draws=${drawCalls(calls).length}`);
+    ok(/提前结束：单次上限 30 次/.test(r.message), "说明是被硬上限卡住", r.message);
+
+    // 留空 / 无效值 → 回到默认口径（抽完今日剩余）
+    for (const [label, extra] of [
+      ["不传 count", {}],
+      ["count 为空串", { count: "" }],
+      ["count=0", { count: 0 }],
+      ["count 是垃圾值", { count: "abc" }],
+      ["count 为负", { count: -3 }],
+    ]) {
+      calls = mockFetch({
+        "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 4, today_draws: 8 })),
+        "POST /api/v1/lottery": seqOf(10, 4),
+      });
+      r = await sub2apiAdapter.lottery(ch(), extra);
+      ok(drawCalls(calls).length === 4, `${label} → 抽完今日剩余 4 次`, `draws=${drawCalls(calls).length}`);
+      ok(r.result.requested === null, `${label} → requested=null`, String(r.result.requested));
+    }
+
+    // 手填的次数优先于 options.lotteryMaxDraws（后者是自动抽奖的上限，不是手动上限）
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+      "POST /api/v1/lottery": seqOf(20),
+    });
+    r = await sub2apiAdapter.lottery(ch({}, { lotteryMaxDraws: "2" }), { count: 5 });
+    ok(drawCalls(calls).length === 5, "手填 5 次优先于 lotteryMaxDraws=2", `draws=${drawCalls(calls).length}`);
+
+    // 自动抽奖不吃手填次数：走 lotteryMaxDraws
+    calls = mockFetch({
+      "POST /api/v1/check-in": () => json(200, CHECKIN_BODY),
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+      "POST /api/v1/lottery": seqOf(20),
+    });
+    r = await sub2apiAdapter.checkin(ch({}, { autoLottery: "true", lotteryMaxDraws: "2" }));
+    ok(drawCalls(calls).length === 2, "自动抽奖按 lotteryMaxDraws=2 抽", `draws=${drawCalls(calls).length}`);
+    ok(/抽奖 2 次/.test(r.message), "签到文案里也是 2 次", r.message);
+
+    // 整数化：填 2.9 只抽 2 次（别把小数发给站点）
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+      "POST /api/v1/lottery": seqOf(20),
+    });
+    r = await sub2apiAdapter.lottery(ch(), { count: 2.9 });
+    ok(drawCalls(calls).length === 2, "count=2.9 → 2 次", `draws=${drawCalls(calls).length}`);
+
+    // runAction 要把 extra 透传给适配器（面板走的就是这条路）
+    calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 11, today_draws: 1 })),
+      "POST /api/v1/lottery": seqOf(20),
+    });
+    r = await runAction("sub2api", "lottery", ch(), { count: 3 });
+    ok(drawCalls(calls).length === 3, "runAction 透传 count", `draws=${drawCalls(calls).length}`);
+    ok(r.ok === true, "runAction 返回适配器结果", r.message);
+
+    // 适配器要自报 count，面板才知道要渲染数字框
+    const act = listAdapters().find((x) => x.id === "sub2api")?.actions?.find((x) => x.action === "lottery");
+    ok(!!act?.count, "lottery 动作自报 count（面板据此渲染数字框）", JSON.stringify(act));
+    ok(!!act?.count?.placeholder, "count 带 placeholder（留空提示）", JSON.stringify(act?.count));
+    // 其它动作不受影响：linux.sb 的抽称号没有 count，面板不会给它加数字框
+    const gacha = listAdapters().find((x) => x.id === "linuxsb")?.actions?.find((x) => x.action === "gacha");
+    ok(!gacha?.count, "linux.sb 的抽称号没有 count（不渲染数字框）", JSON.stringify(gacha));
   }
 } finally {
   globalThis.fetch = restoreFetch;

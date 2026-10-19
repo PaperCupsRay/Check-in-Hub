@@ -41,12 +41,18 @@ export function getAdapter(type) {
   return a;
 }
 
-export async function runAction(type, action, channel) {
+/**
+ * 执行适配器动作。
+ *
+ * extra 是本次动作的附加参数（目前只有抽奖的 { count }）：适配器按需读，
+ * 不读的适配器忽略即可 —— 这样加参数不用改每个适配器的签名。
+ */
+export async function runAction(type, action, channel, extra = {}) {
   const adapter = getAdapter(type);
   if (typeof adapter[action] !== "function") {
     const err = new Error(`渠道 ${type} 不支持动作 ${action}`);
     err.status = 400;
     throw err;
   }
-  return adapter[action](channel);
+  return adapter[action](channel, extra);
 }

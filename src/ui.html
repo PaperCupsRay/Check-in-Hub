@@ -257,6 +257,14 @@
     .tag.quota { background: #0c1a33; color: #93c5fd; border-color: #1d4ed8; }
     .channel .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 12px; }
     .channel .actions button { padding: 7px 10px; font-size: .85rem; }
+    /* 「抽几次」数字框：与按钮同高，窄一点，别抢按钮的视觉重量 */
+    .channel .actions input.action-count {
+      width: 68px;
+      padding: 7px 8px;
+      font-size: .85rem;
+      text-align: center;
+    }
+    .channel .actions input.action-count::placeholder { color: var(--muted); }
     pre {
       margin: 0; white-space: pre-wrap; word-break: break-word;
       font-family: var(--mono); font-size: .8rem; line-height: 1.45;
@@ -603,6 +611,10 @@
     let kvState = { bound: false, ready: false, channelCount: null, lastRun: null, syncing: false };
     let kvPersistTimer = null;
     let kvHydrated = false;
+    // 「抽几次」数字框的值，按 渠道id:动作 存着。只活在页面内存里（不写 KV）：
+    // 保存/运行后 renderList() 会重建卡片，不记住的话填的数字每次都被清空。
+    const actionCounts = {};
+
 
     const $ = (id) => document.getElementById(id);
     const logEl = $("log");
@@ -1268,12 +1280,24 @@
       return "";
     }
 
-    /** 该渠道类型可用的额外按钮（目前只有 linux.sb 的「抽称号」） */
-    function extraButtons(type) {
+    /**
+     * 该渠道类型可用的额外按钮（linux.sb 的「抽称号」、sub2api 的「抽奖」）。
+     *
+     * 动作自报了 count 时，按钮前面多一个数字框（抽几次）；留空 = 用适配器的
+     * 默认口径（抽奖就是抽完今日剩余次数）。值按 渠道id:动作 记住，见 actionCounts。
+     */
+    function extraButtons(type, channelId) {
       const a = adapterOf(type);
-      return (a?.actions || []).map((x) =>
-        `<button data-act="${escapeHtml(x.action)}" class="secondary" title="${escapeHtml(x.title || x.label || "")}">${escapeHtml(x.label || x.action)}</button>`
-      ).join("");
+      return (a?.actions || []).map((x) => {
+        const act = escapeHtml(x.action);
+        const btn = `<button data-act="${act}" class="secondary" title="${escapeHtml(x.title || x.label || "")}">${escapeHtml(x.label || x.action)}</button>`;
+        if (!x.count) return btn;
+        const key = `${channelId}:${x.action}`;
+        const val = actionCounts[key] ?? "";
+        return `<input type="number" class="action-count" data-count-for="${act}" min="1" step="1" inputmode="numeric"
+                  value="${escapeHtml(val)}" placeholder="${escapeHtml(x.count.placeholder || "")}"
+                  title="${escapeHtml(x.count.title || "")}" aria-label="${escapeHtml(x.count.title || "次数")}" />${btn}`;
+      }).join("");
     }
 
     function buildSummary(action, data = {}) {
@@ -1284,8 +1308,12 @@
       const raw = user.raw || data.raw?.data || data.raw || {};
       const perUnit = pickQuotaPerUnit(raw);
       const msg = String(data.message || data.error || "").trim();
+      // 抽奖的 message 本身就是拼好的结论（「抽奖 3 次：中奖 2 次，获得 免费额度 300×1，
+      // 消耗 免费额度 264，今日 12/12」），里面必然出现「额度 + 数字」，会被下面那条
+      // 噪声判据整句丢掉、只剩「抽奖成功」——所以抽奖单独放行。
+      const isLottery = action === "lottery" || (result.count != null && Array.isArray(result.byPrize));
       // 原始 message 常夹带大数字额度，优先用结构化字段生成 $ 文案
-      const msgLooksNoisy = /\d{5,}|quota|额度\s*[\d,]+/i.test(msg);
+      const msgLooksNoisy = !isLottery && /\d{5,}|quota|额度\s*[\d,]+/i.test(msg);
       if (data.ok === false && msg) parts.push(msg);
       else if (msg && !msgLooksNoisy && !/^(ok|success|failed|成功)$/i.test(msg)) {
         parts.push(msg);
@@ -1469,7 +1497,7 @@
             </div>
             <div class="actions">
               <button data-act="checkin" class="success">签到</button>
-              ${extraButtons(ch.type)}
+              ${extraButtons(ch.type, ch.id)}
               <button data-act="me" class="secondary">余额</button>
               <button data-act="log" class="secondary" title="查看该渠道最近一次结果与日志">日志</button>
               <button data-act="edit" class="secondary" title="编辑 / 状态 / 登录校验">编辑</button>
@@ -1480,12 +1508,12 @@
       }).join("");
     }
 
-    async function api(action, channel) {
+    async function api(action, channel, extra = {}) {
       const res = await fetch("/api/checkin", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
         credentials: "same-origin",
-        body: JSON.stringify({ action, channel }),
+        body: JSON.stringify({ action, channel, ...extra }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.status === 401 || data.authRequired) {
@@ -1579,7 +1607,7 @@
       }
     }
 
-    async function runChannel(id, action) {
+    async function runChannel(id, action, extra = {}) {
       const idx = channels.findIndex((c) => c.id === id);
       if (idx < 0) return;
       let ch = channels[idx];
@@ -1596,10 +1624,11 @@
       if ((action === "checkin" || action === "me") && runner !== "worker") {
         return runViaGha(ch, runner, action);
       }
-      log(`${ch.name} → ${actionLabel(action)} ...`, "info");
+      const countText = extra.count ? `${extra.count} 次` : "";
+      log(`${ch.name} → ${actionLabel(action)}${countText ? `（${countText}）` : ""} ...`, "info");
       showToast(`${ch.name}：${actionLabel(action)}中`, "完整过程可点 Log 查看", "info", 2200);
       try {
-        let data = await api(action, ch);
+        let data = await api(action, ch, extra);
         if (data.tokens) {
           ch = mergeTokens(ch, data.tokens);
         }
@@ -1613,6 +1642,11 @@
           const r = data.result || {};
           const perUnit = pickQuotaPerUnit(data.user?.raw || data.raw?.data || data.raw);
           if (r.alreadyCheckedIn) return "今日已签到";
+          // 抽奖：卡片上那行短标签只放「几次 · 中奖几次」，明细在详情里
+          if (r.count != null && r.byPrize) {
+            return `${r.count} 次 · 中奖 ${r.wins ?? 0} 次`;
+          }
+          if (r.skipped && r.reason) return String(r.reason).slice(0, 40);
           if (r.reward != null) {
             const usd = moneyLabel(r.reward, perUnit);
             return usd ? `+${usd}` : "成功";
@@ -1828,9 +1862,35 @@
         openLogDrawer();
         return;
       }
+      // 「抽几次」数字框（动作自报 count 时才有）：留空 = 用适配器默认口径
+      const countEl = card.querySelector(`input[data-count-for="${act}"]`);
+      const rawCount = countEl ? String(countEl.value || "").trim() : "";
+      const count = Number(rawCount);
+      const extra = rawCount && Number.isFinite(count) && count > 0 ? { count: Math.floor(count) } : {};
+      if (countEl && rawCount && !extra.count) {
+        showToast("次数填得不对", "请填正整数，或留空表示抽完今日剩余次数", "warn");
+        return;
+      }
       btn.disabled = true;
-      try { await runChannel(id, act); }
-      finally { btn.disabled = false; }
+      if (countEl) countEl.disabled = true;
+      try { await runChannel(id, act, extra); }
+      finally {
+        btn.disabled = false;
+        if (countEl) countEl.disabled = false;
+      }
+    });
+
+    // 记住「抽几次」数字框的值：保存/运行后 renderList() 会重建卡片，
+    // 不记住的话填的数字每次都被清空（见 actionCounts 的说明）。
+    $("channelList").addEventListener("input", (ev) => {
+      const input = ev.target.closest("input[data-count-for]");
+      if (!input) return;
+      const id = input.closest(".channel")?.dataset.id;
+      if (!id) return;
+      const key = `${id}:${input.getAttribute("data-count-for")}`;
+      const val = String(input.value || "").trim();
+      if (val === "") delete actionCounts[key];
+      else actionCounts[key] = val;
     });
 
     $("channelList").addEventListener("change", (ev) => {

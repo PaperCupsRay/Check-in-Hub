@@ -318,7 +318,8 @@ async function handleCheckin(request, env) {
     if (action === "checkin") {
       ({ result, via } = await checkinWithFallback(channel, env));
     } else {
-      result = await runAction(channel.type, action, channel);
+      // count 只有抽奖用得上（面板上「抽奖」按钮旁边的数字框）；其余动作忽略
+      result = await runAction(channel.type, action, channel, body.count != null ? { count: body.count } : {});
     }
     // 签到推送 TG（余额/状态查询不打扰）。降级分发（via=gfa_*）的真实结果
     // 由 GHA 回传时推送，此处只在 worker 直连出结果时推送，避免重复。

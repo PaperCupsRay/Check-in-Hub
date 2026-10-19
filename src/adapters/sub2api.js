@@ -276,7 +276,10 @@ function failureMessage(data, fallback) {
  * ------------------------------------------------------------------ */
 
 const LOTTERY_PATH = "/api/v1/lottery";
-/** 单次自动抽奖的硬上限：Workers 免费版单次请求子请求上限 50，签到自身还要用掉几个 */
+/**
+ * 单次抽奖的硬上限：Workers 免费版单次请求子请求上限 50，签到自身还要用掉几个。
+ * 面板上手填的次数也受它约束 —— 填 100 只会抽 30。
+ */
 const LOTTERY_HARD_CAP = 30;
 const LOTTERY_COST_LABEL = { free: "免费额度", activity: "活动分", paid: "余额" };
 const LOTTERY_COST_MODES = new Set(["free", "auto", "all"]);
@@ -293,10 +296,27 @@ function lotteryCostMode(channel) {
   return LOTTERY_COST_MODES.has(v) ? v : "free";
 }
 
-function lotteryBudget(channel, remaining) {
+/**
+ * 本次要抽几次。
+ *
+ * requested 是面板上「抽奖」按钮旁边那个数字框填的值：
+ *   · 填了 → 就按它来（用户明确要几次就抽几次），但仍受 LOTTERY_HARD_CAP 与
+ *     今日剩余次数约束；
+ *   · 留空 / 自动抽奖 → 用渠道选项 options.lotteryMaxDraws，缺省即硬上限
+ *     （= 把今日剩余次数一次抽完）。
+ */
+function lotteryBudget(channel, remaining, requested) {
   const cap = Number(channel.options?.lotteryMaxDraws);
-  const limit = Number.isFinite(cap) && cap > 0 ? Math.min(Math.floor(cap), LOTTERY_HARD_CAP) : LOTTERY_HARD_CAP;
-  return Math.max(0, Math.min(remaining, limit));
+  const autoCap = Number.isFinite(cap) && cap > 0 ? Math.min(Math.floor(cap), LOTTERY_HARD_CAP) : LOTTERY_HARD_CAP;
+  const want = Number(requested);
+  const ask = Number.isFinite(want) && want > 0 ? Math.floor(want) : autoCap;
+  return Math.max(0, Math.min(remaining, ask, LOTTERY_HARD_CAP));
+}
+
+/** 面板手填的次数（无效值一律当成「没填」，交给 lotteryBudget 用默认口径） */
+function lotteryRequestedCount(requested) {
+  const n = Number(requested);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 }
 
 function numOrNull(v) {
@@ -455,7 +475,16 @@ export const sub2apiAdapter = {
   description: "JWT Bearer 鉴权（k40 / 100xlabs 等同系）；支持自动抽奖",
   // 面板按这个数组在渠道卡片上多渲染一个按钮（见 src/ui.html 的 extraButtons）。
   // 卡片上的「自动抽奖」开关读的也是这里 —— 有 lottery 动作才显示（见 ui.html）。
-  actions: [{ action: "lottery", label: "抽奖", title: "立即抽完今日剩余次数（默认只花免费额度）" }],
+  // count 表示这个动作在卡片上带一个「抽几次」数字框（留空 = 抽完今日剩余次数）；
+  // 面板按它渲染输入框并把值随请求发过来（见 src/ui.html 的 extraButtons / runChannel）。
+  actions: [
+    {
+      action: "lottery",
+      label: "抽奖",
+      title: "抽几次由旁边数字框决定；留空 = 抽完今日剩余次数（默认只花免费额度）",
+      count: { placeholder: "全部", title: "要抽几次（留空 = 抽完今日剩余次数）" },
+    },
+  ],
   fields: [
     { key: "baseUrl", label: "站点地址", placeholder: "https://k40.example.com", required: true },
     { key: "auth.email", label: "邮箱", placeholder: "user@example.com" },
@@ -472,6 +501,11 @@ export const sub2apiAdapter = {
       key: "options.lotteryCost",
       label: "抽奖消耗方式（free=只花免费额度，默认；auto=免费额度→活动分；all=再退到余额）",
       placeholder: "free",
+    },
+    {
+      key: "options.lotteryMaxDraws",
+      label: "自动抽奖单次最多抽几次（留空 = 抽完今日剩余；硬上限 30）",
+      placeholder: "30",
     },
   ],
 
@@ -747,7 +781,12 @@ export const sub2apiAdapter = {
   },
 
   /**
-   * 抽奖：把今日剩余次数一次抽完（面板「抽奖」按钮与签到后的自动抽奖都走这里）。
+   * 抽奖（面板「抽奖」按钮与签到后的自动抽奖都走这里）。
+   *
+   * 抽几次由 extra.count 决定（面板上「抽奖」按钮旁边的数字框）：
+   *   · 填了 N → 抽 N 次（用户明确要几次就抽几次），仍受今日剩余与硬上限约束，
+   *     被卡住时在文案里说明（「今日只剩 3 次」/「单次上限 30 次」）；
+   *   · 留空 → 按渠道选项 options.lotteryMaxDraws，缺省即把今日剩余次数一次抽完。
    *
    * 循环口径：
    *   · 每抽一次都以服务端回的 today_remaining 为准，抽完即停；
@@ -758,7 +797,7 @@ export const sub2apiAdapter = {
    *     不能因为后面一次失败就当成整体失败）。
    * 每次抽奖都带新的 idempotency_key：重复用同一个 key 会被服务端去重，等于白抽。
    */
-  async lottery(channel) {
+  async lottery(channel, { count } = {}) {
     return this.withAuthRetry(channel, async (token, authVia) => {
       const statusRes = await this.lotteryStatus(channel, token);
       if (!statusRes.ok) {
@@ -802,7 +841,10 @@ export const sub2apiAdapter = {
         };
       }
 
-      const budget = lotteryBudget(channel, status.todayRemaining);
+      // 面板手填的次数（留空 = 按渠道选项 / 硬上限，即抽完今日剩余）
+      const want = lotteryRequestedCount(count);
+      const remainingAtStart = status.todayRemaining;
+      const budget = lotteryBudget(channel, remainingAtStart, want);
       const draws = [];
       let stopReason = "";
       let failure = null;
@@ -838,6 +880,13 @@ export const sub2apiAdapter = {
         if (status.todayRemaining <= 0) break;
       }
 
+      // 填的次数比实际能抽的多：说明白是被今日剩余次数还是被硬上限卡住了
+      if (!stopReason && !failure && want && draws.length < want) {
+        stopReason =
+          draws.length >= LOTTERY_HARD_CAP
+            ? `单次上限 ${LOTTERY_HARD_CAP} 次`
+            : `今日只剩 ${remainingAtStart} 次`;
+      }
       const summary = summarizeDraws(draws);
       const finalStatus = {
         ...base,
@@ -869,6 +918,7 @@ export const sub2apiAdapter = {
         costMode: mode,
         costType: cost.type,
         stopReason: stopReason || null,
+        requested: want,
         failure: failure ? { httpStatus: failure.httpStatus, message: failure.message } : null,
         status: finalStatus,
       };
