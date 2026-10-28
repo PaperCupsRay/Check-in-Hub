@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { parseProxyUrl } from "../src/proxy.js";
-import { PROXY_TEST_ERRORS, PROXY_TEST_TARGET } from "../src/proxy-test.js";
+import { PROXY_TEST_ERRORS, PROXY_TLS_DETAILS, PROXY_TEST_TARGET } from "../src/proxy-test.js";
 
 const execute = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -30,6 +30,17 @@ export function curlErrorCode(error) {
   return "UNKNOWN";
 }
 
+// curl 在失败时也会输出校验结果；仅记录数值，绝不回传原始 stderr。
+function curlOutput(stdout) {
+  const text = String(stdout || "");
+  const match = text.match(/\n__CHECKIN_TLS__:(\d+):(\d+)\s*$/);
+  return {
+    body: match ? text.slice(0, match.index) : text,
+    proxyVerify: match ? Number(match[1]) : null,
+    targetVerify: match ? Number(match[2]) : null,
+  };
+}
+
 export async function curlProbe(proxyUrl, { timeoutMs = 12000, exec = execute } = {}) {
   const started = Date.now();
   const duration = Math.min(20000, Math.max(1000, Number(timeoutMs) || 12000));
@@ -40,15 +51,22 @@ export async function curlProbe(proxyUrl, { timeoutMs = 12000, exec = execute } 
       "--proxy", proxyUrl, "--noproxy", "", "--proxy-basic",
       "--proto", "=https", "--connect-timeout", String(Math.min(duration / 1000, 10)),
       "--max-time", String(duration / 1000), "--max-filesize", "4096",
+      "--write-out", "\n__CHECKIN_TLS__:%{proxy_ssl_verify_result}:%{ssl_verify_result}",
       PROXY_TEST_TARGET,
     ], { timeout: duration + 2000, maxBuffer: 16384, encoding: "utf8", windowsHide: true });
     let ip;
-    try { ip = JSON.parse(stdout).ip; } catch { /* 下方统一处理无效响应 */ }
+    try { ip = JSON.parse(curlOutput(stdout).body).ip; } catch { /* 下方统一处理无效响应 */ }
     if (typeof ip !== "string" || !isIP(ip)) return { ok: false, ms: Date.now() - started, errorCode: "RESPONSE" };
     return { ok: true, ms: Date.now() - started, ip, tlsVerified: true };
   } catch (error) {
     // execFile 的 message 可能包含完整命令（代理密码），绝不输出它或原始 stderr。
-    return { ok: false, ms: Date.now() - started, errorCode: curlErrorCode(error) };
+    const errorCode = curlErrorCode(error);
+    const metadata = curlOutput(error.stdout);
+    const httpsProxy = parseProxyUrl(proxyUrl)?.scheme === "https";
+    const tlsFailureStage = errorCode !== "TLS_CERT" ? null
+      : httpsProxy && metadata.proxyVerify > 0 ? "proxy"
+      : !httpsProxy || metadata.targetVerify > 0 ? "target" : "unknown";
+    return { ok: false, ms: Date.now() - started, errorCode, tlsFailureStage };
   }
 }
 
@@ -125,7 +143,7 @@ export async function runProxyJob(env = process.env, { fetchImpl = fetch, delay 
   const payload = { jobId, results, runId: env.GITHUB_RUN_ID || "" };
   // 产物没有地址、密码或原始 curl 错误，仅包含任务内编号及诊断结果。
   await save("proxy-results.json", JSON.stringify(payload, null, 2));
-  for (const r of results) log(`代理 #${r.id}: ${r.ok ? `HTTPS 通过 ${r.ms}ms${r.browserUsable ? "" : "（需要 SOCKS 认证）"}` : PROXY_TEST_ERRORS[r.errorCode] || PROXY_TEST_ERRORS.UNKNOWN}`);
+  for (const r of results) log(`代理 #${r.id}: ${r.ok ? `HTTPS 通过 ${r.ms}ms${r.browserUsable ? "" : "（需要 SOCKS 认证）"}` : (r.errorCode === "TLS_CERT" && PROXY_TLS_DETAILS[r.tlsFailureStage]) || PROXY_TEST_ERRORS[r.errorCode] || PROXY_TEST_ERRORS.UNKNOWN}`);
   const response = await hubRequest("/api/proxies/test/result", payload);
   log(`已回写 ${response.merged || 0} 个代理结果；验证通过 ${results.filter((r) => r.ok).length}/${results.length}`);
   return response;

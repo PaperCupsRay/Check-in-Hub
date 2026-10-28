@@ -147,9 +147,10 @@ test("curl 强制代理/远端 HTTPS、默认校验证书并限制时间和输�
     assert.equal(args[args.indexOf("--proxy") + 1], proxyUrl);
     assert.equal(args[args.indexOf("--noproxy") + 1], "");
     assert.ok(!args.includes("--insecure") && !args.includes("--proxy-insecure") && !args.includes("--location"));
+    assert.equal(args[args.indexOf("--write-out") + 1], "\n__CHECKIN_TLS__:%{proxy_ssl_verify_result}:%{ssl_verify_result}");
     assert.equal(args.at(-1), PROXY_TEST_TARGET);
     assert.equal(options.timeout, 14000);
-    return { stdout: '{"ip":"2001:db8::1"}' };
+    return { stdout: '{"ip":"2001:db8::1"}\n__CHECKIN_TLS__:0:0' };
   } });
   assert.equal(result.ok, true);
   assert.equal(result.tlsVerified, true);
@@ -235,4 +236,69 @@ test("runner 拒绝无效配置和跨协议地址，401 不重试且报失败", 
   let calls = 0;
   await assert.rejects(runProxyJob(env, { fetchImpl: async () => { calls++; return Response.json({ ok: false }, { status: 401 }); }, delay: async () => assert.fail("401 不应重试") }), /HTTP 401/);
   assert.equal(calls, 1);
+});
+
+test("curl 证书元数据区分代理 TLS 与目标 TLS，不跳过安全校验", async () => {
+  for (const [scheme, stdout, expected] of [
+    ["https", "\n__CHECKIN_TLS__:20:0", "proxy"],
+    ["https", "\n__CHECKIN_TLS__:0:20", "target"],
+    ["https", "\n__CHECKIN_TLS__:20:20", "proxy"],
+    ["https", "", "unknown"],
+    ["https", "\n__CHECKIN_TLS__:0:0", "unknown"],
+    ["http", "", "target"],
+    ["socks5", "\n__CHECKIN_TLS__:0:18", "target"],
+  ]) {
+    const r = await curlProbe(`${scheme}://proxy.example.com:443`, { exec: async (_command, args) => {
+      assert.ok(!args.includes("--insecure") && !args.includes("--proxy-insecure"));
+      throw Object.assign(new Error("private-password"), { code: 60, stdout, stderr: "private-password" });
+    } });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorCode, "TLS_CERT");
+    assert.equal(r.tlsFailureStage, expected, `${scheme}: ${stdout}`);
+    assert.ok(!JSON.stringify(r).includes("private-password"));
+  }
+});
+
+test("非证书错误不因残留 curl 元数据被归为证书告警", async () => {
+  const r = await curlProbe("https://proxy.example.com:443", { exec: async () => {
+    throw Object.assign(new Error("timeout"), { code: 28, stdout: "\n__CHECKIN_TLS__:20:0" });
+  } });
+  assert.equal(r.errorCode, "TIMEOUT");
+  assert.equal(r.tlsFailureStage, null);
+});
+
+test("证书层级回写并给出对应说明，但不计入已经验证可用数量", async () => {
+  const env = makeEnv([
+    { url: "https://proxy.example.com:443", enabled: true },
+    { url: "socks5://socks.example.com:1080", enabled: true },
+    { url: "https://legacy.example.com:443", enabled: true },
+  ]);
+  const job = await newJob(env);
+  const result = await completeProxyTest(env, { jobId: job.id, results: [
+    { id: "0", ok: false, ms: 12, errorCode: "TLS_CERT", tlsFailureStage: "proxy", browserUsable: true },
+    { id: "1", ok: false, ms: 13, errorCode: "TLS_CERT", tlsFailureStage: "target" },
+    { id: "2", ok: false, ms: 14, errorCode: "TLS_CERT" },
+  ] });
+  assert.equal(result.merged, 3);
+  assert.equal(result.job.okCount, 0);
+  assert.equal(result.job.browserUsable, 0);
+  assert.equal(result.job.certWarnings, 3);
+  assert.match(result.job.message, /严格 HTTPS.*证书告警 3 个/);
+  const current = env.CHECKIN_KV.read("proxies");
+  assert.deepEqual(current.map(p => p.lastCheck.tlsFailureStage), ["proxy", "target", "unknown"]);
+  assert.ok(current.every(p => !p.lastCheck.ok && !p.lastCheck.tlsVerified && !p.lastCheck.browserUsable));
+  assert.match(current[0].lastCheck.error, /仍可尝试.*尚未验证/);
+  assert.match(current[1].lastCheck.error, /目标网站 TLS/);
+  assert.match(current[2].lastCheck.error, /可用性待确认/);
+});
+
+test("非 HTTPS 代理不能被标成代理自身证书问题，非法层级不入库", async () => {
+  const env = makeEnv();
+  const job = await newJob(env);
+  const result = await completeProxyTest(env, { jobId: job.id, results: [
+    { id: "0", ok: false, ms: 12, errorCode: "TLS_CERT", tlsFailureStage: "proxy" },
+    { id: "1", ok: false, ms: 13, errorCode: "TLS_CERT", tlsFailureStage: "private-password<script>" },
+  ] });
+  assert.ok(result.job.results.every(r => r.tlsFailureStage === "unknown"));
+  assert.ok(!JSON.stringify(result).includes("private-password<script>"));
 });

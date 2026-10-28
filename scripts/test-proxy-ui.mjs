@@ -80,7 +80,7 @@ test("提交202后排队，完成时自动拉取结果并恢复控件", async ()
   assert.ok([...h.timers.values()].some((t) => t.ms === 5000));
   await h.ui.refreshProxyJob(queued.id);
   assert.equal(h.nodes.get("btnTestProxies").disabled, false);
-  assert.ok(h.nodes.get("proxyResults").innerHTML.includes("HTTPS 通过"));
+  assert.ok(h.nodes.get("proxyResults").innerHTML.includes("HTTPS 可用（已验证）"));
   assert.match(h.nodes.get("proxyTestStatus").textContent, /验证通过/);
   assert.ok(![...h.timers.values()].some((t) => t.ms === 5000));
 });
@@ -157,4 +157,36 @@ test("Telegram 面板正确调用受保护状态/测试/注册接口，失败后
   await h.click("btnTgSetup");
   assert.match(h.nodes.get("tgStatus").textContent, /TG_WEBHOOK_SECRET/);
   assert.equal(h.nodes.get("btnTgSetup").disabled, false);
+});
+
+test("证书告警区分代理/目标/未知层级，不把未验证代理标为绿色可用", async () => {
+  const cases = [
+    { scheme: "https", source: "github", tlsFailureStage: "proxy", label: "代理证书告警 · 仍可尝试", color: "warn", hint: "不能标为已可用" },
+    { scheme: "https", source: "github", tlsFailureStage: "target", label: "目标证书异常 · 影响 HTTPS", color: "err", hint: "本次安全 HTTPS 请求失败" },
+    { scheme: "socks5", source: "github", tlsFailureStage: "target", label: "目标证书异常 · 影响 HTTPS", color: "err", hint: "不会自动关闭目标证书安全检查" },
+    { scheme: "https", source: "github", label: "证书告警 · 可用性待确认", color: "warn", hint: "请重新进行 GitHub 检测" },
+    { scheme: "https", source: "worker", label: "Worker TLS 受限 · 待确认", color: "warn", hint: "不代表 GitHub 浏览器通道一定不可用" },
+    { scheme: "socks5", source: "github", tlsFailureStage: "proxy", label: "证书告警 · 可用性待确认", color: "warn", hint: "当前结果未区分" },
+  ];
+  for (const spec of cases) {
+    const h = harness(async () => ({ proxies: [{ ...proxy, scheme: spec.scheme, lastCheck: {
+      ok: false, browserUsable: false, certUntrusted: true, source: spec.source, tlsFailureStage: spec.tlsFailureStage,
+    } }] }));
+    await h.ui.loadProxies();
+    const output = h.nodes.get("proxyResults").innerHTML;
+    assert.ok(output.includes(`class="tag ${spec.color}">${spec.label}`), spec.label);
+    assert.ok(output.includes(spec.hint));
+    assert.ok(!output.includes('class="tag ok"'));
+    assert.ok(!output.includes("HTTPS 可用（已验证）"));
+  }
+});
+
+test("仅握手通过与 SOCKS 认证不兼容不冒充已验证 HTTPS 可用", async () => {
+  for (const [source, browserUsable, label] of [["worker", true, "握手通过"], ["github", false, "连通，但需 SOCKS 认证"]]) {
+    const h = harness(async () => ({ proxies: [{ ...proxy, scheme: "socks5", lastCheck: { ok: true, source, browserUsable, ms: 10 } }] }));
+    await h.ui.loadProxies();
+    const output = h.nodes.get("proxyResults").innerHTML;
+    assert.ok(output.includes(label));
+    assert.ok(!output.includes("HTTPS 可用（已验证）"));
+  }
 });

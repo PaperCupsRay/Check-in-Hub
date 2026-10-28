@@ -13,12 +13,18 @@ export const PROXY_TEST_ERRORS = Object.freeze({
   CONNECT: "无法连接代理地址或端口",
   TIMEOUT: "代理连接或 HTTPS 请求超时",
   AUTH: "代理拒绝连接或认证失败",
-  TLS_CERT: "TLS 证书校验失败（代理或目标证书不受信任），未绕过校验",
+  TLS_CERT: "TLS 证书未通过严格校验，不代表代理一定断线；实际可用性待确认，请查看证书层级说明",
   TLS: "TLS 握手失败",
   HTTP: "代理隧道或 HTTPS 目标返回错误状态",
   RESPONSE: "HTTPS 响应不是有效的出口 IP",
   CURL: "GitHub 执行环境缺少 curl 或无法启动检测",
   UNKNOWN: "代理检测失败，请检查地址、认证或 GitHub 运行状态",
+});
+
+export const PROXY_TLS_DETAILS = Object.freeze({
+  proxy: "代理自身 TLS 证书未通过严格校验。现有浏览器中继仍可尝试，但本次尚未验证目标 HTTPS；代理身份未验证，存在代理凭证泄露风险。",
+  target: "目标网站 TLS 证书未通过校验，当前安全 HTTPS 请求失败；可能是证书配置问题或拦截，不能判定安全可用。",
+  unknown: "TLS 证书未通过严格校验，尚不能区分代理自身与目标网站证书；不代表代理一定断线，可用性待确认。重新检测可获取更具体说明。",
 });
 
 function fail(message, status = 400) {
@@ -60,15 +66,16 @@ function publicJob(job) {
   }));
   const okCount = results.filter((r) => r.ok).length;
   const browserUsable = results.filter((r) => r.ok && r.browserUsable).length;
+  const certWarnings = results.filter((r) => !r.ok && (r.certUntrusted || r.errorCode === "TLS_CERT")).length;
   const message = status === "completed"
-    ? `GitHub HTTPS 验证通过 ${okCount}/${job.proxies.length}，浏览器认证兼容 ${browserUsable} 个`
+    ? `GitHub 严格 HTTPS 验证通过 ${okCount}/${job.proxies.length}，浏览器认证兼容 ${browserUsable} 个${certWarnings ? `；证书告警 ${certWarnings} 个（可用性见逐条说明）` : ""}`
     : status === "timed_out"
       ? "30 分钟内未收到 GitHub 结果，请检查工作流是否已推送、Actions 是否启用及 HUB_* Secrets"
       : job.error || "已提交 GitHub Actions，正在排队或检测；完成后自动回写";
   return {
     id: job.id, status, source: "github", count: job.proxies.length,
     createdAt: job.createdAt, completedAt: job.completedAt || null,
-    runUrl: job.runUrl || null, okCount, browserUsable, results, message,
+    runUrl: job.runUrl || null, okCount, browserUsable, certWarnings, results, message,
   };
 }
 
@@ -153,15 +160,22 @@ function safeResult(input, proxy) {
     throw fail("成功结果必须包含出口 IP、TLS 验证及浏览器认证兼容性");
   }
   const code = Object.hasOwn(PROXY_TEST_ERRORS, input.errorCode) ? input.errorCode : "UNKNOWN";
+  const scheme = parseProxyUrl(proxy.url).scheme;
+  // 只有 HTTPS 代理才有代理自身的 TLS 层；旧 runner 未提供元数据时不猜测。
+  const tlsFailureStage = !input.ok && code === "TLS_CERT"
+    ? input.tlsFailureStage === "proxy" && scheme === "https" ? "proxy"
+      : input.tlsFailureStage === "target" ? "target" : "unknown"
+    : null;
   return {
     id: proxy.id, ok: input.ok, ms: Math.round(input.ms), ip,
-    source: "github", scheme: parseProxyUrl(proxy.url).scheme,
+    source: "github", scheme,
     tlsVerified: input.ok, browserUsable: input.ok && input.browserUsable,
     authUsed: ["none", "userpass", "basic"].includes(input.authUsed) ? input.authUsed : null,
     certUntrusted: !input.ok && code === "TLS_CERT",
+    tlsFailureStage,
     errorCode: input.ok ? null : code,
     // 不存 runner 原始 stderr，避免 curl 报错意外泄露代理密码。
-    error: input.ok ? null : PROXY_TEST_ERRORS[code],
+    error: input.ok ? null : tlsFailureStage ? PROXY_TLS_DETAILS[tlsFailureStage] : PROXY_TEST_ERRORS[code],
   };
 }
 

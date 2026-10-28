@@ -613,6 +613,7 @@
             <strong>凭证差异（实测）</strong>：Chromium 不支持 SOCKS 用户名密码认证，SOCKS 代理的凭证会被自动剥掉（很多公开代理的 user:pass 只是摆设，剥掉照样能用）；HTTP/HTTPS 代理的 Basic 认证浏览器原生支持，凭证会保留。<br />
             <strong style="color:#fca5a5">安全提示</strong>：签到时会带渠道 Cookie / 访问令牌，运行前会逐个校验代理有没有解密 TLS（对比证书指纹）。<strong>做中间人的代理会被自动拒用</strong>——2026-09-11 实测一批公开「住宅 SOCKS5」全部在换证书，用了等于把凭证明文交给代理方。
             <br /><strong>检测出口</strong>：推荐 GitHub，验证真实 HTTPS、TLS 证书和出口 IP；Worker 仅测握手，结果不代表 GitHub 可用。检测不会向代理发送渠道凭证，HTTPS 通过也不保证目标站一定能过盾。
+            <br /><strong>可用性说明</strong>：绿色「HTTPS 可用」表示本次安全请求已通过；黄色「代理证书告警」不等于断线，现有 HTTPS 中继仍可尝试，但尚未确认可用，也不等于代理身份可信。红色「目标证书异常」会影响安全 HTTPS。未区分证书层级的旧结果请重新检测；所有结果都不保证目标站一定能过盾。
           </div>
         </div>
         <div class="toolbar-actions">
@@ -2413,13 +2414,28 @@
         const chk = p.lastCheck || null;
         const scheme = p.scheme || chk?.scheme || "";
         const github = chk?.source === "github";
+        let usabilityHint = "";
         let tag = `<span class="tag">未测试</span>`;
         if (chk) {
-          if (chk.ok && chk.browserUsable) tag = `<span class="tag ok">${github ? "HTTPS 通过" : "握手通过"} ${escapeHtml(chk.ms)}ms</span>`;
+          if (chk.ok && chk.browserUsable) {
+            tag = `<span class="tag ok">${github ? "HTTPS 可用（已验证）" : "握手通过"} ${escapeHtml(chk.ms)}ms</span>`;
+            usabilityHint = github ? "本次公开 HTTPS 请求与证书校验通过；支持当前浏览器认证方式，但不保证目标站签到或过盾成功。" : "仅证明协议握手成功，尚未验证目标 HTTPS 或出口 IP。";
+          }
           else if (chk.ok && chk.browserUsable === false) {
             tag = `<span class="tag warn" title="浏览器驱动不支持 SOCKS 用户名密码认证">连通，但需 SOCKS 认证</span>`;
           } else if (chk.ok) tag = `<span class="tag ok">连通 ${escapeHtml(chk.ms)}ms</span>`;
-          else if (chk.certUntrusted) tag = `<span class="tag warn" title="${escapeHtml(chk.error || "")}">${github ? "TLS 证书未通过" : "Worker TLS 未通过"}</span>`;
+          else if (chk.certUntrusted || chk.errorCode === "TLS_CERT") {
+            if (github && chk.tlsFailureStage === "proxy" && scheme === "https") {
+              tag = `<span class="tag warn">代理证书告警 · 仍可尝试</span>`;
+              usabilityHint = "代理自身证书未通过，不等于代理断线。现有浏览器通道会尝试 HTTPS 中继，但本次目标 HTTPS 尚未验证，不能标为已可用；代理身份未验证存在代理凭证泄露风险，建议修复证书或使用可信代理。";
+            } else if (github && chk.tlsFailureStage === "target") {
+              tag = `<span class="tag err">目标证书异常 · 影响 HTTPS</span>`;
+              usabilityHint = "目标网站的证书未通过校验，本次安全 HTTPS 请求失败；可能是证书配置或流量拦截问题，不能确认安全可用。不会自动关闭目标证书安全检查。";
+            } else {
+              tag = `<span class="tag warn">${github ? "证书告警 · 可用性待确认" : "Worker TLS 受限 · 待确认"}</span>`;
+              usabilityHint = github ? "当前结果未区分代理自身与目标网站证书，不应直接判定代理失效，也不能保证可用。请重新进行 GitHub 检测获取证书层级。" : "Worker 无法完成本次 TLS 握手或校验，不代表 GitHub 浏览器通道一定不可用；请用 GitHub 检测进一步确认。";
+            }
+          }
           else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
         }
         if (p.enabled === false) tag = `<span class="tag off">已停用</span>` + tag;
@@ -2435,6 +2451,7 @@
             <button data-proxy-act="toggle" class="ghost" style="padding:4px 8px;font-size:.75rem">${p.enabled === false ? "启用" : "停用"}</button>
             <button data-proxy-act="del" class="danger" style="padding:4px 8px;font-size:.75rem">删除</button>
             ${details}
+            ${usabilityHint ? `<div class="note" style="flex-basis:100%">${escapeHtml(usabilityHint)}</div>` : ""}
           </div>
         `;
       }).join("");
