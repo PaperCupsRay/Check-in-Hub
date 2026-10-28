@@ -612,16 +612,38 @@
             每行一个，支持 <code>socks5://</code>、<code>socks4://</code>、<code>http://</code>、<code>https://</code>，可带 <code>user:pass@</code> 和 <code>#备注</code>；省略协议按 socks5 处理。<br />
             <strong>凭证差异（实测）</strong>：Chromium 不支持 SOCKS 用户名密码认证，SOCKS 代理的凭证会被自动剥掉（很多公开代理的 user:pass 只是摆设，剥掉照样能用）；HTTP/HTTPS 代理的 Basic 认证浏览器原生支持，凭证会保留。<br />
             <strong style="color:#fca5a5">安全提示</strong>：签到时会带渠道 Cookie / 访问令牌，运行前会逐个校验代理有没有解密 TLS（对比证书指纹）。<strong>做中间人的代理会被自动拒用</strong>——2026-09-11 实测一批公开「住宅 SOCKS5」全部在换证书，用了等于把凭证明文交给代理方。
+            <br /><strong>检测出口</strong>：推荐 GitHub，验证真实 HTTPS、TLS 证书和出口 IP；Worker 仅测握手，结果不代表 GitHub 可用。检测不会向代理发送渠道凭证，HTTPS 通过也不保证目标站一定能过盾。
           </div>
         </div>
         <div class="toolbar-actions">
-          <button id="btnTestProxies" class="secondary" type="button">测试全部连通性</button>
+          <select id="proxyRunner" aria-label="代理检测执行环境" style="width:auto">
+            <option value="github">GitHub · HTTPS 检测（推荐）</option>
+            <option value="worker">Worker · 握手诊断</option>
+          </select>
+          <button id="btnTestProxies" class="secondary" type="button">测试启用代理</button>
+          <button id="btnRefreshProxies" class="ghost" type="button">刷新结果</button>
           <button id="btnSaveProxies" class="success" type="button">保存代理池</button>
           <button id="btnClearProxies" class="ghost" type="button">清空</button>
         </div>
       </div>
       <textarea id="proxyInput" rows="5" placeholder="socks5://1.2.3.4:1080#US 家宽&#10;socks4://1.2.3.4:1080&#10;http://user:pass@proxy.example.com:8080#付费 HTTP&#10;https://user:pass@proxy.example.com:443&#10;1.2.3.4:4145  （省略协议＝socks5）"></textarea>
+      <div class="hint" id="proxyTestStatus" role="status" aria-live="polite">仅检测已保存且启用的代理；GitHub 任务完成后自动更新。</div>
       <div class="proxy-results" id="proxyResults"></div>
+    </section>
+
+    <section class="card proxy-panel">
+      <div class="toolbar">
+        <div>
+          <h2>Telegram 交互</h2>
+          <div class="hint">通知使用 TG_BOT_TOKEN / TG_CHAT_ID；指令与按钮另需 TG_WEBHOOK_SECRET。群聊还必须配置 TG_ALLOWED_USER_ID。注册后向机器人发送 /start。</div>
+        </div>
+        <div class="toolbar-actions">
+          <button id="btnTgStatus" class="ghost" type="button">检查状态</button>
+          <button id="btnTgTest" class="secondary" type="button">测试通知</button>
+          <button id="btnTgSetup" class="secondary" type="button">注册 Webhook / 指令</button>
+        </div>
+      </div>
+      <div class="hint" id="tgStatus" role="status" aria-live="polite">密钥通过 Worker secrets 配置，不在面板中展示。</div>
     </section>
 
     <section class="card channel-panel">
@@ -856,7 +878,9 @@
       return String(s)
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }
 
     function setSessionToken(token) {
@@ -2341,61 +2365,76 @@
       await doLogout();
     });
 
+    /* ---------------- Telegram 交互 ---------------- */
+    for (const [id, path, title] of [
+      ["btnTgStatus", "/api/tg/status", "检查状态"],
+      ["btnTgTest", "/api/tg/test", "测试通知"],
+      ["btnTgSetup", "/api/tg/setup", "注册 Webhook / 指令"],
+    ]) {
+      $(id).addEventListener("click", async () => {
+        const button = $(id);
+        if (button.disabled) return;
+        if (id === "btnTgSetup" && !confirm("将此机器人的 Webhook 注册到当前面板，会替换该机器人原有的 Webhook。继续？")) return;
+        button.disabled = true;
+        $("tgStatus").textContent = title + "中…";
+        try {
+          const data = await apiRequest(path, { method: id === "btnTgStatus" ? "GET" : "POST" });
+          const message = data.message || (data.webhook
+            ? `${data.webhook.url ? "Webhook 已注册" : "尚未注册 Webhook"} · 待处理 ${data.webhook.pending_update_count || 0}${data.webhook.last_error_message ? " · 最近错误：" + data.webhook.last_error_message : ""}`
+            : "测试通知已发送，请查看 Telegram");
+          $("tgStatus").textContent = message;
+          showToast(title, message, "ok", 5000);
+        } catch (e) {
+          $("tgStatus").textContent = title + "失败：" + e.message;
+          showToast(title + "失败", e.message, "err", 6000);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    }
+
     /* ---------------- 住宅代理池 ---------------- */
     /**
      * 为什么要这个面板：Cloudflare 对 GitHub Actions 的机房 IP 常静默不签发
      * Turnstile 挑战（组件能渲染但永远等不到 token），换住宅出口后同一套代码
      * 27 秒就拿到了 token。代理会频繁失效，所以要能随时增删 + 测连通性。
      */
-    let proxyState = { list: [], testing: false };
+    let proxyState = { list: [], testing: false, job: null, pollTimer: null, pollErrors: 0 };
 
-    function renderProxies(results = null) {
+    function renderProxies() {
       const box = $("proxyResults");
       const list = proxyState.list;
       $("proxyBadge").textContent = String(list.length);
-      if (!list.length && !results) {
+      if (!list.length) {
         box.innerHTML = `<div class="hint">代理池为空。填入上面的输入框后点「保存代理池」。</div>`;
         return;
       }
-      const byUrl = new Map();
-      for (const r of results || []) byUrl.set(r.url, r);
-      box.innerHTML = list.map((p) => {
-        const r = byUrl.get(p.url) || null;
-        const chk = r || p.lastCheck || null;
+      box.innerHTML = list.map((p, index) => {
+        const chk = p.lastCheck || null;
         const scheme = p.scheme || chk?.scheme || "";
+        const github = chk?.source === "github";
         let tag = `<span class="tag">未测试</span>`;
         if (chk) {
-          if (chk.ok && chk.browserUsable) tag = `<span class="tag ok">可用 ${chk.ms}ms</span>`;
+          if (chk.ok && chk.browserUsable) tag = `<span class="tag ok">${github ? "HTTPS 通过" : "握手通过"} ${escapeHtml(chk.ms)}ms</span>`;
           else if (chk.ok && chk.browserUsable === false) {
-            // 只有 SOCKS 才是「凭证 Chromium 用不了」；HTTP(S) 代理的 Basic 认证是支持的，
-            // 所以这里不能一律写成 SOCKS 的说法，否则 HTTP 代理用户会被误导。
-            const why = String(scheme).startsWith("socks")
-              ? "Chromium 不支持 SOCKS 用户名密码认证，本条会被浏览器通道跳过"
-              : "该代理需要认证但凭证未通过";
-            tag = `<span class="tag warn" title="${escapeHtml(why)}">通但浏览器不可用</span>`;
-          } else if (chk.ok) tag = `<span class="tag ok">连通 ${chk.ms}ms</span>`;
-          // 证书校验不过 ≠ 代理失效：Workers 的 socket 不能跳过校验，而浏览器通道
-          // 自己完成到代理的 TLS，这类代理通常仍能用。标成 warn，别让它看起来像挂了。
-          else if (chk.certUntrusted) {
-            tag = `<span class="tag warn" title="${escapeHtml(chk.error || "")}">证书本地校验不了</span>`;
-          } else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
+            tag = `<span class="tag warn" title="浏览器驱动不支持 SOCKS 用户名密码认证">连通，但需 SOCKS 认证</span>`;
+          } else if (chk.ok) tag = `<span class="tag ok">连通 ${escapeHtml(chk.ms)}ms</span>`;
+          else if (chk.certUntrusted) tag = `<span class="tag warn" title="${escapeHtml(chk.error || "")}">${github ? "TLS 证书未通过" : "Worker TLS 未通过"}</span>`;
+          else tag = `<span class="tag err" title="${escapeHtml(chk.error || "")}">失败</span>`;
         }
         if (p.enabled === false) tag = `<span class="tag off">已停用</span>` + tag;
-        const err = chk && !chk.ok && chk.error
-          ? `<div class="note" style="flex-basis:100%">${escapeHtml(chk.error)}</div>` : "";
-        const schemeTag = scheme
-          ? `<span class="tag" title="${p.browserAuth === false ? "SOCKS 代理的凭证 Chromium 用不了，会自动剥离" : "HTTP(S) 代理的凭证 Chromium 原生支持"}">${escapeHtml(scheme)}</span>`
-          : "";
+        const details = chk
+          ? `<div class="note" style="flex-basis:100%">${github ? "GitHub · HTTPS" : "Worker · 握手"}${chk.at ? " · " + escapeHtml(new Date(chk.at).toLocaleString()) : ""}${chk.ip ? " · 出口 " + escapeHtml(chk.ip) : ""}${chk.error ? " · " + escapeHtml(chk.error) : ""}</div>` : "";
         return `
-          <div class="proxy-row" data-proxy-url="${escapeHtml(p.url)}">
-            <span class="addr">${escapeHtml(p.url)}</span>
-            ${schemeTag}
+          <div class="proxy-row" data-proxy-index="${index}">
+            <span class="addr">${escapeHtml(p.maskedUrl || p.url)}</span>
+            ${scheme ? `<span class="tag">${escapeHtml(scheme)}</span>` : ""}
             ${p.note ? `<span class="note">${escapeHtml(p.note)}</span>` : ""}
             <span class="spacer"></span>
             ${tag}
             <button data-proxy-act="toggle" class="ghost" style="padding:4px 8px;font-size:.75rem">${p.enabled === false ? "启用" : "停用"}</button>
             <button data-proxy-act="del" class="danger" style="padding:4px 8px;font-size:.75rem">删除</button>
-            ${err}
+            ${details}
           </div>
         `;
       }).join("");
@@ -2404,11 +2443,59 @@
     async function loadProxies() {
       try {
         const data = await apiRequest("/api/proxies");
-        // rawUrl 才是完整地址（url 是打码后的），保存回写要用原始值
-        proxyState.list = (data.proxies || []).map((p) => ({ ...p, url: p.rawUrl || p.url }));
+        // 原始凭证仅供保存，列表和日志使用服务端打码后的地址。
+        proxyState.list = (data.proxies || []).map((p) => ({ ...p, maskedUrl: p.url, url: p.rawUrl || p.url }));
         renderProxies();
       } catch (e) {
         log("加载代理池失败: " + (e.message || e), "err");
+      }
+    }
+
+    function showProxyJob(job) {
+      clearTimeout(proxyState.pollTimer);
+      proxyState.job = job;
+      proxyState.testing = job?.status === "queued";
+      $("btnTestProxies").disabled = proxyState.testing;
+      $("proxyRunner").disabled = proxyState.testing;
+      $("proxyTestStatus").textContent = job?.message || "尚无 GitHub 检测任务。";
+      if (proxyState.testing) {
+        proxyState.pollTimer = setTimeout(() => refreshProxyJob(job.id), 5000);
+      }
+    }
+
+    async function refreshProxyJob(id = "") {
+      try {
+        const data = await apiRequest("/api/proxies/test" + (id ? "?id=" + encodeURIComponent(id) : ""));
+        // 已经切换任务时，忽略旧轮询的迟到响应。
+        if (id && proxyState.job?.id !== id) return;
+        // 刚提交任务时 KV 跨区域可能短暂读到旧值，保留当前状态并继续轮询。
+        if (proxyState.job?.status === "queued" && (!data.job || data.job.createdAt < proxyState.job.createdAt)) {
+          showProxyJob(proxyState.job);
+          return;
+        }
+        const finished = proxyState.job?.status === "queued" && data.job?.id === proxyState.job.id && data.job.status !== "queued";
+        proxyState.pollErrors = 0;
+        showProxyJob(data.job);
+        if (finished) {
+          await loadProxies();
+          log(data.job.message, data.job.status === "completed" ? "info" : "err");
+          showToast("代理检测" + (data.job.status === "completed" ? "完成" : "未完成"), data.job.message, data.job.okCount ? "ok" : "warn", 6000);
+          // 两个 KV key 的跨区缓存可能不同时过期，稍后再刷新一次行内结果。
+          if (data.job.status === "completed") setTimeout(() => {
+            if (!proxyState.testing && (!authState.authRequired || authState.authenticated)) loadProxies();
+          }, 65000);
+        }
+      } catch (e) {
+        clearTimeout(proxyState.pollTimer);
+        if (proxyState.job?.status === "queued" && ++proxyState.pollErrors < 6 && (!authState.authRequired || authState.authenticated)) {
+          $("proxyTestStatus").textContent = "暂时无法读取结果，10 秒后重试：" + e.message;
+          proxyState.pollTimer = setTimeout(() => refreshProxyJob(proxyState.job.id), 10000);
+        } else {
+          proxyState.testing = false;
+          $("btnTestProxies").disabled = false;
+          $("proxyRunner").disabled = false;
+          $("proxyTestStatus").textContent = "结果刷新失败，请点击「刷新结果」重试：" + e.message;
+        }
       }
     }
 
@@ -2447,39 +2534,47 @@
     });
 
     $("btnTestProxies").addEventListener("click", async () => {
-      if (!proxyState.list.length) return showToast("代理池为空", "先保存几个代理", "warn");
+      const count = proxyState.list.filter((p) => p.enabled !== false).length;
+      if (!count) return showToast("没有启用代理", "先保存并启用代理", "warn");
       if (proxyState.testing) return;
+      clearTimeout(proxyState.pollTimer);
+      proxyState.job = null;
       proxyState.testing = true;
       $("btnTestProxies").disabled = true;
-      log(`开始测试 ${proxyState.list.length} 个代理的连通性 ...`, "info");
-      showToast("正在测试代理", `${proxyState.list.length} 个，约需 10 秒`, "info", 4000);
+      $("proxyRunner").disabled = true;
+      const runner = $("proxyRunner").value;
+      $("proxyTestStatus").textContent = runner === "github" ? "正在提交 GitHub 检测任务…" : "正在从 Worker 测试握手…";
       try {
         const data = await apiRequest("/api/proxies/test", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ all: true }),
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true, runner }),
         });
-        await loadProxies();
-        renderProxies(data.results || []);
-        // certUntrusted 不算失败（Worker 校验不了代理自己的证书而已），
-        // 所以判断整体成败时要把它算进「不是错」的那一边，否则全是这类代理时
-        // 面板会通报一片红，而它们在浏览器通道其实能用。
-        const certUn = (data.results || []).filter((r) => r.certUntrusted).length;
-        const anyGood = data.okCount || certUn;
-        log(`代理测试完成：${data.message || ""}`, anyGood ? "ok" : "err");
-        showToast("代理测试完成", data.message || "", data.browserUsable || certUn ? "ok" : "warn", 5000);
-        for (const r of data.results || []) {
-          if (r.certUntrusted) log(`  ⚠ ${r.url} → ${r.error || "证书本地校验不了"}`, "warn");
-          else if (!r.ok) log(`  ✗ ${r.url} → ${r.error || "失败"}`, "err");
-          else log(`  ✓ ${r.url} → ${r.ms}ms${r.browserUsable === false ? "（SOCKS 认证，Chromium 用不了）" : ""}`, "ok");
+        if (data.job) {
+          proxyState.pollErrors = 0;
+          showProxyJob(data.job);
+          log(data.message, "info");
+          showToast("已提交 GitHub", "任务排队或检测中，完成后自动更新", "info", 5000);
+        } else {
+          proxyState.job = null;
+          await loadProxies();
+          $("proxyTestStatus").textContent = data.message || "Worker 诊断完成";
+          log(data.message, data.persisted === false ? "warn" : "info");
+          showToast("Worker 诊断完成", data.message, data.okCount ? "ok" : "warn", 5000);
         }
       } catch (e) {
-        log("代理测试失败: " + (e.message || e), "err");
+        $("proxyTestStatus").textContent = "检测未提交：" + e.message;
+        log("代理测试失败: " + e.message, "err");
         showToast("代理测试失败", e.message, "err", 5200);
       } finally {
-        proxyState.testing = false;
-        $("btnTestProxies").disabled = false;
+        proxyState.testing = proxyState.job?.status === "queued";
+        $("btnTestProxies").disabled = proxyState.testing;
+        $("proxyRunner").disabled = proxyState.testing;
       }
+    });
+
+    $("btnRefreshProxies").addEventListener("click", async () => {
+      await loadProxies();
+      await refreshProxyJob(proxyState.job?.status === "queued" ? proxyState.job.id : "");
     });
 
     $("btnClearProxies").addEventListener("click", async () => {
@@ -2495,13 +2590,12 @@
     $("proxyResults").addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button[data-proxy-act]");
       if (!btn) return;
-      const row = btn.closest("[data-proxy-url]");
-      const url = row?.getAttribute("data-proxy-url");
-      if (!url) return;
+      const row = btn.closest("[data-proxy-index]");
+      const i = Number(row?.getAttribute("data-proxy-index"));
+      if (!row || !Number.isInteger(i) || !proxyState.list[i]) return;
       const act = btn.getAttribute("data-proxy-act");
+      const label = proxyState.list[i].maskedUrl || "所选代理";
       const next = proxyState.list.map((p) => ({ ...p }));
-      const i = next.findIndex((p) => p.url === url);
-      if (i < 0) return;
       if (act === "del") {
         next.splice(i, 1);
       } else if (act === "toggle") {
@@ -2510,7 +2604,7 @@
       btn.disabled = true;
       try {
         await saveProxies(next, { quiet: true });
-        log(act === "del" ? `已删除代理 ${url}` : `代理 ${url} → ${next[i]?.enabled === false ? "已停用" : "已启用"}`, "info");
+        log(act === "del" ? `已删除代理 ${label}` : `代理 ${label} → ${next[i]?.enabled === false ? "已停用" : "已启用"}`, "info");
       } catch (e) {
         showToast("操作失败", e.message, "err", 5200);
       } finally {
@@ -2538,6 +2632,7 @@
         renderList();
         await hydrateChannelsFromKv();
         await loadProxies();
+        await refreshProxyJob();
         log("界面就绪", "ok");
       } catch (e) {
         $("adapterBadge").textContent = "适配器加载失败";

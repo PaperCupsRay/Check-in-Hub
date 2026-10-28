@@ -92,12 +92,21 @@ export function parseProxyUrl(input) {
   // 放进去只会在 GHA 里白等一次超时，不如当场拒掉。
   // IPv6 经 URL 解析后带方括号，单独放行。
   if (!/^\[.+\]$/.test(host) && !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(host)) return null;
-  const port = u.port ? Number(u.port) : DEFAULT_PORTS[scheme];
+  // URL 会去掉 HTTP :80 / HTTPS :443，优先保留用户显式填写的端口。
+  const authority = s.slice(s.indexOf("://") + 3).split(/[/?]/, 1)[0];
+  const explicitPort = authority.match(/:(\d+)$/);
+  const port = explicitPort ? Number(explicitPort[1]) : u.port ? Number(u.port) : DEFAULT_PORTS[scheme];
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  // SOCKS4 协议本身没有认证字段，填了凭证也用不上，明确拒绝以免用户误会
-  const username = u.username ? decodeURIComponent(u.username) : "";
-  const password = u.password ? decodeURIComponent(u.password) : "";
-  if (scheme === "socks4" && username) return null;
+  if (u.search || (u.pathname && u.pathname !== "/")) return null;
+  let username, password;
+  try {
+    username = decodeURIComponent(u.username);
+    password = decodeURIComponent(u.password);
+  } catch {
+    return null; // 不合法的百分号转义不能让保存整批代理报 500
+  }
+  // SOCKS4 不支持此处的用户名密码认证。
+  if ((scheme === "socks4" && (username || password)) || (!username && password)) return null;
   return { scheme, host, port, username, password, note };
 }
 
@@ -111,6 +120,7 @@ function buildUrl(p) {
 
 /** 规范化成存储形态；无凭证时不留空字段 */
 export function normalizeProxy(input = {}) {
+  if (input == null || (typeof input !== "string" && typeof input !== "object")) return null;
   const raw = typeof input === "string" ? input : input.url || "";
   const parsed = parseProxyUrl(raw);
   if (!parsed) return null;
@@ -143,7 +153,7 @@ export function proxyUrlForBrowser(url) {
 /** 面板展示用：把密码打码，协议/IP/端口保留（否则没法辨认是哪条） */
 export function maskProxyUrl(url) {
   const p = parseProxyUrl(url);
-  if (!p) return String(url || "").slice(0, 60);
+  if (!p) return "（无效代理地址）";
   if (!p.username) return `${p.scheme}://${p.host}:${p.port}`;
   return `${p.scheme}://${p.username}:***@${p.host}:${p.port}`;
 }

@@ -39,7 +39,7 @@ function b64urlDecodeToBytes(str) {
   return out;
 }
 
-function timingSafeEqual(a, b) {
+export function timingSafeEqual(a, b) {
   const enc = new TextEncoder();
   const ba = typeof a === "string" ? enc.encode(a) : a;
   const bb = typeof b === "string" ? enc.encode(b) : b;

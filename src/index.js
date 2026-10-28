@@ -26,6 +26,8 @@ import {
 } from "./proxy.js";
 import uiHtml from "./ui.html";
 import { sendTelegram, formatCheckinReport } from "./tg.js";
+import { startProxyTest, getProxyTestStatus, getProxyTestTask, completeProxyTest, proxyRunnerAuthenticated } from "./proxy-test.js";
+import { handleTelegramWebhook, setupTelegramWebhook, getTelegramStatus } from "./tg-bot.js";
 import _nacl from "tweetnacl";
 import _naclUtil from "tweetnacl-util";
 const { box } = _nacl;
@@ -617,14 +619,27 @@ async function handleProxiesTest(request, env) {
   try {
     body = await request.json();
   } catch {
-    body = {};
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
   }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json({ ok: false, error: "请求体必须是对象" }, 400);
+  const runner = body.runner || (body.url ? "worker" : "github");
+  if (runner === "github") {
+    try {
+      const urls = body.urls ?? (body.url ? [normalizeProxy(body.url)?.url] : undefined);
+      return json(await startProxyTest(env, { urls }), 202);
+    } catch (err) {
+      return json({ ok: false, error: err.message }, err.status || 500);
+    }
+  }
+  if (runner !== "worker") return json({ ok: false, error: "runner 必须是 github 或 worker" }, 400);
+  const requestedAt = Date.now();
+  const timeoutMs = Math.min(20000, Math.max(1000, Number(body.timeoutMs) || 12000));
 
   // 单条测试：不落库，用于「填之前先试一下」
   if (body.url) {
     const r = await testProxy(String(body.url), {
       targetHost: body.targetHost || "api.ipify.org",
-      timeoutMs: Number(body.timeoutMs) || 12000,
+      timeoutMs,
     });
     return json({ ok: true, result: { url: maskProxyUrl(String(body.url)), ...r } });
   }
@@ -636,10 +651,11 @@ async function handleProxiesTest(request, env) {
   } catch (err) {
     return json({ ok: false, error: err.message || String(err) }, err.status || 500);
   }
-  if (!proxies.length) return json({ ok: false, error: "代理池为空" }, 422);
+  proxies = proxies.filter((p) => p.enabled !== false);
+  if (!proxies.length) return json({ ok: false, error: "没有可检测的启用代理" }, 422);
+  if (proxies.length > 100) return json({ ok: false, error: "单次最多检测 100 个代理" }, 422);
 
   const targetHost = body.targetHost || "api.ipify.org";
-  const timeoutMs = Number(body.timeoutMs) || 12000;
   const results = await Promise.all(
     proxies.map(async (p) => {
       const r = await testProxy(p.url, { targetHost, timeoutMs });
@@ -649,6 +665,8 @@ async function handleProxiesTest(request, env) {
   const at = Date.now();
   for (const { entry, r } of results) {
     entry.lastCheck = {
+      source: "worker",
+      requestedAt,
       ok: r.ok,
       ms: r.ms ?? null,
       authUsed: r.authUsed || null,
@@ -661,22 +679,30 @@ async function handleProxiesTest(request, env) {
       at,
     };
   }
+  let persisted = true;
   try {
-    await putProxies(env, proxies);
+    const current = await getProxies(env);
+    const byUrl = new Map(proxies.map((p) => [p.url, p.lastCheck]));
+    for (const p of current) {
+      if (byUrl.has(p.url) && (p.lastCheck?.requestedAt ?? p.lastCheck?.at ?? 0) <= requestedAt) p.lastCheck = byUrl.get(p.url);
+    }
+    await putProxies(env, current);
   } catch {
-    /* 结果仍然返回，只是没存下来 */
+    persisted = false;
   }
   const okCount = results.filter((x) => x.r.ok).length;
   const usable = results.filter((x) => x.r.ok && x.r.browserUsable).length;
   const certUntrusted = results.filter((x) => x.r.certUntrusted).length;
   return json({
     ok: true,
+    source: "worker",
+    persisted,
     count: results.length,
     okCount,
     browserUsable: usable,
     certUntrusted,
     message:
-      `连通 ${okCount}/${results.length}` +
+      `Worker 握手连通 ${okCount}/${results.length}${persisted ? "" : "（结果保存失败）"}` +
       (okCount ? `，浏览器通道可用 ${usable} 个` : "") +
       // 只有 SOCKS 会出现「连通但浏览器用不了」（Chromium 不支持 SOCKS 认证）；
       // HTTP(S) 的凭证 Chromium 能用，不该被算进这一类。
@@ -836,6 +862,9 @@ function isPublicPath(pathname, method) {
   if (pathname === "/api/health" && method === "GET") return true;
   if (pathname === "/api/cron/run" && method === "POST") return true;
   if (pathname === "/api/gh/result" && method === "POST") return true;
+  if (pathname === "/api/proxies/test/task" && method === "GET") return true;
+  if (pathname === "/api/proxies/test/result" && method === "POST") return true;
+  if (pathname === "/api/tg/webhook" && method === "POST") return true;
   return false;
 }
 
@@ -1089,7 +1118,7 @@ function sealBox(publicKeyB64, message) {
 export { handleCheckin, handleBatch, runScheduled, checkinWithFallback, batchCheckinCore };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
 
@@ -1116,6 +1145,40 @@ export default {
         adapters: listAdapters().map((a) => a.id),
         time: new Date().toISOString(),
       });
+    }
+
+    // 所有管理/诊断接口先鉴权；公开回调在各自 handler 强制校验专用 secret。
+    if (authRequired(env) && !isPublicPath(pathname, request.method)) {
+      const ok = await isAuthenticated(request, env);
+      if (!ok) {
+        if (pathname === "/" || pathname === "/index.html") return html(uiHtml);
+        return unauthorized();
+      }
+    }
+
+    if (pathname === "/api/tg/webhook" && request.method === "POST") {
+      return handleTelegramWebhook(request, env, ctx, {
+        checkin: () => runScheduled(env),
+        testProxies: () => startProxyTest(env),
+      });
+    }
+
+    if ((pathname === "/api/proxies/test/task" && request.method === "GET") ||
+        (pathname === "/api/proxies/test/result" && request.method === "POST")) {
+      if (!proxyRunnerAuthenticated(request, env)) return unauthorized("runner secret 不正确");
+      try {
+        if (request.method === "GET") return json(await getProxyTestTask(env, url.searchParams.get("id")));
+        let body;
+        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON body" }, 400); }
+        const { notify, ...result } = await completeProxyTest(env, body);
+        if (notify && !result.duplicate) {
+          const report = sendTelegram(env, `🔎 <b>代理检测完成</b>\n${result.job.message}`);
+          if (ctx?.waitUntil) ctx.waitUntil(report); else await report;
+        }
+        return json(result);
+      } catch (err) {
+        return json({ ok: false, error: err.message }, err.status || 500);
+      }
     }
 
     if (request.method === "POST" && pathname === "/api/cron/run") {
@@ -1204,15 +1267,6 @@ export default {
       return handleGhResult(request, env);
     }
 
-    if (authRequired(env) && !isPublicPath(pathname, request.method)) {
-      const ok = await isAuthenticated(request, env);
-      if (!ok) {
-        if (pathname === "/" || pathname === "/index.html") {
-          return html(uiHtml);
-        }
-        return unauthorized();
-      }
-    }
 
     if (request.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
       return html(uiHtml);
@@ -1223,11 +1277,20 @@ export default {
       return json({ ok: true, adapters: listAdapters() });
     }
 
+    if (request.method === "GET" && pathname === "/api/tg/status") {
+      const result = await getTelegramStatus(env);
+      return json(result, result.ok ? 200 : 400);
+    }
+    if (request.method === "POST" && pathname === "/api/tg/setup") {
+      const result = await setupTelegramWebhook(request, env);
+      return json(result, result.ok ? 200 : 400);
+    }
+
     // TG 通知连通性测试（需登录；发送一条测试消息）
     if (request.method === "POST" && pathname === "/api/tg/test") {
       const r = await sendTelegram(env, "✅ <b>Check-in Hub</b> TG 通知配置成功");
       return json(
-        { ok: r.ok, skipped: !!r.skipped, detail: r.reason || r.error || r.status || null },
+        { ok: r.ok, skipped: !!r.skipped, detail: r.reason || r.error || r.status || null, error: r.ok ? null : r.reason || r.error || "Telegram 通知发送失败" },
         r.ok ? 200 : 400
       );
     }
@@ -1262,6 +1325,13 @@ export default {
     }
     if (pathname === "/api/proxies/test" && request.method === "POST") {
       return handleProxiesTest(request, env);
+    }
+    if (pathname === "/api/proxies/test" && request.method === "GET") {
+      try {
+        return json(await getProxyTestStatus(env, url.searchParams.get("id") || ""));
+      } catch (err) {
+        return json({ ok: false, error: err.message }, err.status || 500);
+      }
     }
 
     return json({ ok: false, error: "Not Found", path: pathname }, 404);

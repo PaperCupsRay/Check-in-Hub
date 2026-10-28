@@ -37,3 +37,6 @@ checkin-hub-channels-*.json
 # python cache（scripts/ 下的脚本本地跑会生成）
 __pycache__/
 *.py[cod]
+
+# GitHub 代理检测生成的诊断产物
+proxy-results.json

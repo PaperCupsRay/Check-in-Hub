@@ -1,0 +1,38 @@
+name: Proxy Diagnostics
+
+# 凭证不放在 repository_dispatch 中；runner 用 HUB_SECRET 读取本次任务快照。
+on:
+  repository_dispatch:
+    types: [proxy-test]
+
+permissions:
+  contents: read
+
+# 不与签到工作流相互阻塞；每个任务独立，避免新任务取消旧任务却一直显示排队。
+concurrency:
+  group: proxy-test-${{ github.event.client_payload.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  proxy-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify proxies over HTTPS and report to Hub
+        env:
+          HUB_BASE_URL: ${{ secrets.HUB_BASE_URL }}
+          HUB_SECRET: ${{ secrets.HUB_SECRET }}
+          PROXY_TEST_JOB_ID: ${{ github.event.client_payload.jobId }}
+        run: node scripts/gha-proxy-test.mjs
+      - name: Upload sanitized results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-results
+          path: proxy-results.json
+          retention-days: 7
+          if-no-files-found: ignore

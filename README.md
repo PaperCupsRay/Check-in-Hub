@@ -405,6 +405,71 @@ export const xxxAdapter = {
 
 ---
 
+## 🔎 代理检测（GitHub / Worker）
+
+面板默认选择 **GitHub · HTTPS 检测**。Worker 的 TCP 出口与 GitHub 不同，且 Worker
+只能做协议握手；Worker 测不通不能直接判断代理在 GitHub 也不可用。
+
+### 配置与上线顺序
+
+1. 将 `.github/workflows/proxy-test.yml`、`scripts/gha-proxy-test.mjs` 和相关源码推送到
+   `GH_REPO` 的**默认分支**，启用 Actions。只在本地新增工作流不会生效。
+2. Worker 配置 `GH_TOKEN`（可调用 repository_dispatch 的令牌，fine-grained PAT 需仓库
+   Contents 写权限，classic PAT 需 repo 权限）、`GH_REPO=owner/repo`、`CRON_SECRET`。
+3. GitHub Actions Secrets 配置 `HUB_BASE_URL`（面板的 HTTPS 根地址）、`HUB_SECRET`
+   （与 Worker 的 `CRON_SECRET` 相同）。代理检测不需要 `HUB_ACCESS_PASSWORD`；现有签到
+   工作流读取渠道仍需按原配置设置该密码。
+4. 执行 `npm run deploy` 部署 Worker，在面板保存并启用代理，点击「测试启用代理」。
+
+检测任务只把 `jobId` 放入 GitHub 事件。runner 使用 `X-Cron-Secret` 获取该任务的代理快照，
+以最多 5 路并发请求公开的 HTTPS IP 服务，再把结果回写当前代理池。不会读取渠道凭证，
+不会因检测复活已删除的代理；较旧任务也不会覆盖已写入的新检测结果。
+
+- 支持 HTTP、HTTPS、SOCKS4(a)、SOCKS5(h)，单次最多 100 个启用代理。
+- 默认校验目标和 HTTPS 代理的 TLS 证书，**不使用 `--insecure` 或 `--proxy-insecure`**。
+  证书失败会明确显示，不冒充“已安全可用”。
+- 带凭证的 SOCKS5 先测免认证；只有带认证才通时，标记为浏览器认证不兼容。
+- 结果包含检测来源、时间、延迟、出口 IP 和错误分类。HTTPS 通过不代表目标站一定能过盾；
+  浏览器签到原有的证书安全检查仍保留。
+- GitHub 异步返回 `202`，面板每 5 秒刷新，重新打开页面也能恢复任务状态。
+  KV 跨区域传播可能延迟约一分钟；30 分钟未回写会显示超时及排查提示，任务记录保留 24 小时。
+- 「Worker · 握手诊断」保留原来的快速诊断，但不验证代理转发后的目标 TLS 或出口 IP。
+
+接口：`POST /api/proxies/test {"runner":"github"}` 提交；
+`GET /api/proxies/test?id=<jobId>` 查结果（省略 id 查最近任务）。这些接口需要面板登录。
+runner 专用的 `GET /api/proxies/test/task`、`POST /api/proxies/test/result` 不使用面板登录，
+而是**始终**要求正确的 `X-Cron-Secret`，即使面板本身未设访问密码也是如此。
+
+## 💬 Telegram 指令和按钮
+
+只需要通知时，保留已有的 `TG_BOT_TOKEN` 和 `TG_CHAT_ID` 即可。开启交互还需配置
+`TG_WEBHOOK_SECRET`：16–256 位随机字母、数字、`_` 或 `-`（建议用 32 字节随机数的 hex）。
+使用 `npx wrangler secret put <变量名>` 保存，不把真实令牌写进仓库。
+
+`TG_CHAT_ID` 必须是数值聊天 ID。群聊还**必须**配置 `TG_ALLOWED_USER_ID`，否则拒绝群成员操作；
+私聊配置该值后也只允许该用户。Webhook 只接受正确的 Telegram secret header 与指定聊天/用户，
+并用 `CHECKIN_KV` 按 update_id 去重 24 小时。KV 为最终一致存储，不承诺跨区域并发严格 exactly-once。
+配置中的聊天 ID 必须是非零安全整数，用户白名单必须是正整数；填错时拒绝执行，
+不会退回“允许全部用户”。普通文本、`/checkin123` 等非完整指令不会触发操作。
+按钮先回执再执行，重复 update 只回执、不重复派发；KV 去重读写失败时返回 503。
+超过 Telegram 单条上限的通知会转换为纯文本分条发送（最多 10 条），避免截断 HTML 或 emoji。
+
+部署后登录面板，在 Telegram 区域点击「注册 Webhook / 指令」，再向机器人发送 `/start`。
+也可在已登录状态下 `POST /api/tg/setup`。注册地址固定为当前 HTTPS 面板的
+`/api/tg/webhook`，不会清空 Telegram 的待处理消息；`GET /api/tg/status` 可检查注册状态。
+注册前会检查 KV 与群聊白名单；状态接口不回显旧 Webhook 地址中的用户信息、查询串或密钥。
+如 Webhook 注册成功但命令菜单设置失败，会明确提示部分成功，可以重新注册。
+
+| 指令 | 功能 |
+|------|------|
+| `/start`、`/help` | 帮助与操作按钮 |
+| `/status` | 渠道启用数和最近签到概况 |
+| `/checkin` | 请求签到，结果通过既有通知流程推送 |
+| `/proxies` | 查看打码后的代理及最近检测结果 |
+| `/testproxies` | 提交 GitHub 代理检测，完成后收到汇总通知 |
+
+---
+
 ## 📁 目录结构
 
 ```text
@@ -449,11 +514,13 @@ checkin-hub/
 | `npm run dev` | 本地开发 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
 | `npm run tail` | 查看线上日志 |
-| `npm test` | 离线回归测试（mock fetch，不联网）：鉴权回退 / 降级路由 + 社区站适配器 + Obsidian Arc 适配器 + Sub2API 抽奖 + 图片验证码判据 |
+| `npm test` | 全量离线回归：适配器、降级路由、抽奖、验证码、代理任务/runner/面板轮询、HTTP 鉴权与 Telegram |
 | `npm run test:forum` | 只跑社区站适配器（nodeseek / linuxsb / nodeloc）的离线回归测试 |
 | `npm run test:onyxaxis` | 只跑 Obsidian Arc（onyxaxis）适配器的离线回归测试 |
 | `npm run test:lottery` | 只跑 Sub2API 抽奖（含浏览器通道页内抽奖 JS）的离线回归测试 |
 | `npm run test:browser` | 只跑浏览器通道的纯函数判据（`python scripts/test-forum-browser.py` + `python scripts/test-captcha.py` + `python scripts/test-human-verify.py`，不联网、不开浏览器、不依赖 ddddocr） |
+| `npm run test:proxy` | 代理解析、GitHub 分发/回写、curl 行为、面板轮询和管理接口鉴权（全部 mock，不联网） |
+| `npm run test:tg` | Telegram 指令、按钮、Webhook 鉴权、重复更新和注册流程（mock，不联网） |
 
 ---
 

@@ -3,3 +3,15 @@ ACCESS_PASSWORD=change-me
 SESSION_SECRET=change-me-too
 # SESSION_TTL_SECONDS=604800
 # CRON_SECRET=
+
+# GitHub 代理检测与签到分发（真实值在生产环境用 wrangler secret put 设置）
+# GH_TOKEN=
+# GH_REPO=owner/repo
+# CRON_SECRET=与 GitHub Actions 的 HUB_SECRET 保持一致
+
+# Telegram 通知与交互
+# TG_BOT_TOKEN=
+# TG_CHAT_ID=数值聊天ID
+# TG_WEBHOOK_SECRET=16到256位随机字母数字下划线或横线
+# 群聊必须配置；私聊配置后也只允许该用户操作
+# TG_ALLOWED_USER_ID=数值用户ID
