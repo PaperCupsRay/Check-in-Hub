@@ -798,6 +798,64 @@ async function runScheduled(env) {
   return { ok: true, results, skipped, lastRun, tg };
 }
 
+/** Run only selected enabled channels, or channels whose latest check-in failed. */
+async function runSelectedCheckin(env, { selection = null, failedOnly = false } = {}) {
+  if (!kvBound(env)) return { ok: false, message: "CHECKIN_KV 未绑定" };
+  let channels;
+  try {
+    channels = await getChannels(env);
+  } catch {
+    return { ok: false, message: "读取渠道配置失败" };
+  }
+
+  let targets;
+  if (failedOnly) {
+    const lastRun = await getLastRun(env).catch(() => null);
+    const lastByName = new Map((Array.isArray(lastRun?.results) ? lastRun.results : []).map((r) => [r.name, r]));
+    targets = channels.filter((channel) => {
+      if (!isChannelEnabled(channel)) return false;
+      const latest = channel.lastResult ?? lastByName.get(channel.name);
+      return latest?.ok === false;
+    });
+    if (!targets.length) return { ok: true, message: "没有最近签到失败的已启用渠道", results: [] };
+  } else {
+    const matches = channels.filter((channel) => {
+      if (!isChannelEnabled(channel) || !selection || typeof selection !== "object") return false;
+      if (selection.id && channel.id) return channel.id === selection.id && channel.name === selection.name;
+      return channel.name === selection.name && channel.type === selection.type && channel.baseUrl === selection.baseUrl;
+    });
+    if (matches.length !== 1) return { ok: false, message: "该渠道已不存在、已停用或配置发生变化，请重新选择" };
+    targets = matches;
+  }
+
+  const outcomes = await batchCheckinCore(targets, env);
+  const results = [];
+  for (const { item, result, via } of outcomes) {
+    if (result.tokens) item.auth = { ...(item.auth || {}), ...result.tokens };
+    item.lastResult = { ok: !!result.ok, summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`, at: Date.now() };
+    results.push({
+      name: item.name, type: item.type, baseUrl: item.baseUrl,
+      ok: !!result.ok, message: result.message || (result.ok ? "签到成功" : "签到失败"),
+      ...(result.result?.lottery ? { lottery: result.result.lottery } : {}),
+      ...(via !== "worker" ? { via } : {}),
+    });
+  }
+  await putChannels(env, channels);
+  await putLastRun(env, { at: new Date().toISOString(), runner: "telegram-manual", results });
+  const failed = results.filter((r) => !r.ok).length;
+  const title = failedOnly ? "🔁 失败渠道重试报告" : "📌 单渠道签到报告";
+  const tg = await sendTelegram(env, formatCheckinReport(title, results));
+  return { ok: failed === 0, message: failed ? `完成 ${results.length} 个渠道，${failed} 个仍失败` : `成功完成 ${results.length} 个渠道`, results, tg };
+}
+
+async function runFailedCheckins(env) {
+  return runSelectedCheckin(env, { failedOnly: true });
+}
+
+async function runChannelCheckin(env, selection) {
+  return runSelectedCheckin(env, { selection });
+}
+
 function cookieSecureFlag(request) {
   try {
     return new URL(request.url).protocol === "https:";
@@ -1101,7 +1159,6 @@ async function handleGhSecrets(request, env) {
  */
 
 function sealBox(publicKeyB64, message) {
-  const rpk = util.decodeBase64(publicKeyB64);
   const eph = box.keyPair();
   const nonceIn = new Uint8Array(eph.publicKey.length + rpk.length);
   nonceIn.set(eph.publicKey, 0);
@@ -1115,7 +1172,7 @@ function sealBox(publicKeyB64, message) {
 }
 
 // 命名导出仅供本地单测/脚本复用；Worker 入口仍是 default export
-export { handleCheckin, handleBatch, runScheduled, checkinWithFallback, batchCheckinCore };
+export { handleCheckin, handleBatch, runScheduled, runSelectedCheckin, checkinWithFallback, batchCheckinCore };
 
 export default {
   async fetch(request, env, ctx) {
@@ -1158,7 +1215,9 @@ export default {
 
     if (pathname === "/api/tg/webhook" && request.method === "POST") {
       return handleTelegramWebhook(request, env, ctx, {
-        checkin: () => runScheduled(env),
+        checkinAll: () => runScheduled(env),
+        retryFailed: () => runFailedCheckins(env),
+        checkinChannel: (selection) => runChannelCheckin(env, selection),
         testProxies: () => startProxyTest(env),
       });
     }

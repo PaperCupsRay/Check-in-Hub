@@ -122,9 +122,51 @@ test("面板登录后注册 Telegram Webhook 与命令，未配 KV 返回友好�
   assert.equal(response.status, 200);
   assert.equal(calls[0].body.url, "https://hub.example.com/api/tg/webhook");
   assert.equal(calls[0].body.secret_token, env.TG_WEBHOOK_SECRET);
-  assert.equal(calls[1].body.commands.length, 6);
+  assert.equal(calls[1].body.commands.length, 9);
   assert.ok(!(await response.text()).includes(env.TG_WEBHOOK_SECRET));
   const noKv = await call({ ...env, CHECKIN_KV: null }, "/api/tg/setup", { method: "POST", login: true });
   assert.equal(noKv.status, 400);
   assert.equal(calls.length, 2);
+});
+
+test("Telegram 失败重试与单渠道按钮只向 GitHub 分发目标启用渠道", async () => {
+  const channels = [
+    { id: "failed-id", name: "失败渠道", type: "sub2api", baseUrl: "https://failed.example", enabled: true, auth: { accessToken: "a" }, options: { runner: "gha_api" }, lastResult: { ok: false } },
+    { id: "healthy-id", name: "正常渠道", type: "sub2api", baseUrl: "https://healthy.example", enabled: true, auth: { accessToken: "b" }, options: { runner: "gha_api" }, lastResult: { ok: true } },
+    { id: "disabled-id", name: "停用失败渠道", type: "sub2api", baseUrl: "https://disabled.example", enabled: false, auth: { accessToken: "c" }, options: { runner: "gha_api" }, lastResult: { ok: false } },
+  ];
+  const env = { ...makeEnv(), TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123", TG_WEBHOOK_SECRET: "secret_0123456789abcdef" };
+  env.CHECKIN_KV = memoryKV({ proxies: [], channels });
+  const dispatched = [];
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("api.github.com")) {
+      const payload = JSON.parse(init.body).client_payload;
+      dispatched.push(payload);
+      return new Response(null, { status: 204 });
+    }
+    return Response.json({ ok: true, result: {} });
+  };
+  const webhook = (update) => new Request("https://hub.example.com/api/tg/webhook", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": env.TG_WEBHOOK_SECRET }, body: JSON.stringify(update),
+  });
+  const ctxRequest = async (update) => {
+    const pending = [];
+    const response = await worker.fetch(webhook(update), env, { waitUntil: (promise) => pending.push(promise) });
+    assert.equal(response.status, 200);
+    await Promise.all(pending);
+  };
+
+  await ctxRequest({ update_id: 21, message: { chat: { id: 123 }, from: { id: 123 }, text: "/retryfailed" } });
+  assert.deepEqual(dispatched[0].names, ["失败渠道"]);
+  assert.equal(env.CHECKIN_KV.read("channels").find((c) => c.id === "disabled-id")?.lastResult.ok, false);
+
+  await ctxRequest({ update_id: 22, message: { chat: { id: 123 }, from: { id: 123 }, text: "/channels" } });
+  const selectionEntry = [...env.CHECKIN_KV.data.entries()].find(([key]) => key.startsWith("tg_channel_action_"));
+  assert.ok(selectionEntry);
+  const [, token] = selectionEntry[0].split("tg_channel_action_");
+  const selection = JSON.parse(selectionEntry[1]).selection;
+  assert.equal(selection.name, "失败渠道");
+  await ctxRequest({ update_id: 23, callback_query: { id: "single-channel", from: { id: 123 }, message: { chat: { id: 123 } }, data: `ch:${token}` } });
+  assert.deepEqual(dispatched[1].names, ["失败渠道"]);
+  assert.deepEqual(dispatched.map(x => x.runners), [["gha_api"], ["gha_api"]]);
 });

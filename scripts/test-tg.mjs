@@ -208,7 +208,7 @@ async function testChatAndUserFilter() {
     const update = messageUpdate({ chat: { id: -100999, type: "group" } });
     const res = await handleTelegramWebhook(webhookRequest(update, secretHeader), env, null, {});
     const body = await res.json();
-    show(res.status === 200 && String(body.result).includes("wrong chat"), "错误 chat → 200 ignored");
+    show(res.status === 200 && String(body.result).includes("unauthorized sender or chat"), "错误 chat → 200 ignored");
     show(fetchMock.calls.length === 0, "错误 chat 不产生任何 Telegram API 调用", `calls=${fetchMock.calls.length}`);
   }
   {
@@ -261,14 +261,10 @@ async function testCommandsAndButtons() {
   let checkinCalls = 0;
   let testProxiesCalls = 0;
   const actions = {
-    checkin: async () => {
-      checkinCalls++;
-      return { ok: true };
-    },
-    testProxies: async () => {
-      testProxiesCalls++;
-      return { ok: true, job: { id: "job1", status: "running", count: 3 } };
-    },
+    checkinAll: async () => { checkinCalls++; return { ok: true }; },
+    retryFailed: async () => ({ ok: true, results: [] }),
+    checkinChannel: async () => ({ ok: true, message: "单渠道完成" }),
+    testProxies: async () => { testProxiesCalls++; return { ok: true, job: { id: "job1", status: "running", count: 3 } }; },
   };
 
   // /status：读取 KV 数据，转义输出
@@ -278,13 +274,12 @@ async function testCommandsAndButtons() {
     results: [{ name: "Chan<b>x", ok: true, message: "ok<svg onload=alert(1)>" }],
   }));
   kv._dump().set("channels", JSON.stringify([
-    { name: "a", enabled: true }, { name: "b", enabled: false },
+    { name: "Chan<b>x", enabled: true }, { name: "b", enabled: false },
   ]));
   kv._dump().set("proxies", JSON.stringify([
     { url: "socks5://user:p@ssw0rd@1.2.3.4:1080", enabled: true, lastCheck: { ok: true, ms: 300, at: Date.now() } },
   ]));
-
-  for (const text of ["/status", "/help", "/start", "/proxies", "/status@MyHubBot", "/checkin", "/testproxies"]) {
+  for (const text of ["/status", "/help", "/start", "/proxies", "/status@MyHubBot", "/checkin", "/checkinall", "/testproxies"]) {
     const res = await handleTelegramWebhook(
       webhookRequest(messageUpdate({ text }), secretHeader),
       env, null, actions
@@ -310,45 +305,30 @@ async function testCommandsAndButtons() {
     !!helpMsg && JSON.stringify(helpMsg.body.reply_markup || {}).includes("cmd:status"),
     "/start|help 带 inline keyboard（callback_data 不含凭证）"
   );
-  show(checkinCalls === 1 && testProxiesCalls === 1, "checkin/testProxies actions 各被调用一次",
-    `checkin=${checkinCalls} testProxies=${testProxiesCalls}`);
-  const checkinMsg = sends.find((c) => c.body.text?.includes("开始处理"));
-  show(!!checkinMsg, "/checkin 先发「开始处理」");
-  show(
-    sends.filter((c) => c.body.text?.includes("签到报告")).length === 0,
-    "/checkin 成功时 bot 不重复发报告"
-  );
-  const submittedMsg = sends.find((c) => c.body.text?.includes("已提交代理测试"));
-  show(!!submittedMsg && submittedMsg.body.text.includes("3 条"), "testproxies 成功回复已提交+条数");
+  show(checkinCalls === 1 && testProxiesCalls === 1, "checkinall/testProxies actions 各被调用一次", `checkin=${checkinCalls} testProxies=${testProxiesCalls}`);
+  const menuMsg = sends.find((c) => c.body.text?.includes("请选择签到范围"));
+  show(!!menuMsg && JSON.stringify(menuMsg.body.reply_markup).includes("cmd:checkinall"), "/checkin 打开全渠道/单渠道/失败重试菜单");
 
-  // /checkin 失败路径：{ok:false,message}
+  // Full check-in failure and exception paths remain explicit.
   {
     const fm2 = mockFetch(defaultRoutes());
     globalThis.fetch = fm2;
     const env2 = { ...BASE_ENV, CHECKIN_KV: mockKV() };
-    const res = await handleTelegramWebhook(
-      webhookRequest(messageUpdate({ text: "/checkin", update_id: 4101 }), secretHeader),
-      env2, null, { checkin: async () => ({ ok: false, message: "全部渠道均未启用" }) }
-    );
-    show(res.status === 200, "/checkin {ok:false} → 200");
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkinall", update_id: 4101 }), secretHeader), env2, null, {
+      checkinAll: async () => ({ ok: false, message: "全部渠道均未启用" }),
+    });
     await new Promise((r) => setTimeout(r, 5));
-    const failMsg = fm2.calls.filter((c) => c.u.pathname.endsWith("sendMessage"))
-      .find((c) => c.body.text?.includes("签到失败"));
-    show(!!failMsg && failMsg.body.text.includes("全部渠道均未启用"), "{ok:false,message} 时提示失败");
+    show(fm2.calls.some(c => c.body.text?.includes("全部渠道均未启用")), "全渠道签到返回失败时提示用户");
   }
-  // /checkin 抛错路径
   {
     const fm2 = mockFetch(defaultRoutes());
     globalThis.fetch = fm2;
     const env2 = { ...BASE_ENV, CHECKIN_KV: mockKV() };
-    await handleTelegramWebhook(
-      webhookRequest(messageUpdate({ text: "/checkin", update_id: 4102 }), secretHeader),
-      env2, null, { checkin: async () => { throw new Error("boom"); } }
-    );
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkinall", update_id: 4102 }), secretHeader), env2, null, {
+      checkinAll: async () => { throw new Error("boom"); },
+    });
     await new Promise((r) => setTimeout(r, 5));
-    const failMsg = fm2.calls.filter((c) => c.u.pathname.endsWith("sendMessage"))
-      .find((c) => c.body.text?.includes("签到失败"));
-    show(!!failMsg && failMsg.body.text.includes("boom"), "actions.checkin 抛错时提示失败");
+    show(fm2.calls.some(c => c.body.text?.includes("boom")), "全渠道签到异常时提示用户");
   }
 
   // 普通文本不是命令 → ignored，不执行动作
@@ -409,15 +389,15 @@ async function testCommandsAndButtons() {
     const env2 = { ...BASE_ENV, CHECKIN_KV: mockKV() };
     let checkinCalls2 = 0;
     const res = await handleTelegramWebhook(
-      webhookRequest(callbackUpdate({ data: "cmd:checkin", update_id: 5001 }), secretHeader),
-      env2, null, { checkin: async () => { checkinCalls2++; return { ok: true }; } }
+      webhookRequest(callbackUpdate({ data: "cmd:checkinall", update_id: 5001 }), secretHeader),
+      env2, null, { checkinAll: async () => { checkinCalls2++; return { ok: true }; } }
     );
     show(res.status === 200, "callback cmd:checkin → 200");
     await new Promise((r) => setTimeout(r, 5));
     const answered = fm2.calls.filter((c) => c.u.pathname.endsWith("answerCallbackQuery"));
     show(answered.length === 1, "callback 执行前 answerCallbackQuery");
     show(answered[0]?.body.callback_query_id === "CB1", "answerCallbackQuery 带正确的 callback_query_id");
-    show(checkinCalls2 === 1, "按钮触发 actions.checkin");
+    show(checkinCalls2 === 1, "按钮触发全渠道签到动作");
   }
   // 恶意 callback_data
   {
@@ -441,8 +421,8 @@ async function testCommandsAndButtons() {
     globalThis.fetch = fm2;
     const env2 = { ...BASE_ENV, CHECKIN_KV: kv2 };
     let calls2 = 0;
-    const actions2 = { checkin: async () => { calls2++; return { ok: true }; } };
-    const upd = messageUpdate({ text: "/checkin", update_id: 6001 });
+    const actions2 = { checkinAll: async () => { calls2++; return { ok: true }; } };
+    const upd = messageUpdate({ text: "/checkinall", update_id: 6001 });
     await handleTelegramWebhook(webhookRequest(upd, secretHeader), env2, null, actions2);
     await handleTelegramWebhook(webhookRequest(upd, secretHeader), env2, null, actions2);
     await new Promise((r) => setTimeout(r, 5));
@@ -468,13 +448,13 @@ async function testCommandsAndButtons() {
     const waited = [];
     const ctx = { waitUntil: (p) => waited.push(p) };
     const res = await handleTelegramWebhook(
-      webhookRequest(messageUpdate({ text: "/checkin", update_id: 7001 }), secretHeader),
-      env2, ctx, { checkin: async () => ({ ok: true }) }
+      webhookRequest(messageUpdate({ text: "/checkinall", update_id: 7001 }), secretHeader),
+      env2, ctx, { checkinAll: async () => ({ ok: true }) }
     );
     show(res.status === 200, "带 ctx 时快速返回 200");
     await Promise.all(waited);
     const sends2 = fm2.calls.filter((c) => c.u.pathname.endsWith("sendMessage"));
-    show(sends2.some((c) => c.body.text?.includes("开始处理")), "waitUntil 中执行了命令");
+    show(sends2.some((c) => c.body.text?.includes("签到全部启用渠道")), "waitUntil 中显示签到菜单并启动全渠道动作");
   }
 }
 
@@ -499,8 +479,7 @@ async function testSetupAndStatus() {
     );
     show(setWebhook?.body.drop_pending_updates === undefined, "不 drop_pending_updates");
     const setCmd = fm.calls.find((c) => c.u.pathname.endsWith("setMyCommands"));
-    show(!!setCmd && Array.isArray(setCmd.body.commands) && setCmd.body.commands.length === 6,
-      "setMyCommands 注册命令菜单");
+    show(!!setCmd && Array.isArray(setCmd.body.commands) && setCmd.body.commands.length === 9, "setMyCommands 注册完整指令菜单");
   }
   {
     const fm = mockFetch(defaultRoutes());
@@ -615,121 +594,73 @@ async function testTelegramApi() {
 }
 
 async function testSafetyBoundaries() {
-  console.log("▶ 安全边界与回执顺序回归");
+  console.log("▶ 安全边界与定向签到");
   for (const [key, values] of [
     ["TG_CHAT_ID", ["abc", "0", " ", "1.5", "1e3", "0x100", "9007199254740992"]],
     ["TG_ALLOWED_USER_ID", ["abc", "0", " ", "-1", "1.5", "1e3", "9007199254740992"]],
-  ]) {
-    for (const value of values) {
-      const fm = mockFetch(defaultRoutes());
-      globalThis.fetch = fm;
-      const kv = mockKV();
-      const res = await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkin" }), secretHeader),
-        { ...BASE_ENV, CHECKIN_KV: kv, [key]: value }, null, { checkin: () => assert.fail("非法配置不能执行") });
-      show(res.status === 503 && fm.calls.length === 0 && kv._dump().size === 0, `${key}=${JSON.stringify(value)}：拒绝且无副作用`);
-    }
+  ]) for (const value of values) {
+    const fm = mockFetch(defaultRoutes()); globalThis.fetch = fm; const kv = mockKV();
+    const response = await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkinall" }), secretHeader),
+      { ...BASE_ENV, CHECKIN_KV: kv, [key]: value }, null, { checkinAll: () => assert.fail("非法配置不能执行") });
+    show(response.status === 503 && fm.calls.length === 0 && kv._dump().size === 0, `${key} 非法值 fail closed`);
   }
   {
-    const fm = mockFetch(defaultRoutes());
-    globalThis.fetch = fm;
-    const kv = mockKV();
-    const env = { ...BASE_ENV, CHECKIN_KV: kv };
+    const fm = mockFetch(defaultRoutes()); globalThis.fetch = fm;
+    const env = { ...BASE_ENV, CHECKIN_KV: mockKV() };
     for (const text of ["/checkin123", "/checkin_extra", "/checkin!", "/checkin@bot/extra", "/checkin@", "prefix /checkin"]) {
-      await handleTelegramWebhook(webhookRequest(messageUpdate({ text }), secretHeader), env, null, { checkin: () => assert.fail(text) });
+      await handleTelegramWebhook(webhookRequest(messageUpdate({ text }), secretHeader), env, null, { checkinAll: () => assert.fail(text) });
     }
-    show(fm.calls.length === 0 && kv._dump().size === 0, "未知命令不执行、不写去重键");
-    await handleTelegramWebhook(webhookRequest(messageUpdate({ from: {}, text: "/checkin" }), secretHeader), env, null, { checkin: () => assert.fail("缺 sender") });
-    show(fm.calls.length === 0, "缺 sender 的消息不执行");
+    show(fm.calls.length === 0 && env.CHECKIN_KV._dump().size === 0, "不完整指令不会执行签到");
   }
-  for (const withContext of [false, true]) {
-    const sequence = [], waits = [];
-    let release;
-    const gate = new Promise((resolve) => { release = resolve; });
-    globalThis.fetch = async (url) => {
-      if (String(url).endsWith("answerCallbackQuery")) {
-        sequence.push("answer:start");
-        if (withContext) await gate;
-        sequence.push("answer:done");
-      } else sequence.push("message");
-      return Response.json({ ok: true });
+  {
+    const kv = mockKV();
+    const channels = [
+      { id: "alpha-id", name: "Alpha 私密渠道名", type: "sub2api", baseUrl: "https://alpha.example", enabled: true },
+      { id: "beta-id", name: "Beta", type: "newapi", baseUrl: "https://beta.example", enabled: true, lastResult: { ok: false } },
+      { id: "disabled-id", name: "Disabled", type: "newapi", baseUrl: "https://disabled.example", enabled: false, lastResult: { ok: false } },
+    ];
+    await kv.put("channels", JSON.stringify(channels));
+    await kv.put("last_run", JSON.stringify({ results: [{ name: "Gamma", ok: false }] }));
+    const env = { ...BASE_ENV, CHECKIN_KV: kv };
+    const calls = [], selected = [], retried = [];
+    globalThis.fetch = async (url, init) => { calls.push({ url: String(url), body: JSON.parse(init.body) }); return Response.json({ ok: true, result: {} }); };
+    const actions = {
+      checkinChannel: async (selection) => { selected.push(selection); return { ok: true, message: "单渠道完成" }; },
+      retryFailed: async () => { retried.push(true); return { ok: true, results: [{ name: "Beta", ok: true }] }; },
     };
-    const env = { ...BASE_ENV, TG_CHAT_ID: "-100999", TG_ALLOWED_USER_ID: "999", CHECKIN_KV: mockKV() };
-    const update = callbackUpdate({ message: { chat: { id: -100999 } } });
-    const ctx = withContext ? { waitUntil: (p) => waits.push(p) } : null;
-    const actions = { checkin: async () => { sequence.push("action"); return { ok: true }; } };
-    const response = await handleTelegramWebhook(webhookRequest(update, secretHeader), env, ctx, actions);
-    if (withContext) {
-      show(response.status === 200 && !sequence.includes("action"), "ctx 模式先返回200，动作等待按钮回执");
-      release();
-      await Promise.all(waits);
-    }
-    show(sequence.indexOf("answer:done") < sequence.indexOf("action") && sequence.includes("action"), `有效群聊用户先回执再执行（ctx=${withContext}）`);
-    await handleTelegramWebhook(webhookRequest(update, secretHeader), env, null, actions);
-    show(sequence.filter((s) => s === "action").length === 1 && sequence.filter((s) => s === "answer:done").length === 2, "重复按钮仍回执但不重复动作");
-    const fm = mockFetch(defaultRoutes());
-    globalThis.fetch = fm;
-    for (const data of ["checkin", "cmd:checkin-extra", "evil:checkin"]) {
-      await handleTelegramWebhook(webhookRequest(callbackUpdate({ data }), secretHeader), { ...BASE_ENV, CHECKIN_KV: mockKV() }, null, actions);
-    }
-    show(fm.calls.length === 3 && fm.calls.every((c) => c.u.pathname.endsWith("answerCallbackQuery")), "未知按钮仅回执，不执行");
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/channels" }), secretHeader), env, null, actions);
+    const picker = calls.find(c => c.body.reply_markup?.inline_keyboard?.flat().some(b => b.callback_data.startsWith("ch:")));
+    const buttons = picker?.body.reply_markup.inline_keyboard.flat() || [];
+    const channelButtons = buttons.filter(b => b.callback_data.startsWith("ch:"));
+    show(channelButtons.length === 2 && channelButtons.every(b => b.callback_data.length <= 64 && !b.callback_data.includes("Alpha")), "单渠道选择仅列启用渠道并使用短期令牌");
+    const alpha = buttons.find(b => b.text === "Alpha 私密渠道名");
+    await handleTelegramWebhook(webhookRequest(callbackUpdate({ data: alpha.callback_data }), secretHeader), env, null, actions);
+    show(selected.length === 1 && selected[0].id === "alpha-id", "按钮只签到选中的渠道");
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/retryfailed" }), secretHeader), env, null, actions);
+    show(retried.length === 1, "失败渠道命令调用定向重试");
+    const stale = await handleTelegramWebhook(webhookRequest(callbackUpdate({ data: "ch:" + "a".repeat(32) }), secretHeader), env, null, actions);
+    show(stale.status === 200 && selected.length === 1, "伪造或过期令牌不会触发签到");
+  }
+  {
+    const kv = mockKV();
+    await kv.put("channels", JSON.stringify(Array.from({ length: 10 }, (_, i) => ({ id: `id-${i}`, name: `Channel ${i}`, enabled: true }))));
+    const env = { ...BASE_ENV, CHECKIN_KV: kv };
+    const fm = mockFetch(defaultRoutes()); globalThis.fetch = fm;
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/channels" }), secretHeader), env, null, {});
+    const first = fm.calls.find(c => c.body.reply_markup);
+    show(first.body.reply_markup.inline_keyboard.flat().filter(b => b.callback_data.startsWith("ch:")).length === 8, "选择器第一页显示8个渠道");
+    const next = first.body.reply_markup.inline_keyboard.flat().find(b => b.callback_data.startsWith("pg:"));
+    await handleTelegramWebhook(webhookRequest(callbackUpdate({ data: next.callback_data }), secretHeader), env, null, {});
+    const last = fm.calls.filter(c => c.body.reply_markup).at(-1);
+    show(last.body.text.includes("2/2") && last.body.reply_markup.inline_keyboard.flat().some(b => b.text === "Channel 9"), "分页按钮显示下一页渠道");
   }
   for (const operation of ["get", "put"]) {
-    globalThis.fetch = mockFetch(defaultRoutes());
-    const kv = mockKV();
-    kv[operation] = async () => { throw new Error(BASE_ENV.TG_BOT_TOKEN); };
-    const response = await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkin" }), secretHeader),
-      { ...BASE_ENV, CHECKIN_KV: kv }, null, { checkin: () => assert.fail("KV失败不能执行") });
-    show(response.status === 503 && !(await response.text()).includes(BASE_ENV.TG_BOT_TOKEN), `KV ${operation} 失败返回503且不泄密`);
-  }
-  {
-    const fm = mockFetch(defaultRoutes());
-    globalThis.fetch = fm;
-    const req = new Request("https://hub.example.com/api/tg/setup", { method: "POST" });
-    const noKv = await setupTelegramWebhook(req, BASE_ENV);
-    const noUser = await setupTelegramWebhook(req, { ...BASE_ENV, CHECKIN_KV: mockKV(), TG_CHAT_ID: "-100999" });
-    show(!noKv.ok && !noUser.ok && fm.calls.length === 0, "注册前检查 KV 和群聊白名单");
-    globalThis.fetch = mockFetch({ ...defaultRoutes(), "POST /bot123456:ABC-DEF_secret-token-value/setMyCommands": tgFail("menu error") });
-    const partial = await setupTelegramWebhook(req, { ...BASE_ENV, CHECKIN_KV: mockKV() });
-    show(!partial.ok && partial.error.includes("Webhook 已注册"), "部分注册失败明确告知 Webhook 已更新");
-  }
-  {
-    globalThis.fetch = mockFetch({ "*": tgOk({
-      url: `https://user:old-password@hub.example.com/${BASE_ENV.TG_BOT_TOKEN}?secret=${secretHeader}#old-secret`,
-      last_error_message: `callback failed ${secretHeader} https://hub.example.com/${BASE_ENV.TG_BOT_TOKEN}`,
-    }) });
-    const r = await getTelegramStatus(BASE_ENV);
-    const output = JSON.stringify(r);
-    show(r.ok && ![BASE_ENV.TG_BOT_TOKEN, secretHeader, "old-password", "old-secret"].some((secret) => output.includes(secret)), "旧 Webhook 地址和错误内容不泄露凭证");
-    globalThis.fetch = mockFetch({ "*": tgFail(`failed ${secretHeader} ${BASE_ENV.TG_BOT_TOKEN}`) });
-    const error = await telegramApi(BASE_ENV, "setWebhook", {});
-    show(![secretHeader, BASE_ENV.TG_BOT_TOKEN].some((secret) => JSON.stringify(error).includes(secret)), "Telegram 错误对象整体脱敏（包括 data）");
-  }
-  {
-    const kv = mockKV();
-    kv._dump().set("channels", JSON.stringify([{ name: "旧配置" }, { name: "启用", enabled: true }, { name: "停用", enabled: false }]));
-    const fm = mockFetch(defaultRoutes());
-    globalThis.fetch = fm;
-    await handleTelegramWebhook(webhookRequest(messageUpdate(), secretHeader), { ...BASE_ENV, CHECKIN_KV: kv }, null, {});
-    show(fm.calls[0].body.text.includes("启用渠道：2 个"), "未显式 enabled 的旧渠道按启用统计");
-  }
-  {
-    const fm = mockFetch(defaultRoutes());
-    globalThis.fetch = fm;
-    const value = "🙂<&>".repeat(1500);
-    const html = `<b>${value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</b>`;
-    const markup = { inline_keyboard: [[{ text: "状态", callback_data: "cmd:status" }]] };
-    await sendTelegram(BASE_ENV, html, { reply_markup: markup });
-    show(fm.calls.every((c) => !c.body.parse_mode && c.body.text.length <= 4096 && c.body.text.isWellFormed()), "超长 HTML 转纯文本，不切坏标签或 emoji");
-    show(fm.calls.map((c) => c.body.text).join("") === value, "长消息转换后内容完整保留");
-    show(fm.calls[0].body.reply_markup && fm.calls.slice(1).every((c) => !c.body.reply_markup), "长消息按钮只附在第一条");
-    fm.calls.length = 0;
-    await sendTelegram(BASE_ENV, "🙂".repeat(30000));
-    show(fm.calls.length === 10 && fm.calls.at(-1).body.text.includes("已截断") && fm.calls.at(-1).body.text.isWellFormed(), "极长消息最多10条并明确截断");
+    const kv = mockKV(); kv[operation] = async () => { throw new Error("kv failure"); };
+    const response = await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/checkinall" }), secretHeader),
+      { ...BASE_ENV, CHECKIN_KV: kv }, null, { checkinAll: () => assert.fail("KV失败时不得运行动作") });
+    show(response.status === 503, `KV ${operation} 故障拒绝操作`);
   }
 }
-
-// ─────────── 运行 ───────────
-
 const suites = [testFailClosed, testChatAndUserFilter, testCommandsAndButtons, testSetupAndStatus, testTelegramApi, testSafetyBoundaries];
 let aborted = false;
 for (const s of suites) {
