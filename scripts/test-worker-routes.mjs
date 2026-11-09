@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test, afterEach } from "node:test";
 import { loadWorker, memoryKV } from "./test-helpers.mjs";
 
-const { default: worker } = await loadWorker();
+const { default: worker, runSelectedCheckin } = await loadWorker();
 const nativeFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = nativeFetch; });
 const makeEnv = () => ({
@@ -169,4 +169,48 @@ test("Telegram 失败重试与单渠道按钮只向 GitHub 分发目标启用渠
   await ctxRequest({ update_id: 23, callback_query: { id: "single-channel", from: { id: 123 }, message: { chat: { id: 123 } }, data: `ch:${token}` } });
   assert.deepEqual(dispatched[1].names, ["失败渠道"]);
   assert.deepEqual(dispatched.map(x => x.runners), [["gha_api"], ["gha_api"]]);
+});
+
+test("定向签到报告只保留签到结论，不重复抽奖信息", async () => {
+  const channel = {
+    id: "lottery-id", name: "林夕", type: "sub2api", baseUrl: "https://lottery.example", enabled: true,
+    auth: { accessToken: "test-token" }, options: { runner: "worker", autoLottery: true },
+  };
+  const env = { ...makeEnv(), TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123" };
+  env.CHECKIN_KV = memoryKV({ proxies: [], channels: [channel] });
+  const telegramBodies = [];
+  const json = (body) => Response.json(body);
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "api.telegram.org") {
+      telegramBodies.push(JSON.parse(init.body ?? "{}"));
+      return json({ ok: true, result: { message_id: 99 } });
+    }
+    if (u.pathname === "/api/v1/check-in") {
+      return json({ code: 0, message: "success", data: { reward_amount: 2, balance_after: 3, current_streak: 4, total_check_in_days: 4, checked_in_today: false } });
+    }
+    if (u.pathname === "/api/v1/lottery/status") {
+      return json({ code: 0, message: "success", data: {
+        enabled: true, window_open: true, can_draw: true, title: "抽奖", description: "",
+        activity_score: 0, activity_cap: 100, balance: 0, free_balance: 100,
+        today_draws: 0, daily_draw_limit: 1, today_remaining: 1,
+        costs: { activity: { enabled: false, amount: "0" }, free: { enabled: true, amount: "1" }, paid: { enabled: false, amount: "0" } },
+      } });
+    }
+    if (u.pathname === "/api/v1/lottery") {
+      return json({ code: 0, message: "success", data: {
+        draw: { id: 1, user_id: 1, cost_type: "free", cost_paid: 0, cost_free: 1, cost_activity: 0, prize_type: "free", prize_amount: 10, prize_amount_actual: 10, status: "win" },
+        activity_score: 0, balance: 0, free_balance: 99, today_draws: 1, today_remaining: 0,
+      } });
+    }
+    throw new Error(`unexpected request ${u.pathname}`);
+  };
+
+  const result = await runSelectedCheckin(env, { selection: { id: "lottery-id", name: "林夕", type: "sub2api", baseUrl: "https://lottery.example" } });
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].lottery?.ok, true);
+  const report = telegramBodies.at(-1)?.text || "";
+  assert.match(report, /📌 单渠道签到报告/);
+  assert.match(report, /✅ <b>林夕<\/b>：签到成功/);
+  assert.doesNotMatch(report, /抽奖|🎰/);
 });

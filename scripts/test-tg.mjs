@@ -114,7 +114,8 @@ function callbackUpdate(overrides = {}) {
 
 function defaultRoutes() {
   return {
-    "POST /bot123456:ABC-DEF_secret-token-value/sendMessage": tgOk({ message_id: 1 }),
+    "POST /bot123456:ABC-DEF_secret-token-value/sendMessage": tgOk({ message_id: 7 }),
+    "POST /bot123456:ABC-DEF_secret-token-value/editMessageText": tgOk(),
     "POST /bot123456:ABC-DEF_secret-token-value/answerCallbackQuery": tgOk(),
     "POST /bot123456:ABC-DEF_secret-token-value/getWebhookInfo": tgOk({ url: "https://hub.example.com/api/tg/webhook", pending_update_count: 0 }),
     "POST /bot123456:ABC-DEF_secret-token-value/setWebhook": tgOk(),
@@ -647,12 +648,15 @@ async function testSafetyBoundaries() {
     const env = { ...BASE_ENV, CHECKIN_KV: kv };
     const fm = mockFetch(defaultRoutes()); globalThis.fetch = fm;
     await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/channels" }), secretHeader), env, null, {});
-    const first = fm.calls.find(c => c.body.reply_markup);
+    const first = fm.calls.find(c => c.u.pathname.endsWith("sendMessage") && c.body.reply_markup);
     show(first.body.reply_markup.inline_keyboard.flat().filter(b => b.callback_data.startsWith("ch:")).length === 8, "选择器第一页显示8个渠道");
     const next = first.body.reply_markup.inline_keyboard.flat().find(b => b.callback_data.startsWith("pg:"));
     await handleTelegramWebhook(webhookRequest(callbackUpdate({ data: next.callback_data }), secretHeader), env, null, {});
-    const last = fm.calls.filter(c => c.body.reply_markup).at(-1);
-    show(last.body.text.includes("2/2") && last.body.reply_markup.inline_keyboard.flat().some(b => b.text === "Channel 9"), "分页按钮显示下一页渠道");
+    const edits = fm.calls.filter(c => c.u.pathname.endsWith("editMessageText"));
+    const sends = fm.calls.filter(c => c.u.pathname.endsWith("sendMessage"));
+    show(sends.length === 1, "翻页不重复发送频道选择消息");
+    const edited = edits.at(-1);
+    show(!!edited && edited.body.message_id === 7 && edited.body.text.includes("2/2") && edited.body.reply_markup.inline_keyboard.flat().some(b => b.text === "Channel 9"), "分页在原消息上编辑并显示下一页");
   }
   for (const operation of ["get", "put"]) {
     const kv = mockKV(); kv[operation] = async () => { throw new Error("kv failure"); };

@@ -99,11 +99,11 @@ export async function getTelegramStatus(env) {
 
 function getActor(update) {
   if (update.message && typeof update.message === "object") {
-    return { kind: "message", chatId: update.message.chat?.id, fromId: update.message.from?.id, text: typeof update.message.text === "string" ? update.message.text : "" };
+    return { kind: "message", messageId: update.message.message_id, chatId: update.message.chat?.id, fromId: update.message.from?.id, text: typeof update.message.text === "string" ? update.message.text : "" };
   }
   if (update.callback_query && typeof update.callback_query === "object") {
     const q = update.callback_query;
-    return { kind: "callback", chatId: q.message?.chat?.id, fromId: q.from?.id, data: typeof q.data === "string" ? q.data : "", callbackId: q.id };
+    return { kind: "callback", messageId: q.message?.message_id, chatId: q.message?.chat?.id, fromId: q.from?.id, data: typeof q.data === "string" ? q.data : "", callbackId: q.id };
   }
   return null;
 }
@@ -147,7 +147,7 @@ function checkinKeyboard() {
   ] };
 }
 
-async function sendChannelPicker(env, requestedPage = 0) {
+async function showChannelPicker(env, requestedPage = 0, actor = {}) {
   let channels;
   try { channels = (await getChannels(env)).filter((c) => c && c.enabled !== false); }
   catch { await sendTelegram(env, "⚠️ 读取渠道失败，请检查面板存储。"); return; }
@@ -172,7 +172,19 @@ async function sendChannelPicker(env, requestedPage = 0) {
   }
   if (navigation.length) keyboard.push(navigation);
   keyboard.push([{ text: "↩ 签到菜单", callback_data: "cmd:checkin" }]);
-  await sendTelegram(env, `选择一个渠道签到（${page + 1}/${pages}）`, { reply_markup: { inline_keyboard: keyboard } });
+  const text = `选择一个渠道签到（${page + 1}/${pages}）`;
+  if (actor?.kind === "callback" && Number.isSafeInteger(actor.messageId) && actor.messageId > 0 && actor.chatId === Number(env.TG_CHAT_ID)) {
+    const edited = await telegramApi(env, "editMessageText", {
+      chat_id: Number(env.TG_CHAT_ID),
+      message_id: actor.messageId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: keyboard },
+    });
+    if (edited.ok || /message is not modified/i.test(edited.error || "")) return;
+  }
+  await sendTelegram(env, text, { reply_markup: { inline_keyboard: keyboard } });
 }
 
 export async function handleTelegramWebhook(request, env, ctx, actions = {}) {
@@ -199,7 +211,7 @@ export async function handleTelegramWebhook(request, env, ctx, actions = {}) {
   }
 
   let command = null;
-  let payload = {};
+  let payload = { actor };
   if (actor.kind === "message") {
     const match = actor.text.match(/^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)/);
     if (match && BOT_COMMANDS.has(match[1])) command = match[1];
@@ -257,8 +269,10 @@ async function dispatchCommand(env, command, actions, payload = {}) {
       await sendTelegram(env, "请选择签到范围：", { reply_markup: checkinKeyboard() });
       return;
     case "channels":
+      await showChannelPicker(env, 0);
+      return;
     case "checkin_page":
-      await sendChannelPicker(env, payload.page || 0);
+      await showChannelPicker(env, payload.page || 0, payload.actor || {});
       return;
     case "checkin_channel": {
       if (!payload.selection || typeof actions.checkinChannel !== "function") {

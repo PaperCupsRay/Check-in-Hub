@@ -469,7 +469,7 @@ runner 专用的 `GET /api/proxies/test/task`、`POST /api/proxies/test/result` 
 |------|------|
 | `/checkin` | 打开签到范围菜单：全部、单个渠道或重试失败渠道 |
 | `/checkinall` | 立即签到全部已启用渠道 |
-| `/channels` | 分页选择单个已启用渠道签到 |
+| `/channels` | 分页选择单个已启用渠道签到；分页按钮会原位更新当前选择消息 |
 | `/retryfailed` | 只重试最近一次签到失败且仍启用的渠道 |
 | `/status` | 查看渠道启用数、最近失败数和签到结果 |
 | `/proxies` | 查看打码后的代理及最近检测结果 |
