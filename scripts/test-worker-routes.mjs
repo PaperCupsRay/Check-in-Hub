@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test, afterEach } from "node:test";
 import { loadWorker, memoryKV } from "./test-helpers.mjs";
 
-const { default: worker, runSelectedCheckin } = await loadWorker();
+const { default: worker, runSelectedCheckin, runScheduled } = await loadWorker();
 const nativeFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = nativeFetch; });
 const makeEnv = () => ({
@@ -213,4 +213,78 @@ test("定向签到报告只保留签到结论，不重复抽奖信息", async ()
   assert.match(report, /📌 单渠道签到报告/);
   assert.match(report, /✅ <b>林夕<\/b>：签到成功/);
   assert.doesNotMatch(report, /抽奖|🎰/);
+});
+
+test("GHA 回传报告去除签到行里的抽奖摘要，结构化和旧浏览器结果都保留独立详情", async () => {
+  const env = { ...makeEnv(), TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123" };
+  const base = "刷新 token 后签到：签到成功，奖励 $300.00，余额 $73.26，连续 120 天，累计 120 天";
+  const lottery = "抽奖 12 次：中奖 12 次，获得 免费额度 100×5、免费额度 30×6、$2.00×1，消耗 免费额度 1056，今日 12/12";
+  const results = [
+    { name: "林夕", ok: true, message: base + " · " + lottery, lottery: { ok: true, message: lottery } },
+    { name: "浏览器", ok: true, message: "登录+签到：签到成功，余额 $73.26 · " + lottery },
+  ];
+  env.CHECKIN_KV = memoryKV({ channels: results.map(r => ({ name: r.name, enabled: true })), proxies: [] });
+  const messages = [];
+  globalThis.fetch = async (url, init) => {
+    assert.ok(String(url).startsWith("https://api.telegram.org/"));
+    messages.push(JSON.parse(init.body).text);
+    return Response.json({ ok: true, result: {} });
+  };
+  const response = await call(env, "/api/gh/result", { method: "POST", body: { secret: env.CRON_SECRET, results } });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).merged, 2);
+  assert.equal(messages.length, 1);
+  const lines = messages[0].split("\n");
+  assert.equal(lines.find(line => line.startsWith("✅ <b>林夕</b>")), `✅ <b>林夕</b>：${base}`);
+  assert.equal(lines.find(line => line.startsWith("✅ <b>浏览器</b>")), "✅ <b>浏览器</b>：登录+签到：签到成功，余额 $73.26");
+  assert.equal(lines.filter(line => line.startsWith("🎰")).length, 2);
+  assert.ok(lines.filter(line => line.startsWith("🎰")).every(line => line.includes(lottery)));
+  // 仅清理报告呈现，原始抽奖记录仍留在 KV，执行结果不被篡改。
+  assert.deepEqual(env.CHECKIN_KV.read("last_run").results.map(r => r.message), results.map(r => r.message));
+});
+
+test("定时签到、批量签到和面板单渠道推送共用去重逻辑，抽奖仍然执行一次", async () => {
+  const channel = {
+    id: "daily-id", name: "林夕", type: "sub2api", baseUrl: "https://daily.example", enabled: true,
+    auth: { accessToken: "test-token" }, options: { runner: "worker", autoLottery: true },
+  };
+  for (const source of ["cron", "batch", "single"]) {
+    const env = { ...makeEnv(), TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123" };
+    env.CHECKIN_KV = memoryKV({ channels: [channel], proxies: [] });
+    const messages = [];
+    let draws = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.telegram.org") {
+        messages.push(JSON.parse(init.body).text);
+        return Response.json({ ok: true, result: {} });
+      }
+      if (u.pathname === "/api/v1/check-in") return Response.json({ code: 0, message: "success", data: { reward_amount: 300, balance_after: 73.26, current_streak: 120, total_check_in_days: 120 } });
+      if (u.pathname === "/api/v1/lottery/status") return Response.json({ code: 0, data: {
+        enabled: true, window_open: true, can_draw: true, free_balance: 100, today_draws: 0, daily_draw_limit: 1, today_remaining: 1,
+        costs: { free: { enabled: true, amount: "1" } },
+      } });
+      if (u.pathname === "/api/v1/lottery") {
+        draws++;
+        return Response.json({ code: 0, data: {
+          draw: { id: 1, cost_type: "free", cost_free: 1, prize_type: "free", prize_amount: 10, prize_amount_actual: 10, status: "win" },
+          today_draws: 1, today_remaining: 0, free_balance: 109,
+        } });
+      }
+      assert.fail(`unexpected request ${u.pathname}`);
+    };
+    if (source === "cron") assert.equal((await runScheduled(env)).ok, true);
+    else {
+      const response = await call(env, source === "batch" ? "/api/batch" : "/api/checkin", {
+        method: "POST", login: true, body: source === "batch" ? { channels: [channel] } : { channel },
+      });
+      assert.equal(response.status, 200);
+    }
+    assert.equal(draws, 1, source);
+    assert.equal(messages.length, 1, source);
+    const checkinLine = messages[0].split("\n").find(line => line.startsWith("✅ <b>林夕</b>"));
+    assert.match(checkinLine, /奖励 \$300\.00，余额 \$73\.26/);
+    assert.doesNotMatch(checkinLine, /抽奖|中奖|免费额度|🎰/);
+    assert.equal(messages[0].split("\n").filter(line => line.startsWith("🎰")).length, 1, source);
+  }
 });

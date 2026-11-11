@@ -844,16 +844,7 @@ async function runSelectedCheckin(env, { selection = null, failedOnly = false } 
   await putLastRun(env, { at: new Date().toISOString(), runner: "telegram-manual", results });
   const failed = results.filter((r) => !r.ok).length;
   const title = failedOnly ? "🔁 失败渠道重试报告" : "📌 单渠道签到报告";
-  const reportResults = results.map(({ lottery, ...result }) => {
-    let message = result.message;
-    if (typeof lottery?.message === "string" && lottery.message) {
-      for (const suffix of [` · ${lottery.message}`, ` · 抽奖失败：${lottery.message}`]) {
-        if (message.endsWith(suffix)) message = message.slice(0, -suffix.length);
-      }
-    }
-    return { ...result, message };
-  });
-  const tg = await sendTelegram(env, formatCheckinReport(title, reportResults));
+  const tg = await sendTelegram(env, formatCheckinReport(title, results, "", { showLottery: false }));
   return { ok: failed === 0, message: failed ? `完成 ${results.length} 个渠道，${failed} 个仍失败` : `成功完成 ${results.length} 个渠道`, results, tg };
 }
 

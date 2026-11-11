@@ -120,21 +120,43 @@ async function sendTelegram(env, text, options = {}) {
 }
 
 /**
- * 签到报告。
- *
- * results: [{ name, ok, message, lottery? }]
- *   lottery 是抽奖结论（{ ok, skipped, message }），单独占一行 —— 签到文案本身
- *   就常有一长串（奖励/余额/连续天数），把抽奖挤在同一行会被 90 字上限截断，
- *   推送里就看不到抽到啥了。
+ * 适配器把抽奖摘要追加到签到 message；先拆分再截断，签到行与抽奖行各显示一次。
+ * 兼容仅有「 · 抽奖…」文案、没有 lottery 字段的浏览器回传。
+ * 只识别明确的分隔符和抽奖前缀，不按任意「抽奖」二字裁剪签到错误。
  */
-function formatCheckinReport(title, results, extra = "") {
+function splitCheckinMessage(message, lottery) {
+  const text = message.trimEnd();
+  const note = String(lottery?.message || "").trim();
+  if (note) {
+    for (const suffix of [` · ${note}`, ` · 抽奖失败：${note}`, ` · 抽奖异常：${note}`]) {
+      if (text.endsWith(suffix)) return { message: text.slice(0, -suffix.length), lottery };
+    }
+  }
+  const boundary = /\s*[·；;]\s*(?=(?:抽奖\s*\d+\s*次[：:]|抽奖(?:失败|异常)[：:]|未抽奖[：:]))/u.exec(text);
+  if (!boundary || boundary.index === 0) return { message, lottery };
+  const lotteryMessage = text.slice(boundary.index + boundary[0].length);
+  return {
+    message: text.slice(0, boundary.index),
+    lottery: note ? lottery : {
+      ...lottery,
+      message: lotteryMessage,
+      ok: !/^抽奖(?:失败|异常)[：:]/u.test(lotteryMessage),
+      skipped: /^未抽奖[：:]/u.test(lotteryMessage),
+    },
+  };
+}
+
+function formatCheckinReport(title, results, extra = "", options = {}) {
   const esc = escapeHtml;
+  const showLottery = options.showLottery !== false;
   const okCount = results.filter((r) => r.ok).length;
   const lines = [];
   for (const r of results) {
-    const msg = esc(String(r.message || (r.ok ? "ok" : "failed")).slice(0, 90));
+    const split = splitCheckinMessage(String(r.message || (r.ok ? "ok" : "failed")), r.lottery);
+    const msg = esc(split.message.slice(0, 90));
     lines.push(`${r.ok ? "✅" : "❌"} <b>${esc(r.name)}</b>：${msg}`);
-    const lot = r.lottery;
+    if (!showLottery) continue;
+    const lot = split.lottery;
     const lotMsg = String(lot?.message || "").trim();
     if (lotMsg) {
       // 抽奖是签到之外的独立动作：跳过（今日已抽完/额度不够）用 ⏭️，成功 🎰，失败 ⚠️

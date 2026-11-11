@@ -665,7 +665,50 @@ async function testSafetyBoundaries() {
     show(response.status === 503, `KV ${operation} 故障拒绝操作`);
   }
 }
-const suites = [testFailClosed, testChatAndUserFilter, testCommandsAndButtons, testSetupAndStatus, testTelegramApi, testSafetyBoundaries];
+async function testReportLotteryDeduplication() {
+  console.log("▶ 签到报告抽奖去重");
+  const base = "刷新 token 后签到：签到成功，奖励 $300.00，余额 $73.26，连续 120 天，累计 120 天";
+  const reward = "抽奖 12 次：中奖 12 次，获得 免费额度 100×5、免费额度 30×6、$2.00×1，消耗 免费额度 1056，今日 12/12";
+  const cases = [
+    { note: reward, lottery: { ok: true, message: reward }, icon: "🎰" },
+    { note: "未抽奖：今日次数已用完（12/12）", lottery: { ok: true, skipped: true, message: "未抽奖：今日次数已用完（12/12）" }, icon: "⏭️" },
+    { note: "抽奖失败：免费额度不足", lottery: { ok: false, message: "抽奖失败：免费额度不足" }, icon: "⚠️" },
+    { note: "抽奖异常：网络超时", lottery: { ok: false, message: "网络超时" }, icon: "⚠️" },
+  ];
+  for (const title of ["📋 定时签到报告", "🤖 GitHub Actions 签到报告", "📋 全部签到报告"]) {
+    for (const c of cases) for (const structured of [true, false]) {
+      const result = { name: "林夕", ok: true, message: base + " · " + c.note, ...(structured ? { lottery: c.lottery } : {}) };
+      const snapshot = JSON.stringify(result);
+      const lines = formatCheckinReport(title, [result]).split("\n");
+      assert.equal(lines[2], `✅ <b>林夕</b>：${base}`);
+      assert.equal(lines.length, 4);
+      assert.equal(lines[3], `${c.icon} <b>林夕</b> 抽奖：${structured ? c.lottery.message : c.note}`);
+      assert.equal(JSON.stringify(result), snapshot);
+    }
+    show(true, `${title}：结构化结果/旧浏览器文案的成功、失败、跳过均不重复`);
+  }
+  for (const c of cases) {
+    const lines = formatCheckinReport("📌 单渠道签到报告", [{ name: "林夕", ok: true, message: base + " · " + c.note, lottery: c.lottery }], "", { showLottery: false }).split("\n");
+    assert.equal(lines.length, 3);
+    assert.equal(lines[2], `✅ <b>林夕</b>：${base}`);
+  }
+  show(true, "定向报告复用去重逻辑，仅显示签到信息");
+  const unrelated = "签到失败：抽奖接口不可用，请联系站点管理员";
+  assert.ok(formatCheckinReport("t", [{ name: "x", ok: false, message: unrelated }]).includes(unrelated));
+  assert.equal(formatCheckinReport("t", [{ name: "x", ok: false, message: "抽奖失败：这本身是错误内容" }]).split("\n").length, 3);
+  show(true, "没有明确追加分隔符的错误文案保持原样");
+  const longBase = "签到奖励明细".repeat(20);
+  const longReport = formatCheckinReport("t", [{ name: "x", ok: true, message: longBase + " · " + reward, lottery: { ok: true, message: reward } }]).split("\n");
+  assert.equal(longReport[2], "✅ <b>x</b>：" + longBase.slice(0, 90));
+  assert.ok(longReport[3].includes(reward));
+  show(true, "先清理再截断，长签到文案和独立奖品详情各自保留");
+  const escaped = formatCheckinReport("t", [{ name: "a<b>", ok: true, message: "签到成功 <safe> · 抽奖异常：<script>&", lottery: { ok: false, message: "<script>&" } }]);
+  assert.ok(escaped.includes("✅ <b>a&lt;b&gt;</b>：签到成功 &lt;safe&gt;\n"));
+  assert.ok(escaped.includes("⚠️ <b>a&lt;b&gt;</b> 抽奖：&lt;script&gt;&amp;"));
+  show(true, "去重后签到和抽奖行仍分别 HTML 转义");
+}
+
+const suites = [testFailClosed, testChatAndUserFilter, testCommandsAndButtons, testSetupAndStatus, testTelegramApi, testSafetyBoundaries, testReportLotteryDeduplication];
 let aborted = false;
 for (const s of suites) {
   if (aborted) break;

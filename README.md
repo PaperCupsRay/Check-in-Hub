@@ -475,6 +475,10 @@ runner 专用的 `GET /api/proxies/test/task`、`POST /api/proxies/test/result` 
 | `/proxies` | 查看打码后的代理及最近检测结果 |
 | `/testproxies` | 提交 GitHub 代理检测，完成后收到汇总通知 |
 
+签到推送先从原始文案拆分抽奖摘要，再分别截断与转义：定时、批量和 GitHub Actions 回传
+的签到行仅包含签到结果，抽奖详情单独显示一次；兼容没有 `lottery` 字段的旧浏览器回传。
+Telegram 单渠道与失败重试报告沿用精简输出，不显示抽奖详情。只调整通知文案，不改变抽奖执行或历史记录。
+
 ---
 
 ## 📁 目录结构
