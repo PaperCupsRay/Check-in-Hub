@@ -1001,6 +1001,15 @@
         options: { ...(prev.options || {}), ...(ch.options || {}) },
       };
       for (const key of ch._clearedKeys || []) deleteByPath(merged, key);
+      if (merged.type === "newapi") {
+        if ((ch._clearedKeys || []).includes("auth.token")) {
+          delete merged.auth.accessToken;
+          delete merged.auth.accessExpiresAt;
+        } else if (ch.auth?.token && ch.auth.token !== prev.auth?.token) {
+          merged.auth.accessToken = ch.auth.token;
+          delete merged.auth.accessExpiresAt;
+        }
+      }
       return merged;
     }
 
@@ -1610,7 +1619,10 @@
     function mergeTokens(ch, tokens) {
       if (!tokens) return ch;
       const next = { ...ch, auth: { ...(ch.auth || {}) } };
-      if (tokens.accessToken) next.auth.accessToken = tokens.accessToken;
+      if (tokens.accessToken) {
+        next.auth.accessToken = tokens.accessToken;
+        if (ch.type === "newapi") next.auth.token = tokens.accessToken;
+      }
       if (tokens.refreshToken) next.auth.refreshToken = tokens.refreshToken;
       if (tokens.cookie) next.auth.cookie = tokens.cookie;
       if (tokens.userId) next.auth.userId = String(tokens.userId);

@@ -129,19 +129,19 @@ cp .dev.vars.example .dev.vars
   「请打开网站后再签到」；而状态查询两种凭证都认，所以「状态查得到、签到报请打开
   网站」正是这道闸门的特征，不是令牌过期。签到由浏览器通道取图 + OCR + 带
   `captcha_id` 提交完成，答错自动换一张重试（见下文）
-- **新版（v1.3.x，如 freeapi.tingfengai.art）**：鉴权换成了**短期访问令牌**，
-  不再是长期 Cookie：站点前端先 `POST /api/user/auth/refresh`（空 body，请求头
-  `X-Auth-Session: <session.sid>`）拿 `access_token`（实测只有 **900 秒**寿命），
-  之后所有接口都带 `Authorization: Bearer <access_token>`。配法是：
-  1. `访问令牌` 填 `access_token`；
-  2. `会话 ID` 填响应里的 `session.sid`（填了才能在 Worker/GHA 出口自动续期；
-     令牌过期后适配器会按站点协议自动续，续到的令牌/过期时间/会话 ID 会写回渠道）；
-  3. `访问令牌过期时间` 可选，填了就不必每次动作都先续一次；
-  4. 用户数字 ID 仍建议填 `New-Api-User`（部分中间件对会话也校验它）。
-  **注意：直接把这个站点的 HAR 当渠道配置导入是用不了的** —— 这类请求在 HAR 里
-  既没有 Cookie 也没有 Authorization（令牌只存在页面 JS 内存里），导入只会得到
-  一个没有任何凭证的渠道。必须按上面的字段手填，或用浏览器通道跑。
-  回归：`node scripts/test-newapi-modern.mjs`（验证续期链、旧站不受影响）。
+- **新版（如 freeapi.tingfengai.art，v1.3.419）**：控制台接口使用短期 Bearer
+  `access_token`（抓包中的有效期约 **900 秒**）。续期是携带登录 Cookie 的空体
+  `POST /api/user/auth/refresh`；`X-Auth-Session` / `session.sid` 只是可选的会话
+  校验标识，**不能替代 Cookie，也不能独立用于续期**。
+  1. 推荐在已登录的站点 F12 → Application → Cookies 复制**完整登录 Cookie**
+     填入渠道的 Cookie 栏，包含 HttpOnly 项；`new_api_has_session=1` 只是标记，
+     单独复制它无效。不要用 `document.cookie`，它看不到 HttpOnly 登录凭证。
+  2. 访问令牌可填刷新响应里的最新 `data.access_token`，不是模型调用用的 `sk-` API Key。
+     JWT 会自动读取 `exp`，未过期时直接查询；过期后用 Cookie 续期。
+  3. 会话 ID 是可选校验项。续期成功后，新 Cookie、令牌、过期时间和会话 ID 一起回写。
+  当前 HAR 的 Cookie / Authorization 请求头已被省略，**不能据此认为请求不需要认证**；
+  响应虽含短期令牌，也不能还原用于长期续期的登录 Cookie。
+  回归：`npm run test:newapi`（覆盖 Cookie 续期、令牌直用、回写与旧站兼容）。
 
 **AgentRouter**
 

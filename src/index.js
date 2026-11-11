@@ -92,6 +92,8 @@ function normalizeChannel(input = {}) {
     "token",
     "accessToken",
     "refreshToken",
+    "authSession",
+    "accessExpiresAt",
     "userId",
     "newApiUser",
     "turnstileToken",
@@ -1054,7 +1056,12 @@ async function handleGhResult(request, env) {
     // cf_clearance 这类与出口 IP 绑定的 cookie 会被 stripIpBoundCookies 去掉。
     if (r.newTokens) {
       ch.auth = { ...(ch.auth || {}) };
-      if (r.newTokens.accessToken) ch.auth.accessToken = r.newTokens.accessToken;
+      if (r.newTokens.accessToken) {
+        ch.auth.accessToken = r.newTokens.accessToken;
+        if (ch.type === "newapi") ch.auth.token = r.newTokens.accessToken;
+      }
+      if (r.newTokens.authSession) ch.auth.authSession = r.newTokens.authSession;
+      if (r.newTokens.accessExpiresAt) ch.auth.accessExpiresAt = r.newTokens.accessExpiresAt;
       if (r.newTokens.refreshToken) ch.auth.refreshToken = r.newTokens.refreshToken;
       if (r.newTokens.cookie) {
         const fresh = stripIpBoundCookies(r.newTokens.cookie);
