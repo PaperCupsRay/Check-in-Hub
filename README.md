@@ -129,6 +129,19 @@ cp .dev.vars.example .dev.vars
   「请打开网站后再签到」；而状态查询两种凭证都认，所以「状态查得到、签到报请打开
   网站」正是这道闸门的特征，不是令牌过期。签到由浏览器通道取图 + OCR + 带
   `captcha_id` 提交完成，答错自动换一张重试（见下文）
+- **新版（v1.3.x，如 freeapi.tingfengai.art）**：鉴权换成了**短期访问令牌**，
+  不再是长期 Cookie：站点前端先 `POST /api/user/auth/refresh`（空 body，请求头
+  `X-Auth-Session: <session.sid>`）拿 `access_token`（实测只有 **900 秒**寿命），
+  之后所有接口都带 `Authorization: Bearer <access_token>`。配法是：
+  1. `访问令牌` 填 `access_token`；
+  2. `会话 ID` 填响应里的 `session.sid`（填了才能在 Worker/GHA 出口自动续期；
+     令牌过期后适配器会按站点协议自动续，续到的令牌/过期时间/会话 ID 会写回渠道）；
+  3. `访问令牌过期时间` 可选，填了就不必每次动作都先续一次；
+  4. 用户数字 ID 仍建议填 `New-Api-User`（部分中间件对会话也校验它）。
+  **注意：直接把这个站点的 HAR 当渠道配置导入是用不了的** —— 这类请求在 HAR 里
+  既没有 Cookie 也没有 Authorization（令牌只存在页面 JS 内存里），导入只会得到
+  一个没有任何凭证的渠道。必须按上面的字段手填，或用浏览器通道跑。
+  回归：`node scripts/test-newapi-modern.mjs`（验证续期链、旧站不受影响）。
 
 **AgentRouter**
 

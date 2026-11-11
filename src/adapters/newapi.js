@@ -204,12 +204,29 @@ function pickAuth(channel) {
     password: auth.password || "",
     cookie: normalizeCookie(auth.cookie || auth.session || ""),
     userId: String(auth.userId || auth.newApiUser || "").trim(),
-    token: auth.token || auth.accessToken || "", // system access token if any
+    token: auth.token || auth.accessToken || "", // system/personal access token
+    accessToken: auth.accessToken || auth.token || "",
+    refreshToken: auth.refreshToken || "",
+    accessExpiresAt: Number(auth.accessExpiresAt || auth.access_expires_at || 0) || 0,
+    authSession: auth.authSession || auth.auth_session || "",
     turnstileToken: auth.turnstileToken || "",
   };
 }
 
-function authHeaders(channel, cookie, { method = "GET" } = {}) {
+/**
+ * 新版 New API（v1.3.x）不再用长期 Cookie 鉴权，而是：
+ *   POST /api/user/auth/refresh（空 body，浏览器上下文或 X-Auth-Session 头）
+ *     → { data: { access_token, access_expires_at, session: { sid }, user } }
+ * 之后所有接口都用 `Authorization: Bearer <access_token>`。令牌有效期很短
+ * （实测 900 秒），所以每个动作开始时按过期时间续一次。
+ *
+ * 续期结果按 channel 对象缓存：同一个动作内 ensureSession 之后的 request 调用
+ * 拿到的是刚续的新令牌，而不是表单里那份可能已过期的。用 WeakMap 而不是改
+ * channel 本身，避免把「本次运行临时拿到的令牌」写脏调用方的配置。
+ */
+const rotatedTokens = new WeakMap();
+
+function authHeaders(channel, cookie, { method = "GET", token } = {}) {
   const auth = pickAuth(channel);
   // Align with real browser traffic (pie-xian HAR used Chrome 150)
   const headers = {
@@ -232,8 +249,17 @@ function authHeaders(channel, cookie, { method = "GET" } = {}) {
   // HTTP 头名不区分大小写：写两次会被 fetch 合并成 "1750, 1750"，
   // 服务端 strconv.Atoi 解析失败并返回「New-Api-User 格式错误」。只能写一次。
   if (auth.userId) headers["New-Api-User"] = String(auth.userId);
-  // Some deployments accept Authorization for personal tokens
-  if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
+  // Some deployments accept Authorization for personal tokens.
+  // token === null 表示「这次不要带 Bearer」（续期请求就是这样发的：浏览器那一版
+  // 不带旧令牌，带过期的 Authorization 反而会被服务端先判掉）；未显式传参时优先
+  // 用本次动作里刚续到的新令牌，其次才是渠道里存的那份。
+  const bearer =
+    token === null ? "" : token || rotatedTokens.get(channel)?.accessToken || auth.token || auth.accessToken;
+  if (bearer) headers.Authorization = `Bearer ${String(bearer).replace(/^Bearer\s+/i, "")}`;
+  // 新版续期靠会话 ID：请求头 X-Auth-Session 必须与当前会话一致，服务端才会
+  // 换发新令牌（见站点前端 S() → post("/api/user/auth/refresh", undefined,
+  // { headers: { "X-Auth-Session": sid } })）。
+  if (auth.authSession) headers["X-Auth-Session"] = auth.authSession;
   const origin = String(channel.baseUrl || "").replace(/\/+$/, "");
   if (origin) {
     headers.Origin = origin;
@@ -576,6 +602,18 @@ export const newapiAdapter = {
     { key: "auth.username", label: "用户名（账密站）", placeholder: "username" },
     { key: "auth.password", label: "密码（账密站）", type: "password" },
     {
+      // 新版（v1.3.x）站点：令牌 15 分钟就过期，续期要带会话 ID。留空时适配器
+      // 仍会尝试续期（浏览器上下文可续），填了就能在 Worker/GHA 出口续期。
+      key: "auth.authSession",
+      label: "会话 ID（新版站点：/api/user/auth/refresh 响应的 session.sid，可选）",
+      placeholder: "填了才能在 Worker 出口自动续期短期访问令牌",
+    },
+    {
+      key: "auth.accessExpiresAt",
+      label: "访问令牌过期时间（Unix 秒，可选；填了可避免每次动作都先续期）",
+      placeholder: "如 1794403556",
+    },
+    {
       key: "auth.turnstileToken",
       label: "Turnstile Token（仅当站点 /api/status 的 turnstile_checkin 为 true 时需要）",
       type: "password",
@@ -583,10 +621,10 @@ export const newapiAdapter = {
     { key: "options.timezone", label: "时区（用于月份）", placeholder: "Asia/Shanghai" },
   ],
 
-  async request(channel, path, { method = "GET", body, cookie } = {}) {
+  async request(channel, path, { method = "GET", body, cookie, token } = {}) {
     const res = await fetch(joinUrl(channel.baseUrl, path), {
       method,
-      headers: authHeaders(channel, cookie, { method }),
+      headers: authHeaders(channel, cookie, { method, token }),
       body: body == null ? undefined : JSON.stringify(body),
       redirect: "manual",
     });
@@ -678,6 +716,30 @@ export const newapiAdapter = {
 
   async ensureSession(channel) {
     const auth = pickAuth(channel);
+    // 新版（v1.3.x）优先：短期 access token + 会话续期。
+    // 判断依据只认新版专用字段（authSession / accessExpiresAt / refreshToken），
+    // 老站不会带这些，因此不会误走这条分支。
+    const modern = !!(auth.authSession || auth.accessExpiresAt || auth.refreshToken);
+    if (modern && (auth.accessToken || auth.authSession)) {
+      const now = Math.floor(Date.now() / 1000);
+      // 没有过期时间时也先续一次：新版令牌只有 15 分钟寿命，赌它还有效不如直接续。
+      const usable = auth.accessToken && auth.accessExpiresAt > now + 60;
+      if (usable) {
+        const tokens = {
+          accessToken: auth.accessToken,
+          ...(auth.refreshToken ? { refreshToken: auth.refreshToken } : {}),
+          ...(auth.accessExpiresAt ? { accessExpiresAt: auth.accessExpiresAt } : {}),
+          ...(auth.authSession ? { authSession: auth.authSession } : {}),
+          ...(auth.userId ? { userId: auth.userId } : {}),
+        };
+        return { ok: true, cookie: auth.cookie || "", tokens };
+      }
+      const refreshed = await this.refreshModern(channel);
+      if (refreshed.ok) return refreshed;
+      // 续期被拒且站点是 OAuth-only（没有账密）时直接报续期原因，不要掉进账密登录
+      // 分支又失败一次——那句「需要用户名+密码」会盖掉真正的续期错误。
+      if (!auth.username || !auth.password) return refreshed;
+    }
     // 「有 cookie」不等于「cookie 能鉴权」。多租户/白标托管面板会额外下发
     // server_name_session 之类的**租户路由** cookie（名字里的 server_name 往往
     // 还是没被替换的模板占位符），它连匿名请求都发、每次值都一样、**不携带用户
@@ -704,10 +766,16 @@ export const newapiAdapter = {
     }
     // Cookie 与访问令牌都是有效凭证：站点前端本身就靠 Cookie 签到，
     // 服务端解不出 session 时才回退看 Authorization。任一存在即视为有会话。
-    if (auth.token || auth.cookie) {
+    if (auth.token || auth.cookie || auth.authSession) {
       const tokens = {};
       if (auth.userId) tokens.userId = auth.userId;
       if (auth.cookie) tokens.cookie = auth.cookie;
+      // 新版站点的令牌与会话 ID 必须一起回传，否则面板存下来的渠道下次又变成
+      // 「只有一份会过期的令牌」，续期链就断了。
+      if (auth.accessToken) tokens.accessToken = auth.accessToken;
+      if (auth.refreshToken) tokens.refreshToken = auth.refreshToken;
+      if (auth.accessExpiresAt) tokens.accessExpiresAt = auth.accessExpiresAt;
+      if (auth.authSession) tokens.authSession = auth.authSession;
       return {
         ok: true,
         cookie: auth.cookie || "",
@@ -727,6 +795,56 @@ export const newapiAdapter = {
       cookie: login.tokens.cookie,
       tokens: login.tokens,
       user: login.user,
+    };
+  },
+
+  /**
+   * 新版 New API 的会话续期：POST /api/user/auth/refresh（空 body）。
+   * 站点前端每 15 分钟到期前用会话 ID 换一次新令牌，请求头带 X-Auth-Session；
+   * 响应体形如 { success, data: { access_token, access_expires_at, session, user } }。
+   *
+   * 这里刻意不带旧 Authorization（token: null）：浏览器那一版也不带，服务端会先
+   * 校验 Authorization，带着过期令牌反而被判掉，续期就永远不会成功。
+   */
+  async refreshModern(channel) {
+    const auth = pickAuth(channel);
+    const res = await this.request(channel, "/api/user/auth/refresh", {
+      method: "POST",
+      body: undefined,
+      token: null,
+    });
+    const data = res.data || {};
+    const d = data.data || {};
+    if (res.status >= 400 || data.success === false || !d.access_token) {
+      return {
+        ok: false,
+        httpStatus: res.status,
+        message: `${httpErrorMessage("刷新会话", res)}${
+          auth.authSession
+            ? ""
+            : "（渠道里没填「会话 ID」；新版站点的续期需要 session.sid，可在 /api/user/auth/refresh 响应里取）"
+        }`,
+        raw: data,
+      };
+    }
+    const user = d.user ? normalizeUser({ data: d.user }) : null;
+    const sid = d.session?.sid || auth.authSession || "";
+    const tokens = {
+      accessToken: d.access_token,
+      ...(d.refresh_token ? { refreshToken: d.refresh_token } : {}),
+      ...(d.access_expires_at ? { accessExpiresAt: d.access_expires_at } : {}),
+      ...(sid ? { authSession: sid } : {}),
+      ...(user?.id || auth.userId ? { userId: user?.id || auth.userId } : {}),
+    };
+    // 同一动作内后续请求直接用新令牌（见 authHeaders 的 rotatedTokens）
+    rotatedTokens.set(channel, tokens);
+    return {
+      ok: true,
+      cookie: auth.cookie || "",
+      tokens,
+      user,
+      message: "会话已续期",
+      raw: data,
     };
   },
 

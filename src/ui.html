@@ -1614,6 +1614,10 @@
       if (tokens.refreshToken) next.auth.refreshToken = tokens.refreshToken;
       if (tokens.cookie) next.auth.cookie = tokens.cookie;
       if (tokens.userId) next.auth.userId = String(tokens.userId);
+      // 新版 New API 的续期结果：令牌 15 分钟过期，必须把过期时间和会话 ID 一起
+      // 存回渠道，否则下次动作只能拿一份过期令牌去撞 401。
+      if (tokens.accessExpiresAt) next.auth.accessExpiresAt = tokens.accessExpiresAt;
+      if (tokens.authSession) next.auth.authSession = tokens.authSession;
       return next;
     }
 
