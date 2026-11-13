@@ -29,6 +29,46 @@ function joinUrl(base, path) {
   return `${String(base).replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+// FreeGG HAR: /api/user/self grants the daily allowance; standard check-in is disabled.
+// Do not generalize checkin_enabled=false to other New API deployments.
+function isDailyAllowanceSite(channel) {
+  try { return new URL(channel.baseUrl).hostname.toLowerCase() === "freegg.app"; }
+  catch { return false; }
+}
+
+function dailyAllowanceProof(payload, tz) {
+  const items = payload?.data?.items;
+  if (!Array.isArray(items)) return null;
+  const today = currentDate(tz);
+  for (const record of items) {
+    const timestamp = Number(record.created_at);
+    if (Number(record.type) !== 1 || !Number.isFinite(timestamp) || timestamp <= 0 ||
+        timestamp > Date.now() / 1000 + 60) continue;
+    let date;
+    try {
+      date = new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+      }).format(new Date(timestamp * 1000));
+    } catch { date = new Date(timestamp * 1000).toISOString().slice(0, 10); }
+    if (date !== today) continue;
+    let other = record.other;
+    if (typeof other === "string") {
+      try { other = JSON.parse(other); } catch { other = null; }
+    }
+    const part = Array.isArray(other?.content_parts)
+      ? other.content_parts.find(p => p?.key === "Daily allowance {{quota}}") : null;
+    const content = String(record.content || "");
+    if (!part && !/^\s*Daily allowance\s+/i.test(content)) continue;
+    // FreeGG logs quota:0 even when $20 was granted. Parse the explicit currency value,
+    // not record.quota and not a hard-coded $20, to report the real reward.
+    const amount = String(part?.params?.quota || content).match(/[$＄]\s*(\d+(?:\.\d+)?)/);
+    const dollars = amount ? Number(amount[1]) : null;
+    const reward = dollars != null && Number.isFinite(dollars) ? dollars * 500000 : null;
+    return { date, reward, content };
+  }
+  return null;
+}
+
 function currentMonth(tz = "Asia/Shanghai") {
   try {
     const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -813,7 +853,12 @@ export const newapiAdapter = {
       return {
         ok: false,
         httpStatus: res.status,
-        message: `刷新会话失败：${data.message || data.code || `HTTP ${res.status}`}。${MODERN_CREDENTIAL_GUIDE}`,
+        message: `刷新会话失败：${data.message || data.code || `HTTP ${res.status}`}。` +
+          (res.status === 401
+            ? "已发送渠道保存的 Cookie，但目标站不接受该登录会话；可能已失效或被撤销，" +
+              "也可能与会话 ID 不匹配。请从当前已登录的同一站点重新复制完整 Cookie，" +
+              "并清空旧会话 ID（可选校验项）后重试。"
+            : MODERN_CREDENTIAL_GUIDE),
         raw: data,
       };
     }
@@ -892,7 +937,49 @@ export const newapiAdapter = {
     };
   },
 
+  /** FreeGG: self triggers the grant; today's allowance log is the success evidence. */
+  async dailyAllowance(channel, { statusOnly = false } = {}) {
+    const me = await this.me(channel);
+    if (!me.ok) return me;
+    const active = sessionChannel(channel, me);
+    const tz = channel.options?.timezone || "Asia/Shanghai";
+    const now = Math.floor(Date.now() / 1000);
+    const query = new URLSearchParams({
+      p: "1", page_size: "100", type: "1",
+      start_timestamp: String(now - 36 * 3600), end_timestamp: String(now + 60),
+    });
+    let proof = null, logData = null, logFailure = "";
+    let tokens = me.tokens;
+    try {
+      const log = await this.request(active, `/api/log/self?${query}`);
+      logData = log.data;
+      if (log.ok && logData?.success === true) {
+        proof = dailyAllowanceProof(logData, tz);
+        if (log.setCookies?.length) {
+          tokens = { ...(tokens || {}), cookie: mergeCookie(active.auth?.cookie, log.setCookies) };
+        }
+      } else logFailure = `奖励日志查询失败（HTTP ${log.status}）`;
+    } catch { logFailure = "奖励日志查询失败"; }
+    const money = proof?.reward != null ? quotaUsd(proof.reward) : null;
+    const message = proof
+      ? `今日每日补贴已到账${money ? `，奖励 ${money}` : ""}（Daily allowance 日志确认；用户信息查询触发，未重复 POST 签到）`
+      : `已查询用户信息，但${logFailure || "未找到今日 Daily allowance 奖励记录"}，无法确认补贴到账`;
+    return {
+      ok: statusOnly || !!proof,
+      httpStatus: me.httpStatus,
+      user: me.user,
+      status: { enabled: true, manualCheckinEnabled: false, mode: "dailyAllowance",
+        checkedInToday: proof ? true : null, todayReward: proof?.reward ?? null },
+      ...(!statusOnly ? { result: { success: !!proof, reward: proof?.reward ?? null,
+        checkInDate: proof?.date || null, via: "/api/user/self", message } } : {}),
+      message,
+      tokens,
+      raw: { user: me.raw, allowanceLog: logData },
+    };
+  },
+
   async status(channel) {
+    if (isDailyAllowanceSite(channel)) return this.dailyAllowance(channel, { statusOnly: true });
     const ensured = await this.ensureSession(channel);
     if (!ensured.ok) return ensured;
     const month = currentMonth(channel.options?.timezone || "Asia/Shanghai");
@@ -973,6 +1060,7 @@ export const newapiAdapter = {
   },
 
   async checkin(channel) {
+    if (isDailyAllowanceSite(channel)) return this.dailyAllowance(channel);
     const ensured = await this.ensureSession(channel);
     if (!ensured.ok) return ensured;
     const auth = pickAuth(channel);

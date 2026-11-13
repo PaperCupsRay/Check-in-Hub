@@ -32,7 +32,7 @@ function mock({ rejectRefresh = false, rejectSelf = false } = {}) {
       assert.equal(init.method, "POST");
       assert.equal(init.body, undefined);
       assert.equal(h.get("Authorization"), null);
-      assert.equal(h.get("Referer"), "https://freeapi.example.test/profile");
+      assert.equal(h.get("Referer"), `${new URL(url).origin}/profile`);
       return json({ success: true, data: { access_token: FRESH, access_expires_at: NOW + 900,
         session: { sid: SID }, user: { id: 7, username: "fixture", quota: 1000 } } }, 200,
         { "Set-Cookie": "new_api_refresh=rotated-secret; Path=/; HttpOnly; Secure" });
@@ -110,7 +110,8 @@ try {
     const result = await adapter.checkin(channel({ token: OLD, cookie: COOKIE, authSession: SID }));
     assert.equal(result.ok, false);
     assert.match(result.message, /刷新会话失败：Unauthorized/);
-    assert.match(result.message, /完整登录 Cookie/);
+    assert.match(result.message, /已发送渠道保存的 Cookie/);
+    assert.doesNotMatch(result.message, /缺少完整登录 Cookie/);
     assert.equal(calls.length, 1);
     assert.equal(checkedIn, false);
   });
@@ -157,6 +158,88 @@ try {
     assert.equal(replaced.auth.accessToken, FRESH);
     assert.equal(replaced.auth.accessExpiresAt, undefined);
     assert.equal(prev.auth.token, OLD);
+  });
+  // FreeGG HAR: user/self grants +10,000,000 quota; the log itself has quota:0.
+  const allowanceRecord = (overrides = {}) => ({ type: 1, created_at: NOW,
+    content: "Daily allowance ＄20.000000", quota: 0,
+    other: JSON.stringify({ content_parts: [{ key: "Daily allowance {{quota}}",
+      params: { quota: "＄20.000000" } }] }), ...overrides });
+  function mockAllowance(items, { expired = false, logFailure = false, logThrows = false } = {}) {
+    mock();
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      const u = new URL(url);
+      if (u.pathname === "/api/log/self") {
+        calls.push({ path: u.pathname, ...init });
+        assert.equal(u.searchParams.get("type"), "1");
+        assert.equal(u.searchParams.get("page_size"), "100");
+        assert.ok(Number(u.searchParams.get("start_timestamp")) <= NOW);
+        assert.equal(new Headers(init.headers).get("Authorization"), `Bearer ${FRESH}`);
+        if (expired) assert.equal(new Headers(init.headers).get("Cookie"), ROTATED_COOKIE);
+        if (logThrows) throw new Error("log network failure");
+        return json({ success: !logFailure, data: { items } }, logFailure ? 503 : 200);
+      }
+      assert.notEqual(u.pathname, "/api/user/checkin", "FreeGG must never call manual check-in");
+      return baseFetch(url, init);
+    };
+    return { ...channel({ token: expired ? OLD : FRESH, cookie: COOKIE, authSession: SID }),
+      baseUrl: "https://freegg.app" };
+  }
+  for (const action of ["checkin", "status"]) {
+    await test(`FreeGG ${action}: self then today's allowance log confirms $20`, async () => {
+      const result = await adapter[action](mockAllowance([allowanceRecord()]));
+      assert.equal(result.ok, true);
+      assert.equal(result.status.checkedInToday, true);
+      assert.equal(result.status.manualCheckinEnabled, false);
+      assert.equal(result.status.todayReward, 10000000);
+      assert.match(result.message, /\$20\.00/);
+      assert.deepEqual(calls.map(c => c.path), ["/api/user/self", "/api/log/self"]);
+      if (action === "checkin") assert.equal(result.result.reward, 10000000);
+    });
+  }
+  await test("FreeGG expired token: refresh cookie preserved across self and log calls", async () => {
+    const result = await adapter.checkin(mockAllowance([allowanceRecord()], { expired: true }));
+    assert.equal(result.ok, true);
+    assert.equal(result.tokens.cookie, ROTATED_COOKIE);
+    assert.equal(result.tokens.token, FRESH);
+    assert.deepEqual(calls.map(c => c.path), ["/api/user/auth/refresh", "/api/user/self", "/api/log/self"]);
+  });
+  await test("FreeGG exact structured allowance key works with translated content", async () => {
+    const result = await adapter.checkin(mockAllowance([allowanceRecord({ content: "每日补贴" })]));
+    assert.equal(result.ok, true);
+    assert.equal(result.result.reward, 10000000);
+  });
+  await test("FreeGG reward is parsed, not hardcoded or taken from log quota", async () => {
+    const result = await adapter.checkin(mockAllowance([allowanceRecord({
+      content: "Daily allowance $3.500000", other: "malformed", quota: 0,
+    })]));
+    assert.equal(result.ok, true);
+    assert.equal(result.result.reward, 1750000);
+    assert.match(result.message, /\$3\.50/);
+  });
+  for (const [label, items, options] of [
+    ["empty logs", [], {}],
+    ["yesterday's grant", [allowanceRecord({ created_at: NOW - 86400 })], {}],
+    ["future grant", [allowanceRecord({ created_at: NOW + 86400 })], {}],
+    ["consumption not grant", [allowanceRecord({ type: 2 })], {}],
+    ["unrelated topup", [allowanceRecord({ content: "充值 $20", other: "{}" })], {}],
+    ["logs rejected", [allowanceRecord()], { logFailure: true }],
+    ["logs unreachable", [], { logThrows: true }],
+  ]) {
+    await test(`FreeGG ${label}: never report a successful reward without evidence`, async () => {
+      const result = await adapter.checkin(mockAllowance(items, options));
+      assert.equal(result.ok, false);
+      assert.equal(result.status.checkedInToday, null);
+      assert.equal(result.result.reward, null);
+      assert.match(result.message, /无法确认补贴到账/);
+    });
+  }
+  await test("only exact FreeGG hostname uses allowance flow; other sites remain unchanged", async () => {
+    mock();
+    const result = await adapter.checkin({ ...channel({ token: FRESH }), baseUrl: "https://freegg.app.example.test" });
+    assert.equal(result.ok, true);
+    assert.equal(checkedIn, true);
+    assert.equal(calls.some(c => c.path === "/api/log/self"), false);
   });
   console.log("New API regression: all checks passed");
 } finally {

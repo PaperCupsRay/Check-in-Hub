@@ -142,6 +142,14 @@ cp .dev.vars.example .dev.vars
   当前 HAR 的 Cookie / Authorization 请求头已被省略，**不能据此认为请求不需要认证**；
   响应虽含短期令牌，也不能还原用于长期续期的登录 Cookie。
   回归：`npm run test:newapi`（覆盖 Cookie 续期、令牌直用、回写与旧站兼容）。
+- **FreeGG（freegg.app，每日补贴）**：HAR 显示 `checkin_enabled:false`，但访问
+  `GET /api/user/self` 后余额增加，且当天日志写入 `Daily allowance ＄20.000000`。
+  因此仍选 `newapi` 类型，Base URL 填 `https://freegg.app`，项目会自动使用
+  **用户信息查询 → 当日补贴日志确认**，不会调用标准 `/api/user/checkin`。
+  金额从真实日志读取，不固定为 $20；没找到当天记录时不会误报“签到成功”。
+  认证仍用上面的 Cookie 续期体系：需要 FreeGG 当前有效的 `new_api_refresh`，
+  不能混用听风 Cookie。若已填 Cookie 仍刷新 401，应从当前已登录的 FreeGG
+  重新复制整站 Cookie，并清空旧会话 ID 后重试；自动补贴机制不同并不会绕过认证。
 
 **AgentRouter**
 
