@@ -1786,6 +1786,12 @@
         console.log(ch.name, action, data);
         return data;
       } catch (e) {
+        // A business request can fail after refresh rotated the credentials.
+        // Preserve that bundle even when api() throws for a non-2xx response.
+        if (e.data?.tokens) {
+          ch = mergeTokens(ch, e.data.tokens);
+          channels[idx] = ch;
+        }
         const detail = e.data ? buildSummary(action, e.data) : (e.message || String(e));
         const msg = detail || e.message || String(e);
         channels[idx].lastResult = {

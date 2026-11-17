@@ -109,12 +109,48 @@ try {
     mock({ rejectRefresh: true });
     const result = await adapter.checkin(channel({ token: OLD, cookie: COOKIE, authSession: SID }));
     assert.equal(result.ok, false);
-    assert.match(result.message, /刷新会话失败：Unauthorized/);
+    assert.match(result.message, /刷新会话失败：AUTH_UNAUTHORIZED/);
     assert.match(result.message, /已发送渠道保存的 Cookie/);
     assert.doesNotMatch(result.message, /缺少完整登录 Cookie/);
     assert.equal(calls.length, 1);
     assert.equal(checkedIn, false);
   });
+  await test("stale SID: bootstrap once with Cookie and persist the new session bundle", async () => {
+    mock();
+    const base = globalThis.fetch;
+    let conflicts = 0;
+    globalThis.fetch = async (url, init) => {
+      const h = new Headers(init.headers);
+      if (new URL(url).pathname === "/api/user/auth/refresh" && h.get("X-Auth-Session")) {
+        conflicts++;
+        assert.equal(h.get("Cookie"), COOKIE);
+        assert.equal(h.get("Authorization"), null);
+        return json({ success: false, code: "AUTH_SESSION_MISMATCH", message: "Conflict" }, 409);
+      }
+      return base(url, init);
+    };
+    const result = await adapter.me(channel({ cookie: COOKIE, token: OLD, authSession: "old-session", auth_session: "old-alias" }));
+    assert.equal(conflicts, 1);
+    assert.equal(result.ok, true);
+    assert.equal(result.tokens.authSession, SID);
+    assert.equal(result.tokens.cookie, ROTATED_COOKIE);
+    assert.equal(result.tokens.token, FRESH);
+    assert.equal(headersFor("/api/user/auth/refresh")[0].get("X-Auth-Session"), null);
+  });
+  for (const code of ["AUTH_SESSION_MISMATCH", "OTHER_CONFLICT"]) {
+    await test(`${code}: bounded retry, no business request on failure`, async () => {
+      let attempts = 0;
+      globalThis.fetch = async (url) => {
+        assert.equal(new URL(url).pathname, "/api/user/auth/refresh");
+        attempts++;
+        return json({ success: false, code }, 409);
+      };
+      const result = await adapter.me(channel({ cookie: COOKIE, token: OLD, authSession: SID }));
+      assert.equal(result.ok, false);
+      assert.equal(attempts, code === "AUTH_SESSION_MISMATCH" ? 2 : 1);
+      assert.match(result.message, new RegExp(code));
+    });
+  }
   await test("near-expiry token remains usable after failed refresh", async () => {
     mock({ rejectRefresh: true });
     const near = token(NOW + 45);

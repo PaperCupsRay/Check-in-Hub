@@ -8,15 +8,11 @@
  * Auth differs by upstream version, and this is the usual cause of failures:
  *  - v0.9.x and earlier: session Cookie, with `New-Api-User: <id>` required
  *    alongside it. `Authorization` was only a fallback when no session existed.
- *  - v1.0.x: the session branch was removed from middleware/auth.go. Dashboard
- *    requests are authenticated *only* via the `Authorization` header, so a
- *    pasted Cookie can never authenticate. Users generate the value at
- *    个人设置 → 生成访问令牌 (server route GET /api/user/token).
- *
- * The two v1.0 rejection messages distinguish the failure precisely:
- *   "未提供 access token" → no credential was read at all (a Cookie lands here)
- *   "access token 无效"   → Authorization was read but did not validate
- * Both arrive as application JSON, not as a Cloudflare challenge page.
+ *  - Modern dashboard auth (e.g. FreeGG rc.49): short-lived access JWTs,
+ *    renewed with POST /api/user/auth/refresh using the refresh Cookie.
+ *    The optional X-Auth-Session header checks identity; it is not a credential.
+ *    These versions need not expose the legacy GET /api/user/token UI.
+ *    Model API keys are separate from dashboard authentication.
  *
  * Login (optional): POST /api/user/login { username, password }
  * Self: GET /api/user/self
@@ -337,9 +333,9 @@ function looksLikeHtmlChallenge(data, status) {
 }
 
 /**
- * 站点把签到挂在 Turnstile 后面时（/api/status 的 turnstile_check 为 true），
- * 不带 token 的 POST 会被业务层拒掉，返回 HTTP 200 + success:false +
- * message:"Turnstile token 为空"。
+ * 全局 turnstile_check 可能只保护登录/注册，不能据此判断签到需要验证。
+ * 只有不带 token 的签到 POST 被业务层明确拒绝（例如 HTTP 200 +
+ * success:false + message:"Turnstile token 为空"）后才进入验证码流程。
  *
  * 注意这不是凭证问题，也不代表站点「打开网页就自动签到」：站点前端本身就是
  * 先不带 token POST 一次，拿到含 "Turnstile" 的报错后才弹出人机校验框、带
@@ -348,8 +344,11 @@ function looksLikeHtmlChallenge(data, status) {
  */
 function turnstileRejected(data) {
   const raw = responseTextHint(data);
-  if (!/turnstile/i.test(raw)) return false;
-  return !/<!doctype html|<html[\s>]/i.test(raw);
+  if (/<!doctype html|<html[\s>]/i.test(raw)) return false;
+  const message = typeof data === "string" ? data :
+    [data?.message, data?.msg, data?.error, data?.code, data?.data?.message]
+      .filter(value => typeof value === "string").join(" ");
+  return /turnstile/i.test(message);
 }
 
 /**
@@ -479,7 +478,7 @@ function httpErrorMessage(action, res) {
   if (turnstileRejected(data)) {
     return (
       `${serverMsg || "Turnstile 校验未通过"} · 该站已开启签到人机校验` +
-      `（/api/status 的 turnstile_check=true），凭证本身有效，但纯 HTTP 通道产不出 token。` +
+      `（签到接口实际要求 Turnstile；全局 turnstile_check 不能作为签到判据），纯 HTTP 通道产不出 token。` +
       `站点前端是「先试签到→被拒→才弹验证框」的惰性挂载，所以页面上平时看不到组件，` +
       `看不到 ≠ 服务端不校验。注意 gha_browser 通道也未必能解：Cloudflare 对 GitHub ` +
       `Actions 的机房 IP 常静默不签发挑战（组件能渲染但永远等不到 token），` +
@@ -640,9 +639,9 @@ export const newapiAdapter = {
     },
     {
       key: "auth.token",
-      label: "访问令牌（可选替代方案；站点「个人设置 → 生成访问令牌」）",
+      label: "访问令牌（旧版可手动生成；新版短效，由 Cookie 自动续期）",
       type: "password",
-      placeholder: "粘贴访问令牌，无需自己加 Bearer 前缀",
+      placeholder: "新版可留空并填写刷新 Cookie；不要填模型 API Key",
     },
     { key: "auth.username", label: "用户名（账密站）", placeholder: "username" },
     { key: "auth.password", label: "密码（账密站）", type: "password" },
@@ -658,7 +657,7 @@ export const newapiAdapter = {
     },
     {
       key: "auth.turnstileToken",
-      label: "Turnstile Token（仅当站点 /api/status 的 turnstile_checkin 为 true 时需要）",
+      label: "Turnstile Token（仅当签到接口明确要求验证时使用）",
       type: "password",
     },
     { key: "options.timezone", label: "时区（用于月份）", placeholder: "Asia/Shanghai" },
@@ -842,34 +841,40 @@ export const newapiAdapter = {
     if (!auth.cookie) {
       return { ok: false, message: `无法刷新会话：缺少完整登录 Cookie。${MODERN_CREDENTIAL_GUIDE}` };
     }
-    const res = await this.request(channel, "/api/user/auth/refresh", {
+    let res = await this.request(channel, "/api/user/auth/refresh", {
       method: "POST",
       body: undefined,
       token: null,
     });
+    // A manually replaced Cookie can belong to a different login session.
+    // Only this explicit conflict permits one bootstrap without the stale SID.
+    const resetSession = res.status === 409 && res.data?.code === "AUTH_SESSION_MISMATCH" && !!auth.authSession;
+    if (resetSession) {
+      res = await this.request({ ...channel, auth: { ...channel.auth, authSession: "", auth_session: "" } },
+        "/api/user/auth/refresh", { method: "POST", token: null });
+    }
     const data = res.data || {};
     const d = data.data || {};
     if (!res.ok || data.success !== true || !d.access_token) {
       return {
         ok: false,
         httpStatus: res.status,
-        message: `刷新会话失败：${data.message || data.code || `HTTP ${res.status}`}。` +
+        message: `刷新会话失败：${data.code || data.message || `HTTP ${res.status}`}。` +
           (res.status === 401
-            ? "已发送渠道保存的 Cookie，但目标站不接受该登录会话；可能已失效或被撤销，" +
-              "也可能与会话 ID 不匹配。请从当前已登录的同一站点重新复制完整 Cookie，" +
-              "并清空旧会话 ID（可选校验项）后重试。"
+            ? "已发送渠道保存的 Cookie，但目标站不接受该登录会话；可能已失效或被撤销。" +
+              "请从当前已登录的同一站点更新刷新 Cookie；无需寻找访问令牌生成入口。"
             : MODERN_CREDENTIAL_GUIDE),
         raw: data,
       };
     }
     const user = d.user ? normalizeUser({ data: d.user }) : null;
-    const sid = d.session?.sid || auth.authSession || "";
+    const sid = d.session?.sid || (resetSession ? "" : auth.authSession) || "";
     const cookie = mergeCookie(auth.cookie, res.setCookies || []);
     const tokens = {
       accessToken: d.access_token,
       token: d.access_token,
       ...(d.access_expires_at ? { accessExpiresAt: d.access_expires_at } : {}),
-      ...(sid ? { authSession: sid } : {}),
+      authSession: sid,
       ...(user?.id || auth.userId ? { userId: user?.id || auth.userId } : {}),
       cookie,
     };
@@ -1154,23 +1159,31 @@ export const newapiAdapter = {
       /* continue to POST */
     }
 
-    // 2) Actual check-in POST
+    // 2) Try the real check-in without captcha first, even if global status says true.
+    // A configured token may be stale; only send it after the endpoint requests it.
     const turnstile =
       auth.turnstileToken || channel.options?.turnstileToken || channel.auth?.turnstileToken || "";
-    const path = turnstile
-      ? `/api/user/checkin?turnstile=${encodeURIComponent(turnstile)}`
-      : "/api/user/checkin";
-    const res = await this.request(channel, path, {
-      method: "POST",
-      body: {},
-      cookie,
+    let res = await this.request(channel, "/api/user/checkin", {
+      method: "POST", body: {}, cookie,
     });
     if (res.setCookies?.length) {
       cookie = mergeCookie(cookie, res.setCookies);
       tokens = { ...(tokens || {}), cookie };
     }
-    const data = res.data || {};
-    const normalized = normalizeCheckin(data);
+    let data = res.data || {};
+    let normalized = normalizeCheckin(data);
+    if (turnstile && !normalized.alreadyCheckedIn &&
+        (res.status >= 400 || data.success === false) && turnstileRejected(data)) {
+      res = await this.request(channel, `/api/user/checkin?turnstile=${encodeURIComponent(turnstile)}`, {
+        method: "POST", body: {}, cookie,
+      });
+      if (res.setCookies?.length) {
+        cookie = mergeCookie(cookie, res.setCookies);
+        tokens = { ...(tokens || {}), cookie };
+      }
+      data = res.data || {};
+      normalized = normalizeCheckin(data);
+    }
 
     // POST blocked by CF, but we already know not checked in / or status unknown
     if (res.status === 403 || looksLikeHtmlChallenge(data, res.status)) {
@@ -1212,7 +1225,7 @@ export const newapiAdapter = {
         // reCAPTCHA v2 / 图片验证码换出口都无解：纯 HTTP 通道无论从 Worker 还是
         // GHA 发出都产不出答案，标 needsBrowser 让 src/index.js 直接分发到
         // gha_browser，省掉一次注定失败的 gha_api 运行。
-        ...(recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
+        ...(turnstileRejected(data) || recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
           ? { needsBrowser: true }
           : {}),
         result: normalized,
@@ -1227,7 +1240,7 @@ export const newapiAdapter = {
         ok: false,
         httpStatus: res.status,
         message: httpErrorMessage("签到", res),
-        ...(recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
+        ...(turnstileRejected(data) || recaptchaRejected(data) || captchaRejected(data) || humanVerificationRejected(data)
           ? { needsBrowser: true }
           : {}),
         result: normalized,

@@ -359,6 +359,11 @@ await scenario(
   }
 );
 
+// 与适配器 currentDate("Asia/Shanghai") 同口径：mock 的记录日期必须落在「今天」，
+// 否则 todayReward 按日期找不到记录，这条测试只会在硬编码日期那天通过
+const todayCST = () =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+
 // 9d) 状态查询说今天已签 → 必须直接成功返回，不再 POST（该站签到 POST 会消耗验证码，
 //     而且「今日已签到」在答对时也会出现，重复 POST 只会把预算烧在 OCR 上）
 await scenario(
@@ -375,7 +380,7 @@ await scenario(
             stats: {
               checked_in_today: true,
               checkin_count: 4,
-              records: [{ checkin_date: "2026-10-15", quota_awarded: 5000000 }],
+              records: [{ checkin_date: todayCST(), quota_awarded: 5000000 }],
             },
           },
         }),

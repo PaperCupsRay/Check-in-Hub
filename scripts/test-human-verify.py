@@ -243,7 +243,7 @@ ok(
 )
 
 print("\n[11] 探针兜底：空 token 被拒且点名「人机验证」时改走多厂商自挂")
-i_probe = SOURCE.find("if human_verification_missing(pb):")
+i_probe = SOURCE.find("if human_verification_missing(pb)")
 i_unrelated = SOURCE.find("与 Turnstile 无关的失败")
 ok(i_probe > 0, "存在该兜底分支")
 ok(

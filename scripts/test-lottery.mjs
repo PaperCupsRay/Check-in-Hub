@@ -483,7 +483,8 @@ try {
     // 浏览器通道不走适配器（它是 Playwright 里自己发页内 fetch），所以那段 JS 单独钉一遍：
     // 从 Python 源码里把 JSFUNC_SUB2API_LOTTERY 抠出来，在 Node 里用 mock fetch 跑。
     const py = fs.readFileSync(new URL("../scripts/browser-checkin.py", import.meta.url), "utf8");
-    const m = /JSFUNC_SUB2API_LOTTERY = """\n([\s\S]*?)\n"""/.exec(py);
+    // \r? 兼容 Windows 检出（core.autocrlf 会把 LF 转成 CRLF）
+    const m = /JSFUNC_SUB2API_LOTTERY = """\r?\n([\s\S]*?)\r?\n"""/.exec(py);
     ok(!!m, "能从 browser-checkin.py 里抠出页内抽奖 JS");
     const lotteryInPage = new Function(`return (${m[1]});`)();
     ok(typeof lotteryInPage === "function", "抠出来的是可调用的 async 函数");

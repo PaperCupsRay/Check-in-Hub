@@ -6,15 +6,11 @@
   2. 对每个渠道：
      - CloakBrowser (xvfb 有头模式) 打开站点首页
      - 注入渠道 cookie（session 等）
-     - 挂载 Cloudflare Turnstile 组件（sitekey 取渠道 options.turnstileSiteKey，
-       缺省用 gorouter 的内置 key），拟人点击 checkbox，轮询拿 token（最长 45s）
-     - 在页面内 fetch /api/user/checkin?turnstile=<token> 完成签到
-       （请求从浏览器发出，TLS/IP/cookie 三者天然一致）
-    - 自挂组件拿不到 token 时，照站点自身流程把人的动作重放一遍：
-      ① 空 token POST 一次（站点前端就是这么开头的）；② 点站点自己的签到按钮，
-      让它前端去挂它自己的 widget；③ 从那个 widget 收 token 重发。
-      站点对空 token 的回话固定是「Turnstile token 为空」，那是**对空 token 的话术**，
-      不是「我们的 token 无效」；页面上平时看不到组件，因为它是这段流程里才惰性挂的。
+     - 先不带验证码 token 请求签到；成功或已签到即结束
+     - 只有签到接口明确要求验证时，才挂载对应验证码组件并重试
+       （全局 turnstile_check 可能仅保护登录，不能作为签到判据）
+     - 自挂组件拿不到 token 时，点站点自己的签到按钮，
+       让它前端挂原生 widget，再从那个 widget 收 token 重发。
     - 每次「POST 说不清」都再用 GET /api/user/checkin?month= 查一次权威状态：
       token 是一次性的，站点前端可能已经抢先用掉并领了奖励，光看 POST 回话会误报失败
      - 页面内 fetch /api/user/self 取余额
@@ -3196,7 +3192,7 @@ async def recaptcha_site_ui_checkin(page, name, base, token, tz="Asia/Shanghai")
 
 
 async def checkin_one(channel, proxy=None) -> dict:
-    """单渠道：开浏览器 → Turnstile token → 页面内 fetch 签到。
+    """单渠道：开浏览器 → 先直签 → 按接口要求取验证码再重试。
 
     站点的两段式流程（gorouter / SeekAi 这类 NewAPI 变体）：前端**先不带 token POST
     一次 /api/user/checkin**，被拒（典型回话就是「Turnstile token 为空」）之后才惰性
@@ -3264,6 +3260,51 @@ async def checkin_one(channel, proxy=None) -> dict:
             )
 
         await seed_localstorage_auth(page, token, user_id)
+        # First try the endpoint itself, before reading captcha flags or mounting widgets.
+        # Login-only turnstile_check (e.g. Future) must not force a check-in challenge.
+        done = await confirm_checked_in(page, token, name, tz)
+        if done:
+            await attach_quota(page, done, token)
+            return done
+        log(f"  🧪 {name}: 先不带验证码 token 直签 ...")
+        pre = await inpage_checkin(page, token, None)
+        pb = pre.get("body") if isinstance(pre.get("body"), dict) else {}
+        pmsg = str(pb.get("message") or pb.get("code") or "")[:120]
+        if checkin_ok(pb, pre.get("status")):
+            res = {"name": name, "ok": True,
+                   "message": checkin_message(True, pb, pre.get("status"))}
+            await attach_quota(page, res, token)
+            return res
+        log(f"  🧪 {name}: 直签被拒（HTTP {pre.get('status')}：{pmsg or str(pb)[:100]}）")
+        if (re.search(r"recaptcha|g-recaptcha", pmsg, re.I) or
+                (human_verification_missing(pb) == "empty" and
+                 (channel.get("options") or {}).get("recaptchaSiteKey"))):
+            return await recaptcha_site_ui_checkin(page, name, base, token, tz)
+        if human_verification_missing(pb) and not re.search(r"turnstile", pmsg, re.I):
+            log(f"  🧩 {name}: 签到接口要求人机验证（{pmsg}），走多厂商自挂组件")
+            res = await selfmounted_captcha_checkin(page, name, base, token, tz, f"直签回话：{pmsg}")
+            if res.get("ok"):
+                await attach_quota(page, res, token)
+            return res
+        if (not re.search(r"turnstile|hcaptcha", pmsg, re.I) and
+                (channel.get("options") or {}).get("captchaCheckin") is not False and
+                (re.search(r"验证码", pmsg) or CAPTCHA_NEEDS_SESSION_RE.search(pmsg)
+                 or CAPTCHA_WRONG_RE.search(pmsg) or CAPTCHA_EXPIRED_RE.search(pmsg))):
+            res = await captcha_checkin(page, name, base, token, tz, channel)
+            if res.get("ok"):
+                await attach_quota(page, res, token)
+            return res
+        if not re.search(r"turnstile|hcaptcha|人机验证|人机校验", pmsg, re.I):
+            # 与 Turnstile 无关的失败：认证/限流/网络失败不通过挂组件解决。
+            done = await confirm_checked_in(page, token, name, tz)
+            if done:
+                await attach_quota(page, done, token)
+                return done
+            code = pre.get("status")
+            return {"name": name, "ok": False,
+                    "retryable": code in (403, 429) or (isinstance(code, int) and code >= 500),
+                    "message": f"空 token 直签 HTTP {code}：{checkin_message(False, pb, code)}"[:300]}
+        # A captcha refusal, not /api/status, is the gate to all captcha paths below.
         # 图片验证码闸门（jianzhile.vip 这类 NewAPI 定制站）必须排在 Turnstile 前面：
         # 它们的 /api/status 里 turnstile_check 是 false，下面那套自挂组件 + 空 token
         # 探针在它们身上只会白等 45s，最后把「请打开网站后再签到」当成不可重试的失败。
@@ -3283,9 +3324,8 @@ async def checkin_one(channel, proxy=None) -> dict:
                 return res
 
 
-        # 站点在 /api/status 里显式声明了签到需要哪几家人机验证时，直接走「多厂商自挂」。
-        # 这条路比驱动站点 UI 确定：站点页面可能崩在 ErrorBoundary 上（按钮压根不渲染），
-        # 而签到接口本身是好的，只差 token。
+        # 直签明确要求验证码后，才按签到专用开关选择需要的厂商。
+        # 这条路比驱动站点 UI 确定：页面可能崩溃，而接口本身是好的，只差 token。
         # 2026-10-15 星见雅实测 checkin_turnstile_check 与 checkin_hcaptcha_check 同时为真，
         # 服务端要求两个 token 都非空 —— 必须一次把两家都拿到（见 selfmounted_captcha_checkin）。
         # 例外：声明了 reCAPTCHA 时仍走站点 UI 驱动，因为 reCAPTCHA v2 的 token 与渲染它的
@@ -3427,77 +3467,8 @@ async def checkin_one(channel, proxy=None) -> dict:
         log(f"  ⏳ {name}: 等待 Turnstile token（拟人点击，最长 {TOKEN_WAIT_S}s）...")
         ts_token, ts_src = await wait_any_token(page, TOKEN_WAIT_S)
         if not ts_token:
-            # 站点两段式流程的第一段：先不带 token POST 一次。这就是站点前端自己干的事
-            # （见 checkin_one 文档字符串与 src/adapters/newapi.js 的 turnstileRejected）。
-            # 一枪两用：① 站点若其实没强制 Turnstile，这一枪就是真签到；
-            #          ② gorouter 这类站的前端正是**被这一枪拒掉之后**才惰性挂载 widget，
-            #             所以自挂组件不出 token 时，可以借它这一挂拿站点自己的原生 token。
-            log(f"  🧪 {name}: 自挂组件未出 token，按站点自身流程先空 token POST 一次 ...")
-            pre = await inpage_checkin(page, token, None)
-            pb = pre.get("body") if isinstance(pre.get("body"), dict) else {}
-            pmsg = str(pb.get("message") or "")[:120]
-            if checkin_ok(pb, pre.get("status")):
-                # 站点其实没强制 Turnstile：这一枪就是真签到
-                res = {
-                    "name": name,
-                    "ok": True,
-                    "message": checkin_message(True, pb, pre.get("status")),
-                }
-                await attach_quota(page, res, token)
-                return res
-            log(f"  🧪 {name}: 空 token POST 被拒（{pmsg or str(pb)[:100]}）")
-            # 兜底：前面的 detect_recaptcha 没认出这个站（首页无组件、/api/status 也没
-            # 挂 key），但空 token POST 的回话点名了 recaptcha —— 仍然按 reCAPTCHA 站
-            # 处理。不加这句的话它会掉进下面「与 Turnstile 无关」的分支被判成不可重试，
-            # 当天直接漏签。
-            if re.search(r"recaptcha|g-recaptcha", pmsg + str(pb)[:200], re.I):
-                log(f"  🧩 {name}: 探针回话点名 reCAPTCHA，改走站点 UI 驱动")
-                return await recaptcha_site_ui_checkin(page, name, base, token, tz)
-            # 兜底：空 token POST 的回话点名「人机验证 token 为空 / 校验失败」时，按
-            # **多厂商自挂**处理。这条要排在下面「与 Turnstile 无关」的分支之前，否则
-            # 会被判成不可重试、当天直接漏签。
-            # 2026-10-15 星见雅实测：它同时要 Turnstile 与 hCaptcha，缺任一只回
-            # 「人机验证 token 为空」；这句不含「Turnstile」字样，靠下面的正则匹配不到。
-            if human_verification_missing(pb):
-                log(f"  🧩 {name}: 探针回话点名人机验证（{pmsg}），改走多厂商自挂组件")
-                res = await selfmounted_captcha_checkin(
-                    page, name, base, token, tz, f"探针回话：{pmsg}", site_st
-                )
-                if res.get("ok"):
-                    await attach_quota(page, res, token)
-                return res
-
-            # 兜底：状态查询没看出 captcha_enabled（例如渠道缺 session，状态接口直接
-            # 401），但空 token POST 的回话点名了验证码 —— 仍然按图片验证码站处理。
-            # 「请打开网站后再签到」也要认：它就是本站缺会话时签到接口的固定话术，
-            # 而它不含「验证码」二字，不显式匹配就会掉进下面「与 Turnstile 无关」的
-            # 分支被判成不可重试，当天直接漏签。
-            if (
-                re.search(r"验证码", pmsg)
-                or CAPTCHA_NEEDS_SESSION_RE.search(pmsg)
-                or CAPTCHA_WRONG_RE.search(pmsg)
-                or CAPTCHA_EXPIRED_RE.search(pmsg)
-            ):
-                log(f"  🔐 {name}: 探针回话点名图片验证码，改走验证码通道")
-                res = await captcha_checkin(page, name, base, token, tz, channel)
-                if res.get("ok"):
-                    await attach_quota(page, res, token)
-                return res
-
-            if not re.search(r"turnstile|challenge|人机|校验|验证", pmsg + str(pb)[:200], re.I):
-                # 与 Turnstile 无关的失败：站点不会因此挂 widget，别再白等几十秒。
-                # 也显式标不可重试 —— 额度/凭证/风控类拒绝换出口没用，而每次尝试要烧
-                # 45s+，重试三次会把 JOB_BUDGET_S 吃光（尾部渠道当天直接漏签）。
-                # 文案仍写明「未取到 Turnstile token」，人读日志时知道卡在哪一步。
-                return {
-                    "name": name,
-                    "ok": False,
-                    "retryable": False,
-                    "message": (
-                        f"未取到 Turnstile token（自挂组件 {TOKEN_WAIT_S}s 无）；"
-                        f"空 token 直签 HTTP {pre.get('status')}：{pmsg or str(pb)[:100]}"
-                    )[:300],
-                }
+            # The empty-token POST was already sent before mounting. Do not repeat it.
+            # Reuse that refusal while falling back to the site's native widget.
             # 先问一次权威状态再去折腾 widget：站点可能今天早就签过了（那它不会再挂
             # widget、按钮文案也变成「已签到」），光等 40s 只会白等并报一条假失败。
             done = await confirm_checked_in(page, token, name, tz)
