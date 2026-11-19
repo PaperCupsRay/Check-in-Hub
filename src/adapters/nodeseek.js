@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * NodeSeek（https://www.nodeseek.com）签到适配器
  *
@@ -60,7 +61,7 @@ function headers(channel, cookie) {
 }
 
 async function request(channel, path, cookie) {
-  const res = await fetch(joinUrl(channel.baseUrl, path), {
+  const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
     method: path.includes("board") ? "GET" : "POST",
     headers: headers(channel, cookie),
     redirect: "manual",

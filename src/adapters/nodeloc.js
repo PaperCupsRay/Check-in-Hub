@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * NodeLoc（https://www.nodeloc.com）签到适配器
  *
@@ -173,7 +174,7 @@ export const nodelocAdapter = {
       // 会校验它们与 body 里的 nonce 是否一致。
       Object.assign(headers, extra);
     }
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method,
       headers,
       body: body == null ? undefined : new URLSearchParams(body).toString(),

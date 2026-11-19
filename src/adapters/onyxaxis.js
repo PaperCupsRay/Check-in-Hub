@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * Obsidian Arc（Axis AI）签到适配器
  *
@@ -292,7 +293,7 @@ export const onyxaxisAdapter = {
     const headers = baseHeaders(channel, cookie);
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (extra) Object.assign(headers, extra);
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

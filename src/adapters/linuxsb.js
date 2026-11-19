@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * linux.sb（烧饼社区，https://linux.sb）适配器：自动签到 + 抽称号
  *
@@ -77,7 +78,7 @@ function pageHeaders(channel, cookie, { method = "GET", referer, contentType } =
 }
 
 async function getPage(channel, path, cookie) {
-  const res = await fetch(joinUrl(channel.baseUrl, path), {
+  const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
     method: "GET",
     headers: pageHeaders(channel, cookie),
     redirect: "manual",
@@ -269,7 +270,7 @@ export const linuxsbAdapter = {
     }
 
     const origin = String(channel.baseUrl || "").replace(/\/+$/, "");
-    const post = await fetch(joinUrl(channel.baseUrl, FREE_PULL_PATH), {
+    const post = await channelFetch(channel, joinUrl(channel.baseUrl, FREE_PULL_PATH), {
       method: "POST",
       headers: pageHeaders(channel, cur, {
         method: "POST",
@@ -300,7 +301,7 @@ export const linuxsbAdapter = {
     const location = postRes.location || "";
     if (postRes.status >= 300 && postRes.status < 400 && location) {
       const resultUrl = location.startsWith("http") ? location : joinUrl(channel.baseUrl, location);
-      const page = await fetch(resultUrl, {
+      const page = await channelFetch(channel, resultUrl, {
         method: "GET",
         headers: pageHeaders(channel, cur, { referer: `${origin}/gacha` }),
         redirect: "manual",

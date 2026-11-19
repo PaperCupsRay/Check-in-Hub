@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * New API (one-api fork) check-in adapter
  * Observed from:
@@ -669,7 +670,7 @@ export const newapiAdapter = {
     if (path === "/api/user/auth/refresh" && pickAuth(channel).authSession) {
       headers["X-Auth-Session"] = pickAuth(channel).authSession;
     }
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method, headers,
       body: body == null ? undefined : JSON.stringify(body),
       redirect: "manual",

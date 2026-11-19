@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * AgentRouter adapter (NewAPI family, special-cased)
  *
@@ -230,7 +231,7 @@ export const agentrouterAdapter = {
   ],
 
   async request(channel, path, { method = "GET", body, cookie } = {}) {
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method,
       headers: authHeaders(channel, cookie),
       body: body == null ? undefined : JSON.stringify(body),

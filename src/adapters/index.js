@@ -1,3 +1,4 @@
+import { requireChannelTransport } from "../channel-transport.js";
 import { runCheckinWithRetry } from "../checkin-retry.js";
 import { sub2apiAdapter } from "./sub2api.js";
 import { newapiAdapter } from "./newapi.js";
@@ -26,6 +27,10 @@ export function listAdapters() {
     name: a.name,
     description: a.description,
     fields: [...a.fields, {
+      key: "options.proxyUrl", type: "password",
+      label: "固定代理（所有渠道通用；填写后强制 Actions 执行，失败不直连、不轮换）",
+      placeholder: "http(s)://user:pass@host:port 或 socks5://user:pass@host:port",
+    }, {
       key: "options.retryCount", type: "number", min: 0, max: 5, step: 1,
       label: "失败重试次数（每执行通道 0–5，默认 2；含首次最多 3 次）",
       placeholder: "留空使用默认 2；0 表示不重试",
@@ -54,6 +59,7 @@ export function getAdapter(type) {
  */
 export async function runAction(type, action, channel, extra = {}) {
   const adapter = getAdapter(type);
+  requireChannelTransport(channel);
   if (typeof adapter[action] !== "function") {
     const err = new Error(`渠道 ${type} 不支持动作 ${action}`);
     err.status = 400;

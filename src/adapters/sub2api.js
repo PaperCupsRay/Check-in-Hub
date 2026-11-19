@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * Sub2API-style check-in adapter
  * Observed from:
@@ -512,7 +513,7 @@ export const sub2apiAdapter = {
   async request(channel, path, { method = "GET", body, token } = {}) {
     const headers = jsonHeaders();
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method,
       headers,
       body: body == null ? undefined : JSON.stringify(body),

@@ -1,3 +1,4 @@
+import { channelFetch } from "../channel-transport.js";
 /**
  * AnyRouter adapter (NewAPI / OneAPI family)
  *
@@ -343,7 +344,7 @@ export const anyrouterAdapter = {
   ],
 
   async request(channel, path, { method = "GET", body, cookie } = {}) {
-    const res = await fetch(joinUrl(channel.baseUrl, path), {
+    const res = await channelFetch(channel, joinUrl(channel.baseUrl, path), {
       method,
       headers: authHeaders(channel, cookie, { method }),
       body: body == null ? undefined : JSON.stringify(body),
