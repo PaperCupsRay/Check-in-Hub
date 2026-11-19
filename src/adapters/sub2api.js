@@ -1038,11 +1038,11 @@ export const sub2apiAdapter = {
       const normalized = normalizeCheckin(data);
       // success when code===0, or already checked in messages
       const ok =
-        res.status < 400 &&
-        (data.code === 0 ||
-          normalized.alreadyCheckedIn ||
-          normalized.success ||
-          data.success === true);
+        normalized.alreadyCheckedIn ||
+        (res.status < 400 &&
+          (data.code === 0 ||
+            normalized.success ||
+            data.success === true));
       if (!ok) {
         return {
           ok: false,

@@ -759,6 +759,17 @@ try {
     ok(calls.map((call) => call.u.pathname).join(",") === "/api/v1/check-in,/api/v1/redeem/checkin,/api/v1/user/checkin", "星驰按预期请求回退路径");
 
     calls = mockFetch({
+      "POST /api/v1/check-in": () => new Response("Not Found", { status: 404 }),
+      "POST /api/v1/redeem/checkin": () => new Response("Not Found", { status: 404 }),
+      "POST /api/v1/user/checkin": () => json(400, { code: 400, message: "already checked in today" }),
+    });
+    const alreadyCheckedIn = await runAction("sub2api", "checkin", ch());
+    ok(alreadyCheckedIn.ok === true, "HTTP 4xx 的已签到响应按成功处理", alreadyCheckedIn.message);
+    ok(alreadyCheckedIn.result.alreadyCheckedIn === true, "保留已签到标记");
+    ok(alreadyCheckedIn.attempts === 1, "已签到不重试、不降级", String(alreadyCheckedIn.attempts));
+    ok(calls.length === 3, "只探测三种明确的签到路径", String(calls.length));
+
+    calls = mockFetch({
       "POST /api/v1/check-in": () => json(500, { code: 500, message: "server error" }),
     });
     const serverFailure = await sub2apiAdapter.checkin(ch());
