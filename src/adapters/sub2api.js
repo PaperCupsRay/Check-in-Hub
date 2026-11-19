@@ -127,10 +127,10 @@ function checkinSummary({ alreadyCheckedIn, reward, balance, serverMsg, d }) {
 
 function normalizeCheckin(payload) {
   const d = payload?.data || payload || {};
-  const reward = d.reward_amount ?? d.reward ?? d.today_reward ?? d.quota_awarded ?? null;
+  const reward = d.reward_amount ?? d.reward ?? d.today_reward ?? d.quota_awarded ?? d.amount ?? null;
   const alreadyCheckedIn =
     !!d.already_checked_in || /already|已签到/i.test(String(payload?.message || ""));
-  const balance = d.balance_after ?? d.balance ?? null;
+  const balance = d.balance_after ?? d.new_balance ?? d.balance ?? null;
   const message = checkinSummary({
     alreadyCheckedIn,
     reward,
@@ -143,7 +143,7 @@ function normalizeCheckin(payload) {
       payload?.code === 0 ||
       payload?.success === true ||
       d.checked_in_today === true ||
-      !!d.reward_amount ||
+      !!(d.reward_amount ?? d.reward ?? d.today_reward ?? d.quota_awarded ?? d.amount) ||
       alreadyCheckedIn,
     message,
     reward,
@@ -1013,11 +1013,26 @@ export const sub2apiAdapter = {
       const body = {};
       if (channel.options?.sendTimezone !== false) body.timezone = timezoneOf(channel);
       if (auth.turnstileToken) body.turnstile_token = auth.turnstileToken;
-      const res = await this.request(channel, "/api/v1/check-in", {
+      let res = await this.request(channel, "/api/v1/check-in", {
         method: "POST",
         body,
         token,
       });
+      // Sub2API variants use the captured redeem/checkin and user/checkin routes.
+      if (res.status === 404) {
+        res = await this.request(channel, "/api/v1/redeem/checkin", {
+          method: "POST",
+          body,
+          token,
+        });
+      }
+      if (res.status === 404) {
+        res = await this.request(channel, "/api/v1/user/checkin", {
+          method: "POST",
+          body,
+          token,
+        });
+      }
       const data = res.data || {};
       const normalized = normalizeCheckin(data);
       // success when code===0, or already checked in messages

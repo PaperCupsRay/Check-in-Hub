@@ -734,6 +734,32 @@ try {
     info = await sub2apiAdapter.lotteryInfo(ch({ refreshToken: "r1" }));
     ok(info.ok === true, "token 过期 → 刷新后拿到状态", info.message);
     ok(info.result.maxDraws === 3, "刷新后次数正确", String(info.result.maxDraws));
+    calls = mockFetch({
+      "POST /api/v1/check-in": () => new Response("Not Found", { status: 404 }),
+      "POST /api/v1/redeem/checkin": () => json(200, { code: 0, message: "success", data: { reward: 1, checked_in: true } }),
+    });
+    const siteCheckin = await sub2apiAdapter.checkin(ch());
+    ok(siteCheckin.ok === true, "404 后回退至站点签到接口", siteCheckin.message);
+    ok(siteCheckin.result.reward === 1, "站点 reward 字段正常解析", String(siteCheckin.result.reward));
+    ok(calls.map((call) => call.u.pathname).join(",") === "/api/v1/check-in,/api/v1/redeem/checkin", "按预期顺序请求两条路径");
+
+    calls = mockFetch({
+      "POST /api/v1/check-in": () => new Response("Not Found", { status: 404 }),
+      "POST /api/v1/redeem/checkin": () => new Response("Not Found", { status: 404 }),
+      "POST /api/v1/user/checkin": () => json(200, { code: 0, message: "success", data: { amount: 2.5, new_balance: 18.75, status: "success" } }),
+    });
+    const xingchiCheckin = await sub2apiAdapter.checkin(ch());
+    ok(xingchiCheckin.ok === true, "两条旧路径 404 后兼容星驰签到接口", xingchiCheckin.message);
+    ok(xingchiCheckin.result.reward === 2.5, "星驰 amount 识别为签到奖励", String(xingchiCheckin.result.reward));
+    ok(xingchiCheckin.result.balance === 18.75, "星驰 new_balance 被正确解析", String(xingchiCheckin.result.balance));
+    ok(calls.map((call) => call.u.pathname).join(",") === "/api/v1/check-in,/api/v1/redeem/checkin,/api/v1/user/checkin", "星驰按预期请求回退路径");
+
+    calls = mockFetch({
+      "POST /api/v1/check-in": () => json(500, { code: 500, message: "server error" }),
+    });
+    const serverFailure = await sub2apiAdapter.checkin(ch());
+    ok(serverFailure.ok === false, "非 404 错误不回退", serverFailure.message);
+    ok(calls.length === 1, "非 404 失败只请求一次", String(calls.length));
   }
 } finally {
   globalThis.fetch = restoreFetch;
