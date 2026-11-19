@@ -5265,6 +5265,103 @@ def requested_names():
     return out or None
 
 
+DEFAULT_RETRY_COUNT = 2
+MAX_RETRY_COUNT = 5
+
+
+def retry_count(channel):
+    value = (channel.get("options") or {}).get("retryCount")
+    if value is None or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return DEFAULT_RETRY_COUNT
+    if isinstance(value, str) and not value.strip():
+        return DEFAULT_RETRY_COUNT
+    try:
+        number = float(value)
+        if number < 0 or number != int(number):
+            return DEFAULT_RETRY_COUNT
+        return min(int(number), MAX_RETRY_COUNT)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_RETRY_COUNT
+
+
+def browser_attempt_plan(channel, safe):
+    plan = [None] + list(safe)
+    limit = retry_count(channel) + 1
+    return (plan + [plan[-1]] * max(0, limit - len(plan)))[:limit]
+
+
+def browser_retryable(result):
+    if result.get("ok") or result.get("retryable") is False:
+        return False
+    message = str(result.get("message") or "")
+    if re.search(r"未登录|unauthorized|invalid (?:access |refresh )?token|凭证.*(?:失效|无效|过期)|密码.*(?:错误|不正确)|未配置|不支持", message, re.I):
+        return False
+    return result.get("retryable") is True or bool(RETRYABLE_VIA_PROXY.search(message))
+
+
+async def run_browser_channel(channel, safe, job_deadline, *, run=None, sleep=asyncio.sleep):
+    name = channel.get("name", "?")
+    active = {**channel, "auth": dict(channel.get("auth") or {})}
+    plan = browser_attempt_plan(channel, safe)
+    attempt_log = []
+    new_tokens = {}
+    r = None
+    for i, proxy in enumerate(plan):
+        remaining = job_deadline - time.monotonic()
+        if remaining <= 0:
+            log(f"  ⏹️ {name}: job 预算用尽，停止执行/重试")
+            break
+        via = "直连" if proxy is None else f"代理 {mask_proxy(proxy)}"
+        if i:
+            delay = 2 if i == 1 else 5 if i == 2 else 10
+            if remaining <= delay:
+                break
+            log(f"  🔁 {name}: {via}重试（第 {i}/{len(plan) - 1} 次）")
+            await sleep(delay)
+        remaining = job_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            if run:
+                coro = run(active, proxy)
+            elif active.get("type") == "sub2api":
+                coro = sub2api_login_checkin(active, proxy=proxy)
+            elif active.get("type") in FORUM_TYPES:
+                coro = forum_browser_checkin(active, proxy=proxy)
+            else:
+                coro = checkin_one(active, proxy=proxy)
+            r = await asyncio.wait_for(coro, timeout=min(CHANNEL_BUDGET_S, remaining))
+        except asyncio.TimeoutError:
+            r = {"name": name, "ok": False, "retryable": True,
+                 "message": f"{via}超时（单次/剩余 job 时间预算）"}
+        except Exception as e:  # noqa: BLE001
+            r = {"name": name, "ok": False, "retryable": True,
+                 "message": f"{via}异常: {str(e)[:120]}"}
+        if r.get("newTokens"):
+            new_tokens.update(r["newTokens"])
+            active["auth"].update(r["newTokens"])
+            if active.get("type") == "newapi" and r["newTokens"].get("accessToken"):
+                active["auth"]["token"] = r["newTokens"]["accessToken"]
+        attempt_log.append((via, bool(r.get("ok")), attempt_reason(r.get("message"))))
+        if r.get("ok"):
+            if i:
+                r["message"] = f"{r.get('message', '签到成功')}（第 {i + 1}/{len(plan)} 次尝试，经{via}）"[:700]
+            break
+        if not browser_retryable(r):
+            log(f"  ⏹️ {name}: 该失败不可重试，停止")
+            break
+    if r is None:
+        r = {"name": name, "ok": False, "message": "job 时间预算用尽，本次未执行", "retryable": False}
+    if not r.get("ok") and len(attempt_log) > 1:
+        tried = "；".join(f"{v} → {m}" for v, ok, m in attempt_log if not ok)
+        r["message"] = f"{r.get('message', '')} ｜ 各出口：{tried}"[:700]
+    if new_tokens:
+        r["newTokens"] = new_tokens
+    r["attempts"] = len(attempt_log)
+    r["maxAttempts"] = len(plan)
+    return r
+
+
 async def main():
     if not HUB:
         raise SystemExit("缺少 HUB_BASE_URL")
@@ -5358,7 +5455,6 @@ async def main():
     else:
         log("代理池为空，仅直连（Turnstile 站可能拿不到 token）")
 
-    attempts = [None] + safe
 
     results = []
     # 整个 job 的墙钟预算。超了就不再开新渠道，直接把已有结果回传 ——
@@ -5366,63 +5462,7 @@ async def main():
     # 面板上那个渠道会一直停在「已触发」，比拿到一条失败记录更难排查。
     job_deadline = time.monotonic() + JOB_BUDGET_S
     for ch in channels:
-        name = ch.get("name", "?")
-        r = None
-        if time.monotonic() > job_deadline:
-            log(f"  ⏭️ {name}: job 时间预算用尽，跳过（未执行）")
-            results.append({"name": name, "ok": False, "message": "job 时间预算用尽，本次未执行"})
-            continue
-        # 每次出口的结果都留一份：全部失败时拼进文案。没有它，面板上只能看到
-        # 「最后一次尝试」的失败原因，看不出到底试过哪些出口、各自卡在哪 ——
-        # 2026-10-15 星见雅多厂商那次就是这样，hCaptcha 报 network-error 但
-        # 无从判断是直连还是某个代理，只能靠猜。
-        attempt_log = []
-        for i, proxy in enumerate(attempts):
-            via = "直连" if proxy is None else f"代理 {mask_proxy(proxy)}"
-            if i:
-                if time.monotonic() > job_deadline:
-                    log(f"  ⏹️ {name}: job 预算用尽，停止重试")
-                    break
-                log(f"  🔁 {name}: 换 {via} 重试（第 {i} 次）")
-            try:
-                # 单次尝试也要有硬上限：里面每一步都各自有超时，但「每步都刚好不超时」
-                # 累加起来仍能拖很久（首次 GHA 跑就是这样撞上 30 分钟 job 上限被
-                # cancelled）。这里兜一层，超时就当失败换下一个出口。
-                ctype = ch.get("type")
-                if ctype == "sub2api":
-                    coro = sub2api_login_checkin(ch, proxy=proxy)
-                elif ctype in FORUM_TYPES:
-                    # 社区站（NodeSeek / linux.sb）：机制与 NewAPI 那套完全不同，
-                    # 各有自己的流程（见 forum_browser_checkin）
-                    coro = forum_browser_checkin(ch, proxy=proxy)
-                else:
-                    coro = checkin_one(ch, proxy=proxy)
-                r = await asyncio.wait_for(coro, timeout=CHANNEL_BUDGET_S)
-            except asyncio.TimeoutError:
-                r = {
-                    "name": name,
-                    "ok": False,
-                    "message": f"{via}超时（单次尝试超过 {CHANNEL_BUDGET_S}s 预算）",
-                }
-            except Exception as e:  # noqa: BLE001
-                r = {"name": name, "ok": False, "message": f"{via}异常: {str(e)[:120]}"}
-                if i:
-                    r["message"] = f"{r.get('message', '')}（经{via}）"
-                attempt_log.append((via, True, ""))
-                break
-            attempt_log.append((via, False, attempt_reason(r.get("message"))))
-            # 结果里显式标了不可重试的直接停：这类失败换出口也解决不了，而每次尝试要烧
-            # 45s+40s，重试三次足以把 JOB_BUDGET_S 吃光，尾部渠道当天就漏签了。
-            if r.get("retryable") is False:
-                log(f"  ⏹️ {name}: 该失败换出口无效，不再重试")
-                break
-            # 只有「拿不到 token / 网络层失败」才值得换出口；凭证类错误换 IP 也白搭
-            if not RETRYABLE_VIA_PROXY.search(str(r.get("message", ""))):
-                break
-        # 试过多个出口且最终失败时，把每个出口的结果并列出来（面板只看得到最后一条）
-        if not r.get("ok") and len(attempt_log) > 1:
-            tried = "；".join(f"{v} → {m}" for v, ok, m in attempt_log if not ok)
-            r["message"] = f"{r.get('message', '')} ｜ 各出口：{tried}"[:700]
+        r = await run_browser_channel(ch, safe, job_deadline)
         log(f"  {'✅' if r['ok'] else '❌'} {r['name']}: {r['message']}")
         results.append(r)
     report_results(results)

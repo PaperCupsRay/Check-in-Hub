@@ -149,12 +149,14 @@ function splitCheckinMessage(message, lottery) {
 function formatCheckinReport(title, results, extra = "", options = {}) {
   const esc = escapeHtml;
   const showLottery = options.showLottery !== false;
-  const okCount = results.filter((r) => r.ok).length;
+  const pendingCount = results.filter((r) => r.pending || r.degraded).length;
+  const okCount = results.filter((r) => r.ok && !r.pending && !r.degraded).length;
   const lines = [];
   for (const r of results) {
     const split = splitCheckinMessage(String(r.message || (r.ok ? "ok" : "failed")), r.lottery);
     const msg = esc(split.message.slice(0, 90));
-    lines.push(`${r.ok ? "✅" : "❌"} <b>${esc(r.name)}</b>：${msg}`);
+    const pending = !!(r.pending || r.degraded);
+    lines.push(`${pending ? "⏳" : r.ok ? "✅" : "❌"} <b>${esc(r.name)}</b>：${msg}`);
     if (!showLottery) continue;
     const lot = split.lottery;
     const lotMsg = String(lot?.message || "").trim();
@@ -166,7 +168,7 @@ function formatCheckinReport(title, results, extra = "", options = {}) {
   }
   return [
     `<b>${esc(title)}</b>`,
-    `成功 ${okCount}/${results.length}${extra ? ` · ${esc(extra)}` : ""}`,
+    `成功 ${okCount}/${results.length}${pendingCount ? ` · 待确认${pendingCount}` : ""}${extra ? ` · ${esc(extra)}` : ""}`,
     ...lines,
   ].join("\n");
 }

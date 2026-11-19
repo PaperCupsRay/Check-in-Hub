@@ -1063,9 +1063,12 @@
             </div>
           `;
         }
+        const bounds = type === "number"
+          ? ["min", "max", "step"].filter(k => f[k] != null).map(k => ` ${k}="${escapeHtml(f[k])}"`).join("")
+          : "";
         return `
           <label>${label}</label>
-          <input data-field="${key}" type="${type}" placeholder="${ph}" />
+          <input data-field="${key}" type="${type}" placeholder="${ph}"${bounds} />
         `;
       }).join("");
     }
@@ -1522,11 +1525,11 @@
             rawShort.length <= 28 &&
             !/https?:\/\//i.test(rawShort)
               ? rawShort
-              : last.ok
-                ? "成功"
-                : "失败";
+              : last.pending
+                ? "待确认"
+                : last.ok ? "成功" : "失败";
           const statusText = `${actionLabel(last.action || "")}${last.action ? " · " : ""}${short}`;
-          tag = `<span class="tag ${last.ok ? "ok" : "err"}">${escapeHtml(statusText)}</span>`;
+          tag = `<span class="tag ${last.pending ? "compact" : last.ok ? "ok" : "err"}">${escapeHtml(statusText)}</span>`;
         }
         if (!enabled) {
           tag = `<span class="tag compact off">未启用</span>` + tag;
@@ -1682,7 +1685,7 @@
         if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
         log(`${ch.name}：Actions 已触发。${data.message || ""}`, "ok");
         ch.lastResult = {
-          ok: true,
+          ok: false, pending: true,
           action,
           short: "GHA 已触发",
           summary: `${verb}（${runner}）：已在 GitHub Actions 排队，结果回传后自动更新。${data.message || ""}`,
@@ -1755,19 +1758,21 @@
         ch.quotaInfo = extractQuotaInfo(ch.type, data, ch.quotaInfo);
         ch.lastResult = {
           ok: !!data.ok,
+          pending: !!data.pending,
+          attempts: data.attempts ?? null, maxAttempts: data.maxAttempts ?? null,
           action,
-          short,
+          short: data.pending ? "待确认" : short,
           summary: `${actionLabel(action)}：${summary}`,
           at: Date.now(),
           data,
         };
         channels[idx] = ch;
         saveChannels();
-        log(`${ch.name} ${actionLabel(action)} → ${summary}`, data.ok ? "ok" : "err");
+        log(`${ch.name} ${actionLabel(action)} → ${summary}`, data.pending ? "info" : data.ok ? "ok" : "err");
         showToast(
-          `${ch.name}：${actionLabel(action)}${data.ok ? "完成" : "失败"}`,
+          `${ch.name}：${actionLabel(action)}${data.pending ? "等待结果" : data.ok ? "完成" : "失败"}`,
           summary,
-          data.ok ? "ok" : "err"
+          data.pending ? "info" : data.ok ? "ok" : "err"
         );
         if (data.raw || data.user || data.result || data.status) {
           log(JSON.stringify({

@@ -1,3 +1,4 @@
+import { runCheckinWithRetry } from "../checkin-retry.js";
 import { sub2apiAdapter } from "./sub2api.js";
 import { newapiAdapter } from "./newapi.js";
 import { agentrouterAdapter } from "./agentrouter.js";
@@ -24,7 +25,11 @@ export function listAdapters() {
     id: a.id,
     name: a.name,
     description: a.description,
-    fields: a.fields,
+    fields: [...a.fields, {
+      key: "options.retryCount", type: "number", min: 0, max: 5, step: 1,
+      label: "失败重试次数（每执行通道 0–5，默认 2；含首次最多 3 次）",
+      placeholder: "留空使用默认 2；0 表示不重试",
+    }],
     // 适配器自报的额外动作（目前只有 linux.sb 的「抽称号」）：面板按它在卡片上
     // 渲染按钮，src/ui.html 的 actionLabel / extraButtons 据此工作。
     actions: a.actions || [],
@@ -54,5 +59,7 @@ export async function runAction(type, action, channel, extra = {}) {
     err.status = 400;
     throw err;
   }
-  return adapter[action](channel, extra);
+  return action === "checkin"
+    ? runCheckinWithRetry(adapter, channel, extra)
+    : adapter[action](channel, extra);
 }

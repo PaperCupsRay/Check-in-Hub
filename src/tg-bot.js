@@ -338,8 +338,9 @@ async function buildStatusText(env) {
   for (const channel of enabled) {
     const result = channel.lastResult || results.get(channel.name);
     if (!result) continue;
-    if (result.ok === false) failed++;
-    lines.push(`${result.ok ? "✅" : "❌"} <b>${escapeHtml(String(channel.name || "渠道"))}</b>：${escapeHtml(redactTelegramText(result.summary || result.message || (result.ok ? "ok" : "failed"), env).slice(0, 90))}`);
+    const pending = !!(result.pending || result.degraded);
+    if (result.ok === false && !pending) failed++;
+    lines.push(`${pending ? "⏳" : result.ok ? "✅" : "❌"} <b>${escapeHtml(String(channel.name || "渠道"))}</b>：${escapeHtml(redactTelegramText(result.summary || result.message || (pending ? "等待最终结果" : result.ok ? "ok" : "failed"), env).slice(0, 90))}`);
   }
   lines.splice(1, 0, `最近失败渠道：${failed} 个`);
   if (lastRun?.at) lines.push(`最近执行：${escapeHtml(String(lastRun.at))}`);

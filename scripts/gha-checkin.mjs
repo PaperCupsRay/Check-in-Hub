@@ -21,6 +21,8 @@
  */
 
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+import { isPermanentCheckinFailure } from "../src/checkin-retry.js";
 
 const HUB = (process.env.HUB_BASE_URL || "").replace(/\/+$/, "");
 const SECRET = process.env.HUB_SECRET || "";
@@ -92,8 +94,8 @@ function mergeWafCookies(channel) {
   }
 }
 
-async function runOne(channel, runner) {
-  const { runAction } = await import("../src/adapters/index.js");
+export async function runOne(channel, runner, action = null) {
+  const runAction = action || (await import("../src/adapters/index.js")).runAction;
   const started = Date.now();
   try {
     let ch = channel;
@@ -101,7 +103,7 @@ async function runOne(channel, runner) {
       ch = mergeWafCookies(channel);
       const hasWaf = /acw_tc|acw_sc__v2|cf_clearance|cdn_sec_tc/i.test(ch.auth?.cookie || "");
       if (!hasWaf) {
-        return { name: channel.name, ok: false, runner, message: "无可用 WAF cookie（浏览器解挑战未产出）", ms: Date.now() - started };
+        return { name: channel.name, type: channel.type, ok: false, runner, message: "无可用 WAF cookie（浏览器解挑战未产出）", ms: Date.now() - started };
       }
     }
     const r = await runAction(channel.type, "checkin", ch);
@@ -124,20 +126,26 @@ async function runOne(channel, runner) {
       message: r.message || (r.ok ? "ok" : "failed"),
       httpStatus: r.httpStatus ?? null,
       needsBrowser: !!r.needsBrowser,
+      // runAction 已执行共享重试；这里只保留最终结论与刷新出的凭证，不再重试 HTTP。
+      retryable: isPermanentCheckinFailure(r) ? false : r.retryable,
+      attempts: r.attempts ?? null,
+      maxAttempts: r.maxAttempts ?? null,
+      newTokens: r.tokens || null,
       // 签到顺带的抽奖结论（适配器放在 result.lottery 里）：回传后 TG 报告单独占一行
       lottery: r.result?.lottery || null,
       quotaInfo: qi,
       ms: Date.now() - started,
     };
   } catch (e) {
-    return { name: channel.name, ok: false, runner, message: e.message || String(e), ms: Date.now() - started };
+    return { name: channel.name, type: channel.type, ok: false, runner,
+      httpStatus: e.status ?? null, message: e.message || String(e), ms: Date.now() - started };
   }
 }
 
-async function report(results) {
+export async function report(results) {
   if (!HUB || !SECRET) {
     console.log("未配置 HUB_BASE_URL / HUB_SECRET，跳过回传（结果仅存 artifact）");
-    return;
+    return false;
   }
   const res = await fetch(`${HUB}/api/gh/result`, {
     method: "POST",
@@ -146,6 +154,8 @@ async function report(results) {
   });
   const data = await res.json().catch(() => ({}));
   console.log(`回传结果: HTTP ${res.status} merged=${data.merged ?? "?"}`);
+  if (!res.ok || !data.ok) throw new Error(`回传结果失败: HTTP ${res.status}`);
+  return true;
 }
 
 function payloadNames() {
@@ -164,10 +174,10 @@ function payloadNames() {
  * 用于「本次 run 不带 browser job」的场景：那时 gha-fallback.json 没人接手，
  * api 侧再失败也传不出去，渠道会一直漏签到浏览器通道能解为止。
  */
-async function dispatchBrowserFallback(names) {
+export async function dispatchBrowserFallback(names) {
   if (!HUB) {
     console.log(`无处转交浏览器通道（缺 HUB_BASE_URL）: ${names.join("、")}`);
-    return;
+    return false;
   }
   try {
     // 面板开了访问密码就用无状态头，省掉一次登录往返（也避开 set-cookie 的脆弱解析）；
@@ -186,9 +196,51 @@ async function dispatchBrowserFallback(names) {
     console.log(
       `已请求面板触发浏览器通道（${names.join("、")}）: HTTP ${res.status} ${data.message || data.error || ""}`
     );
+    return !!(res.ok && data.ok);
   } catch (e) {
     console.log(`触发浏览器通道失败: ${e.message || e}`);
+    return false;
   }
+}
+
+/** 先持久化待确认结果，再启动独立 browser run，避免旧回传覆盖新 run 的终态。 */
+export async function reportWithBrowserFallback(results, runners, ghaBrowserNames = [], {
+  reportResults = report,
+  dispatch = dispatchBrowserFallback,
+  writeFallback = (names) => fs.writeFileSync("gha-fallback.json", JSON.stringify(names, null, 2)),
+} = {}) {
+  const fallback = results.filter((r) => r.runner === "gha_api" && !r.ok &&
+    BROWSER_TYPES.has(r.type) && !isPermanentCheckinFailure(r));
+  const needBrowser = [...new Set(fallback.map((r) => r.name))];
+  const nameSet = new Set(needBrowser);
+  const browserInRun = runners.includes("gha_browser");
+  // API-only 只反向 dispatch；含 browser 的同 run 才把清单交给 artifact 流程。
+  writeFallback(browserInRun ? needBrowser : []);
+  const reason = (r) => r.message || "HTTP 签到失败";
+  let reported = results.map((r) => nameSet.has(r.name) && fallback.includes(r) ? {
+    ...r,
+    pending: true,
+    message: `HTTP通道未完成，正在自动转浏览器，等待最终结果（原始原因：${reason(r)}）`,
+  } : r);
+  const persisted = await reportResults(reported);
+  if (!needBrowser.length || browserInRun) return reported;
+
+  // 带上常规 browser 渠道，避免 GitHub 同组取消旧的 pending run 后漏签。
+  const names = [...new Set([...needBrowser, ...ghaBrowserNames])];
+  console.log(`需要浏览器通道: ${needBrowser.join("、")}`);
+  const dispatched = persisted !== false && await dispatch(names);
+  if (!dispatched) {
+    const failed = fallback.map((r) => ({
+      ...r,
+      pending: false,
+      message: `HTTP通道未完成，浏览器任务启动失败，签到最终失败（原始原因：${reason(r)}）`,
+    }));
+    // 仅更新启动失败的渠道，不能拿本批其他旧结果覆盖新的回传。
+    await reportResults(failed);
+    const byName = new Map(failed.map((r) => [r.name, r]));
+    reported = reported.map((r) => nameSet.has(r.name) && r.pending ? byName.get(r.name) : r);
+  }
+  return reported;
 }
 
 async function main() {
@@ -201,7 +253,7 @@ async function main() {
   console.log(`本次通道: ${runners.join(", ")}${names ? ` | 指定渠道: ${names.join("、")}` : " | 全部"}`);
 
   const channels = await fetchChannels();
-  // 反向补触发浏览器通道时要一并带上的渠道名（见文件末尾的说明）
+  // 反向补触发浏览器通道时要一并带上的常规 browser 渠道。
   const ghaBrowserNames = channels
     .filter((c) => (c.options?.runner || "worker") === "gha_browser")
     .map((c) => c.name);
@@ -232,49 +284,13 @@ async function main() {
     }
   }
 
-  // 降级：gha_api 失败的渠道交给同次运行的 browser job（CloakBrowser 模拟登录签到）。
-  // 永久性失败（缺凭证 / 接口不存在）不转——换出口也不会成功。
-  const PERMANENT = /缺少|未配置|不存在|404|无可用/;
-  const retryable = [...new Set(results.filter((r) => !r.ok && !PERMANENT.test(r.message || "")).map((r) => r.name))];
-  fs.writeFileSync("gha-fallback.json", JSON.stringify(retryable, null, 2));
-  if (retryable.length) {
-    console.log(`降级到 browser 通道: ${retryable.join("、")}`);
-  }
-
-  await report(results);
-
-  // 本次 run 里没有 browser job（payload 只给了 gha_api）时，上面那份 fallback 清单没有
-  // 人接手：由本 job 反向请求面板再派一次浏览器通道，否则「只有浏览器能解」的失败
-  // （登录接口要 Turnstile / WAF）只会一直失败到当天漏签 —— 2026-09-24「林夕」就是这样。
-  //
-  // 放在 report 之后：反向触发的 run 与本 run 同属一个 concurrency group，先写完自己的
-  // 结果再派，免得新 run 的结果先落 KV、又被本次这份旧内容覆盖。
-  //
-  // names 要带上本通道（gha_browser）自己的渠道：GitHub 同 group 会取消「仍在 pending」
-  // 的旧 run，万一正好挤掉每日 cron 的浏览器 run，带上它们才不会漏签（代价是那几个
-  // 渠道会重复跑一次，站点一般回「今日已签到」，无害）。
-  if (!new Set(runners).has("gha_browser")) {
-    const needBrowser = [
-      ...new Set(
-        results
-          .filter((r) => !r.ok && r.needsBrowser && BROWSER_TYPES.has(r.type))
-          .map((r) => r.name)
-      ),
-    ];
-    if (needBrowser.length) {
-      const names = [...new Set([...needBrowser, ...ghaBrowserNames])];
-      console.log(
-        `需要浏览器通道: ${needBrowser.join("、")}` +
-          (ghaBrowserNames.length ? `（同时带上本通道渠道：${ghaBrowserNames.join("、")}）` : "")
-      );
-      await dispatchBrowserFallback(names);
-    }
-  }
-
-  fs.writeFileSync("gha-results.json", JSON.stringify(results, null, 2));
+  const reported = await reportWithBrowserFallback(results, runners, ghaBrowserNames);
+  fs.writeFileSync("gha-results.json", JSON.stringify(reported, null, 2));
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+  });
+}

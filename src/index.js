@@ -1,5 +1,6 @@
 import { listAdapters, runAction, getAdapter } from "./adapters/index.js";
 import { stripIpBoundCookies } from "./adapters/forum.js";
+import { isPermanentCheckinFailure } from "./checkin-retry.js";
 import {
   authRequired,
   isAuthenticated,
@@ -126,6 +127,9 @@ function storeChannel(input = {}) {
 function publicResult(action, result) {
   return {
     ok: !!result?.ok,
+    pending: !!(result?.pending || result?.degraded),
+    attempts: result?.attempts ?? null,
+    maxAttempts: result?.maxAttempts ?? null,
     action,
     message: result?.message || (result?.ok ? "ok" : "failed"),
     user: result?.user || null,
@@ -208,7 +212,7 @@ async function tryWorkerCheckin(channel) {
  *   gha-checkin.mjs 写 fallback 清单转交同次运行的 browser job。
  *
  * 返回 [{ item, result, via }]：via = "worker" 为真实结果；via = "gha_api" /
- * "gha_browser" 是占位（ok=true），真实结果由 GHA 经 /api/gh/result 回传覆盖
+ * "gha_browser" 是待确认占位（ok=false, pending=true），真实结果由 GHA 回传覆盖
  * KV lastResult + TG 通知。占位保留 worker 尝试刷新出的 tokens 供持久化。
  */
 async function batchCheckinCore(items, env) {
@@ -226,7 +230,7 @@ async function batchCheckinCore(items, env) {
         out.push({
           item,
           via: runner,
-          result: { ok: true, degraded: true, message: `已按配置通道 ${runner} 分发（结果回传后更新）` },
+          result: { ok: false, pending: true, degraded: true, message: `已按配置通道 ${runner} 分发（结果回传后更新）` },
         });
       } else {
         // 未配 GitHub 集成：退回 worker 直连尽力而为
@@ -240,7 +244,7 @@ async function batchCheckinCore(items, env) {
     // 换出口没用，而 gha_api 与 Worker 跑的是同一份纯 HTTP 适配器，分发过去只会再失败
     // 一次。2026-09-24「林夕」实测：worker 与 gha_api 双失败，浏览器通道根本没被触发。
     const browserOnly = !!result.needsBrowser && BROWSER_CAPABLE.has(channel.type);
-    const permanent = !browserOnly && PERMANENT_FAIL_RE.test(String(result.message || ""));
+    const permanent = !browserOnly && (isPermanentCheckinFailure(result) || PERMANENT_FAIL_RE.test(String(result.message || "")));
     if (!result.ok && canFallback && !permanent) {
       const target = browserOnly ? "gha_browser" : "gha_api";
       if (!groups.has(target)) groups.set(target, []);
@@ -251,9 +255,12 @@ async function batchCheckinCore(items, env) {
         item,
         via: target,
         result: {
-          ok: true,
+          ok: false,
+          pending: true,
           degraded: true,
           tokens: result.tokens || null,
+          attempts: result.attempts ?? null,
+          maxAttempts: result.maxAttempts ?? null,
           ...(browserOnly ? { needsBrowser: true } : {}),
           message: `worker 失败（${reason}），已降级 GitHub Actions · ${
             target === "gha_browser" ? "浏览器通道" : "纯 HTTP 通道"
@@ -344,6 +351,7 @@ async function handleCheckin(request, env) {
           {
             name: channel.name,
             ok: !!result?.ok,
+            pending: !!(result?.pending || result?.degraded),
             message: result?.message || (result?.ok ? "ok" : "failed"),
             lottery: result?.result?.lottery || null,
           },
@@ -352,7 +360,7 @@ async function handleCheckin(request, env) {
     }
     const payload = publicResult(action, result);
     payload.via = via;
-    return json(payload, result?.ok ? 200 : 422);
+    return json(payload, result?.ok || payload.pending ? 200 : 422);
   } catch (err) {
     const status = err.status || 500;
     return json(
@@ -428,9 +436,10 @@ async function handleBatch(request, env) {
       env,
       formatCheckinReport(
         "📋 全部签到报告",
-        results.map(({ name, ok, message, result: res }) => ({
+        results.map(({ name, ok, pending, message, result: res }) => ({
           name,
           ok,
+          pending,
           message,
           lottery: res?.lottery || null,
         }))
@@ -438,7 +447,7 @@ async function handleBatch(request, env) {
     );
   }
   return json({
-    ok: results.every((r) => r.ok),
+    ok: results.every((r) => r.ok || r.pending),
     count: results.length,
     results,
   });
@@ -764,6 +773,9 @@ async function runScheduled(env) {
     }
     item.lastResult = {
       ok: !!result.ok,
+      pending: !!(result.pending || result.degraded),
+      attempts: result.attempts ?? null,
+      maxAttempts: result.maxAttempts ?? null,
       summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`,
       at: Date.now(),
     };
@@ -772,6 +784,9 @@ async function runScheduled(env) {
       type: item.type,
       baseUrl: item.baseUrl,
       ok: !!result.ok,
+      pending: !!(result.pending || result.degraded),
+      attempts: result.attempts ?? null,
+      maxAttempts: result.maxAttempts ?? null,
       message: result.message,
       // 签到顺带的抽奖结论（适配器放在 result.lottery 里）也要进 TG 报告
       ...(result.result?.lottery ? { lottery: result.result.lottery } : {}),
@@ -793,7 +808,7 @@ async function runScheduled(env) {
     env,
     formatCheckinReport(
       "📋 定时签到报告",
-      results.map(({ name, ok, message, lottery }) => ({ name, ok, message, lottery }))
+      results.map(({ name, ok, pending, message, lottery }) => ({ name, ok, pending, message, lottery }))
     )
   );
   if (!tg.ok && !tg.skipped) console.log("TG 通知失败:", tg.error || tg.status);
@@ -817,7 +832,7 @@ async function runSelectedCheckin(env, { selection = null, failedOnly = false } 
     targets = channels.filter((channel) => {
       if (!isChannelEnabled(channel)) return false;
       const latest = channel.lastResult ?? lastByName.get(channel.name);
-      return latest?.ok === false;
+      return latest?.ok === false && !latest?.pending;
     });
     if (!targets.length) return { ok: true, message: "没有最近签到失败的已启用渠道", results: [] };
   } else {
@@ -834,20 +849,30 @@ async function runSelectedCheckin(env, { selection = null, failedOnly = false } 
   const results = [];
   for (const { item, result, via } of outcomes) {
     if (result.tokens) item.auth = { ...(item.auth || {}), ...result.tokens };
-    item.lastResult = { ok: !!result.ok, summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`, at: Date.now() };
+    item.lastResult = {
+      ok: !!result.ok, pending: !!(result.pending || result.degraded),
+      attempts: result.attempts ?? null, maxAttempts: result.maxAttempts ?? null,
+      summary: `checkin: ${result.message || (result.ok ? "ok" : "failed")}`, at: Date.now(),
+    };
     results.push({
       name: item.name, type: item.type, baseUrl: item.baseUrl,
       ok: !!result.ok, message: result.message || (result.ok ? "签到成功" : "签到失败"),
+      pending: !!(result.pending || result.degraded),
+      attempts: result.attempts ?? null, maxAttempts: result.maxAttempts ?? null,
       ...(result.result?.lottery ? { lottery: result.result.lottery } : {}),
       ...(via !== "worker" ? { via } : {}),
     });
   }
   await putChannels(env, channels);
   await putLastRun(env, { at: new Date().toISOString(), runner: "telegram-manual", results });
-  const failed = results.filter((r) => !r.ok).length;
+  const failed = results.filter((r) => !r.ok && !r.pending).length;
+  const pending = results.filter((r) => r.pending).length;
   const title = failedOnly ? "🔁 失败渠道重试报告" : "📌 单渠道签到报告";
   const tg = await sendTelegram(env, formatCheckinReport(title, results, "", { showLottery: false }));
-  return { ok: failed === 0, message: failed ? `完成 ${results.length} 个渠道，${failed} 个仍失败` : `成功完成 ${results.length} 个渠道`, results, tg };
+  return { ok: failed === 0,
+    message: failed ? `完成 ${results.length} 个渠道，${failed} 个仍失败${pending ? `，待确认${pending}` : ""}`
+      : pending ? `完成 ${results.length} 个渠道，待确认${pending}` : `成功完成 ${results.length} 个渠道`,
+    results, tg };
 }
 
 async function runFailedCheckins(env) {
@@ -1045,6 +1070,9 @@ async function handleGhResult(request, env) {
     if (!ch) continue;
     ch.lastResult = {
       ok: !!r.ok,
+      pending: !!(r.pending || r.degraded),
+      attempts: r.attempts ?? null,
+      maxAttempts: r.maxAttempts ?? null,
       action: "checkin",
       summary: `gha: ${r.message || (r.ok ? "ok" : "failed")}`,
       at: Date.now(),
@@ -1056,13 +1084,20 @@ async function handleGhResult(request, env) {
     // cf_clearance 这类与出口 IP 绑定的 cookie 会被 stripIpBoundCookies 去掉。
     if (r.newTokens) {
       ch.auth = { ...(ch.auth || {}) };
-      if (r.newTokens.accessToken) {
-        ch.auth.accessToken = r.newTokens.accessToken;
-        if (ch.type === "newapi") ch.auth.token = r.newTokens.accessToken;
+      const tokens = r.newTokens;
+      const accessToken = tokens.accessToken || (ch.type === "newapi" ? tokens.token : null);
+      if (accessToken) {
+        ch.auth.accessToken = accessToken;
+        if (ch.type === "newapi") ch.auth.token = accessToken;
       }
-      if (r.newTokens.authSession) ch.auth.authSession = r.newTokens.authSession;
-      if (r.newTokens.accessExpiresAt) ch.auth.accessExpiresAt = r.newTokens.accessExpiresAt;
-      if (r.newTokens.refreshToken) ch.auth.refreshToken = r.newTokens.refreshToken;
+      if (Object.prototype.hasOwnProperty.call(tokens, "authSession")) ch.auth.authSession = tokens.authSession ?? "";
+      if (tokens.accessExpiresAt) ch.auth.accessExpiresAt = tokens.accessExpiresAt;
+      if (tokens.refreshToken) ch.auth.refreshToken = tokens.refreshToken;
+      const userId = tokens.userId ?? (ch.type === "newapi" ? tokens.newApiUser : null);
+      if (userId != null && userId !== "") {
+        ch.auth.userId = userId;
+        if (ch.type === "newapi") ch.auth.newApiUser = userId;
+      }
       if (r.newTokens.cookie) {
         const fresh = stripIpBoundCookies(r.newTokens.cookie);
         if (fresh) ch.auth.cookie = fresh;
@@ -1071,7 +1106,11 @@ async function handleGhResult(request, env) {
     merged++;
   }
   if (merged) await putChannels(env, channels);
-  const flat = results.map((r) => ({ name: r.name, ok: !!r.ok, message: r.message, lottery: r.lottery || null }));
+  const flat = results.map((r) => ({
+    name: r.name, ok: !!r.ok, pending: !!(r.pending || r.degraded),
+    attempts: r.attempts ?? null, maxAttempts: r.maxAttempts ?? null,
+    message: r.message, lottery: r.lottery || null,
+  }));
   await putLastRun(env, {
     at: new Date().toISOString(),
     runner: "github-actions",

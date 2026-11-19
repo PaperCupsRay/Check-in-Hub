@@ -99,6 +99,7 @@ function installFetch(scenario) {
     if (u.includes("api.github.com")) return new Response(null, { status: 204 }); // repository_dispatch
     if (u.includes("/api/v1/auth/refresh")) return scenario.refresh();
     if (u.includes("/api/v1/auth/login")) return scenario.login();
+    if (u.includes("/api/v1/check-in/status")) return json(200, {code:0,data:{checked_in_today:false}});
     if (u.includes("/api/v1/check-in")) {
       return (headers.Authorization || "") === `Bearer ${OLD_ACCESS}` ? scenario.checkinOld() : scenario.checkinNew();
     }
@@ -128,7 +129,7 @@ async function scenario(name, spec, fn) {
   const calls = installFetch(spec.fetch);
   const out = await batchCheckinCore([spec.channel ?? makeChannel()], spec.env ?? GH_ENV);
   const { result, via } = out[0];
-  const checkins = calls.filter((c) => c.url.includes("/api/v1/check-in"));
+  const checkins = calls.filter((c) => c.method === "POST" && c.url.includes("/api/v1/check-in"));
   const authCalls = calls.filter((c) => c.url.includes("/api/v1/auth/"));
   const payloads = calls
     .filter((c) => c.url.includes("/dispatches"))

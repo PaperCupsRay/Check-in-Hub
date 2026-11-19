@@ -7,13 +7,14 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "test": "node scripts/test-auth-fallback.mjs && npm run test:newapi && node scripts/test-forum-adapters.mjs && node scripts/test-onyxaxis.mjs && node scripts/test-lottery.mjs && python scripts/test-captcha.py && python scripts/test-human-verify.py && node scripts/test-proxy.mjs && node scripts/test-proxy-ui.mjs && node scripts/test-worker-routes.mjs && node scripts/test-tg.mjs",
+    "test": "node scripts/test-auth-fallback.mjs && npm run test:newapi && npm run test:retry && node scripts/test-forum-adapters.mjs && node scripts/test-onyxaxis.mjs && node scripts/test-lottery.mjs && python scripts/test-captcha.py && python scripts/test-human-verify.py && node scripts/test-proxy.mjs && node scripts/test-proxy-ui.mjs && node scripts/test-worker-routes.mjs && node scripts/test-tg.mjs",
     "test:newapi": "node scripts/test-newapi-modern.mjs && node scripts/test-newapi-ui-failure.mjs && node scripts/test-newapi-direct-first.mjs && python scripts/test-newapi-direct-first.py",
     "test:forum": "node scripts/test-forum-adapters.mjs",
     "test:onyxaxis": "node scripts/test-onyxaxis.mjs",
     "test:lottery": "node scripts/test-lottery.mjs",
     "test:proxy": "node scripts/test-proxy.mjs && node scripts/test-proxy-ui.mjs && node scripts/test-worker-routes.mjs",
     "test:tg": "node scripts/test-tg.mjs",
+    "test:retry": "node scripts/test-checkin-retry.mjs && python scripts/test-browser-retry.py && node scripts/test-gha-report.mjs && node scripts/test-retry-ui.mjs",
     "test:browser": "python scripts/test-forum-browser.py && python scripts/test-captcha.py && python scripts/test-human-verify.py"
   },
   "devDependencies": {
