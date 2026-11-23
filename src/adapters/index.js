@@ -32,8 +32,8 @@ export function listAdapters() {
       placeholder: "http(s)://user:pass@host:port 或 socks5://user:pass@host:port",
     }, {
       key: "options.retryCount", type: "number", min: 0, max: 5, step: 1,
-      label: "失败重试次数（每执行通道 0–5，默认 2；含首次最多 3 次）",
-      placeholder: "留空使用默认 2；0 表示不重试",
+      label: "失败重试次数（0–5；Worker 默认 0，Actions 默认 2）",
+      placeholder: "留空使用执行通道默认值；0 表示不重试",
     }],
     // 适配器自报的额外动作（目前只有 linux.sb 的「抽称号」）：面板按它在卡片上
     // 渲染按钮，src/ui.html 的 actionLabel / extraButtons 据此工作。
@@ -57,7 +57,7 @@ export function getAdapter(type) {
  * extra 是本次动作的附加参数（目前只有抽奖的 { count }）：适配器按需读，
  * 不读的适配器忽略即可 —— 这样加参数不用改每个适配器的签名。
  */
-export async function runAction(type, action, channel, extra = {}) {
+export async function runAction(type, action, channel, extra = {}, retryOptions = {}) {
   const adapter = getAdapter(type);
   requireChannelTransport(channel);
   if (typeof adapter[action] !== "function") {
@@ -66,6 +66,6 @@ export async function runAction(type, action, channel, extra = {}) {
     throw err;
   }
   return action === "checkin"
-    ? runCheckinWithRetry(adapter, channel, extra)
+    ? runCheckinWithRetry(adapter, channel, extra, retryOptions)
     : adapter[action](channel, extra);
 }

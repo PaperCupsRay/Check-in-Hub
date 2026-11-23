@@ -58,6 +58,8 @@ await test('needsBrowser is handed off without repeating HTTP; credential failur
   assert.equal(isPermanentCheckinFailure({ok:false,message:'缺少完整登录 Cookie'}),true);
   assert.equal(shouldRetryCheckin({ok:false,httpStatus:429}),true);
   assert.equal(shouldRetryCheckin({ok:false,httpStatus:403,message:'Cloudflare challenge'}),false);
+  assert.equal(shouldRetryCheckin({ok:false,message:'Too many subrequests by single Worker invocation'}),false);
+  assert.equal(isPermanentCheckinFailure({ok:false,message:'Too many subrequests by single Worker invocation'}),true);
 });
 await test('retry carries credential bundle without mutating input; success is terminal', async () => {
   const before=JSON.stringify(channel);let posts=0;

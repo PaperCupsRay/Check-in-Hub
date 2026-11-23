@@ -2,12 +2,12 @@
 export const DEFAULT_RETRY_COUNT = 2;
 export const MAX_RETRY_COUNT = 5;
 
-export function retryCount(channel) {
+export function retryCount(channel, defaultValue = DEFAULT_RETRY_COUNT) {
   const value = channel?.options?.retryCount;
   if (value == null || (typeof value === "string" && value.trim() === "") ||
-      !["number", "string"].includes(typeof value)) return DEFAULT_RETRY_COUNT;
+      !["number", "string"].includes(typeof value)) return defaultValue;
   const number = Number(value);
-  if (!Number.isFinite(number) || number < 0 || !Number.isInteger(number)) return DEFAULT_RETRY_COUNT;
+  if (!Number.isFinite(number) || number < 0 || !Number.isInteger(number)) return defaultValue;
   return Math.min(number, MAX_RETRY_COUNT);
 }
 
@@ -19,6 +19,7 @@ export function isPermanentCheckinFailure(result) {
   const code = String(result?.raw?.code || "");
   if (status === 401 || status === 404) return true;
   if (status === 403 && !/cloudflare|challenge|waf|blocked|拦截/i.test(message)) return true;
+  if (/too many subrequests|subrequests by single worker invocation/i.test(message)) return true;
   return /AUTH_(?:UNAUTHORIZED|SESSION_REVOKED|SESSION_EXPIRED)/i.test(code) ||
     /缺少[^\n]*(?:凭证|cookie|访问令牌|用户名|密码)|凭证.*(?:无效|失效|过期)|密码.*(?:错误|不正确)|未登录|unauthorized|invalid\s+(?:access\s+|refresh\s+)?token|余额不足|额度不足|连续登录|资格不足|活动已(?:失效|结束)|未配置|接口不存在|未知渠道|不支持/i.test(message);
 }
@@ -43,8 +44,9 @@ function applyTokens(channel, tokens) {
 
 export async function runCheckinWithRetry(adapter, channel, extra = {}, {
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  defaultRetryCount = DEFAULT_RETRY_COUNT,
 } = {}) {
-  const maxAttempts = retryCount(channel) + 1;
+  const maxAttempts = retryCount(channel, defaultRetryCount) + 1;
   let active = { ...channel, auth: { ...channel.auth } };
   let tokens = {};
   const accept = result => {

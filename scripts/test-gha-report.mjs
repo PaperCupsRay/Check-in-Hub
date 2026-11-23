@@ -327,10 +327,11 @@ test("publicResult carries attempts and pending while configured/dispatched Work
 
 test("Worker degraded placeholders preserve pending/retry metadata; dispatch errors return a terminal failure", async () => {
   const env = makeEnv([channel("Future API", "newapi", "worker")]);
+  const retryChannel = { ...channel("Future API", "newapi", "worker"), options: { runner: "worker", retryCount: 2 } };
   adapters.newapi = { checkin: async () => ({ ok: false, needsBrowser: true, message: "Turnstile token为空",
     tokens: { userId: "42" }, attempts: 1, maxAttempts: 3 }) };
   mockWorkerOutbound(env);
-  const [pending] = await batchCheckinCore([channel("Future API", "newapi", "worker")], env);
+  const [pending] = await batchCheckinCore([retryChannel], env);
   assert.equal(pending.result.ok, false);
   assert.equal(pending.result.pending, true);
   assert.equal(pending.result.degraded, true);
@@ -338,7 +339,7 @@ test("Worker degraded placeholders preserve pending/retry metadata; dispatch err
   assert.equal(pending.result.maxAttempts, 3);
   assert.equal(pending.via, "gha_browser");
   mockWorkerOutbound(env, { githubStatus: 503 });
-  const [failed] = await batchCheckinCore([channel("Future API", "newapi", "worker")], env);
+  const [failed] = await batchCheckinCore([retryChannel], env);
   assert.equal(failed.result.ok, false);
   assert.ok(!failed.result.pending && !failed.result.degraded);
   assert.match(failed.result.message, /GHA 分发失败/);

@@ -192,7 +192,7 @@ const BROWSER_CAPABLE = new Set(["sub2api", "newapi", "nodeseek", "linuxsb"]);
 
 async function tryWorkerCheckin(channel) {
   try {
-    return await runAction(channel.type, "checkin", channel);
+    return await runAction(channel.type, "checkin", channel, {}, { defaultRetryCount: 0 });
   } catch (err) {
     return { ok: false, message: err.message || String(err) };
   }
@@ -804,15 +804,49 @@ async function runScheduled(env) {
   const lastRun = { at: new Date().toISOString(), results, skipped };
   await putLastRun(env, lastRun);
   // TG 通知（未配置 secrets 时静默跳过）
-  const tg = await sendTelegram(
+  const tg = await sendScheduledTelegram(
     env,
     formatCheckinReport(
       "📋 定时签到报告",
       results.map(({ name, ok, pending, message, lottery }) => ({ name, ok, pending, message, lottery }))
     )
   );
-  if (!tg.ok && !tg.skipped) console.log("TG 通知失败:", tg.error || tg.status);
   return { ok: true, results, skipped, lastRun, tg };
+}
+
+function scheduledFailureReport(message) {
+  return formatCheckinReport("⚠️ 定时签到任务异常", [{
+    name: "Cloudflare Cron",
+    ok: false,
+    message: String(message || "签到任务未正常完成"),
+  }], "", { showLottery: false });
+}
+
+async function sendScheduledTelegram(env, text) {
+  let result = await sendTelegram(env, text);
+  if (!result.ok && !result.skipped) {
+    console.log("Cron Telegram 通知失败，短暂等待后重试:", result.error || result.status);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    result = await sendTelegram(env, text);
+  }
+  if (!result.ok && !result.skipped) console.log("Cron Telegram 重试失败:", result.error || result.status);
+  return result;
+}
+
+export async function runScheduledCron(env) {
+  try {
+    const result = await runScheduled(env);
+    if (!result?.ok) {
+      const tg = await sendScheduledTelegram(env, scheduledFailureReport(result?.message));
+      return { ...result, tg };
+    }
+    return result;
+  } catch (error) {
+    const message = error?.message || String(error);
+    console.error("Cron 签到任务异常:", message);
+    const tg = await sendScheduledTelegram(env, scheduledFailureReport(message));
+    return { ok: false, message, tg };
+  }
 }
 
 /** Run only selected enabled channels, or channels whose latest check-in failed. */
@@ -1443,6 +1477,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runScheduled(env));
+    ctx.waitUntil(runScheduledCron(env));
   },
 };

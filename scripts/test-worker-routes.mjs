@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test, afterEach } from "node:test";
+import { adapters } from "../src/adapters/index.js";
 import { loadWorker, memoryKV } from "./test-helpers.mjs";
 
-const { default: worker, runSelectedCheckin, runScheduled } = await loadWorker();
+const { default: worker, runSelectedCheckin, runScheduled, batchCheckinCore } = await loadWorker();
 const nativeFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = nativeFetch; });
 const makeEnv = () => ({
@@ -286,5 +287,60 @@ test("定时签到、批量签到和面板单渠道推送共用去重逻辑，�
     assert.match(checkinLine, /奖励 \$300\.00，余额 \$73\.26/);
     assert.doesNotMatch(checkinLine, /抽奖|中奖|免费额度|🎰/);
     assert.equal(messages[0].split("\n").filter(line => line.startsWith("🎰")).length, 1, source);
+  }
+});
+
+test("Cron reports preflight failures and retries transient Telegram delivery", async () => {
+  const env = { TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123" };
+  const messages = [];
+  let sends = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    assert.ok(String(url).includes("api.telegram.org"));
+    sends++;
+    messages.push(JSON.parse(init.body).text);
+    if (sends === 1) return Response.json({ ok: false, description: "temporary unavailable" }, { status: 503 });
+    return Response.json({ ok: true, result: {} });
+  };
+  let task;
+  worker.scheduled({}, env, { waitUntil(promise) { task = promise; } });
+  assert.ok(task instanceof Promise);
+  const result = await task;
+  assert.equal(result.ok, false);
+  assert.equal(sends, 2);
+  assert.match(messages[0], /定时签到任务异常/);
+  assert.match(messages[1], /CHECKIN_KV not bound/);
+});
+
+test("Worker batch check-in uses no default retries and skips exhausted subrequest fallback", async () => {
+  const previous = adapters.fixture;
+  let checks = 0;
+  let statuses = 0;
+  adapters.fixture = {
+    fields: [],
+    checkin: async () => {
+      checks++;
+      return { ok: false, message: "Too many subrequests by single Worker invocation" };
+    },
+    status: async () => {
+      statuses++;
+      throw new Error("subrequest limit is exhausted");
+    },
+  };
+  try {
+    const [outcome] = await batchCheckinCore([{
+      name: "fixture",
+      type: "fixture",
+      baseUrl: "https://fixture.example",
+      auth: {},
+      options: {},
+    }], { GH_TOKEN: "must-not-dispatch", GH_REPO: "owner/repo" });
+    assert.equal(checks, 1);
+    assert.equal(statuses, 0);
+    assert.equal(outcome.via, "worker");
+    assert.equal(outcome.result.attempts, 1);
+    assert.match(outcome.result.message, /Too many subrequests/);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
   }
 });
