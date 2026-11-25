@@ -112,6 +112,19 @@
     @media (max-width: 860px) { .hero { grid-template-columns: 1fr; } }
     .channel-panel { margin-top: 14px; }
     .proxy-panel { margin-top: 14px; }
+    .proxy-panel > summary {
+      display: flex; align-items: center; gap: 8px;
+      cursor: pointer; list-style: none; user-select: none;
+    }
+    .proxy-panel > summary::-webkit-details-marker { display: none; }
+    .proxy-panel > summary::before {
+      content: ""; width: 0; height: 0; flex: 0 0 auto;
+      border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+      border-left: 7px solid var(--muted); transition: transform .15s ease;
+    }
+    .proxy-panel[open] > summary::before { transform: rotate(90deg); }
+    .proxy-panel > summary h2 { justify-content: flex-start; }
+    .proxy-content { margin-top: 12px; }
     .proxy-panel textarea { min-height: 96px; }
     .proxy-results { display: grid; gap: 6px; margin-top: 10px; }
     .proxy-row {
@@ -582,6 +595,7 @@
       </div>
       <div class="header-actions">
         <div class="badge" id="adapterBadge">加载适配器中…</div>
+        <div class="badge" id="appVersion">v__CHECKIN_HUB_VERSION__</div>
         <button id="btnOpenLog" class="secondary" type="button" style="padding:7px 10px;font-size:.82rem">Log</button>
         <button id="btnLogout" class="secondary" type="button" style="display:none;padding:7px 10px;font-size:.82rem">退出登录</button>
       </div>
@@ -600,13 +614,16 @@
       </div>
     </section>
 
-    <section class="card proxy-panel">
+    <details class="card proxy-panel" id="proxyPanel">
+      <summary>
+        <h2>
+          <span>代理池</span>
+          <span class="badge" id="proxyBadge">0</span>
+        </h2>
+      </summary>
+      <div class="proxy-content">
       <div class="toolbar">
         <div>
-          <h2>
-            <span>代理池</span>
-            <span class="badge" id="proxyBadge">0</span>
-          </h2>
           <div class="hint">
             供「GitHub Actions · 浏览器过盾」通道使用。Cloudflare 对 GHA 机房 IP 常静默不签发 Turnstile 挑战（组件能渲染但永远等不到 token），换成住宅出口后实测 27s 即可拿到 token。<br />
             每行一个，支持 <code>socks5://</code>、<code>socks4://</code>、<code>http://</code>、<code>https://</code>，可带 <code>user:pass@</code> 和 <code>#备注</code>；省略协议按 socks5 处理。<br />
@@ -630,7 +647,8 @@
       <textarea id="proxyInput" rows="5" placeholder="socks5://1.2.3.4:1080#US 家宽&#10;socks4://1.2.3.4:1080&#10;http://user:pass@proxy.example.com:8080#付费 HTTP&#10;https://user:pass@proxy.example.com:443&#10;1.2.3.4:4145  （省略协议＝socks5）"></textarea>
       <div class="hint" id="proxyTestStatus" role="status" aria-live="polite">仅检测已保存且启用的代理；GitHub 任务完成后自动更新。</div>
       <div class="proxy-results" id="proxyResults"></div>
-    </section>
+      </div>
+    </details>
 
     <section class="card proxy-panel">
       <div class="toolbar">

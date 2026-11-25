@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { loadWorker } from "./test-helpers.mjs";
 
 const html = readFileSync(new URL("../src/ui.html", import.meta.url), "utf8");
+const packageInfo = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const fragment = script.slice(script.indexOf("    /* ---------------- Telegram 交互 ---------------- */"), script.indexOf("    async function loadApp()"));
 const esc = script.slice(script.indexOf("    function escapeHtml("), script.indexOf("    function setSessionToken("));
@@ -35,6 +37,36 @@ test("完整内联脚本可编译，新增检测控件 ID 唯一", () => {
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
   assert.equal(ids.length, new Set(ids).size);
   for (const id of ["proxyRunner", "btnTestProxies", "btnRefreshProxies", "proxyTestStatus"]) assert.ok(ids.includes(id));
+});
+
+test("前端与健康检查显示构建时注入的 package.json 版本", async () => {
+  const versionBadge = html.match(/<div class="badge" id="appVersion">([^<]+)<\/div>/);
+  assert.ok(versionBadge, "版本标识应显示在顶部状态区");
+  assert.equal(versionBadge[1], "v__CHECKIN_HUB_VERSION__");
+  const { default: worker } = await loadWorker();
+  for (const env of [{}, { ACCESS_PASSWORD: "private-test-password" }]) {
+    const page = await worker.fetch(new Request("https://hub.example/"), env);
+    const content = await page.text();
+    assert.ok(content.includes(`id="appVersion">v${packageInfo.version}</div>`));
+    assert.ok(!content.includes("__CHECKIN_HUB_VERSION__"));
+    const health = await worker.fetch(new Request("https://hub.example/api/health"), env);
+    assert.equal((await health.json()).version, packageInfo.version);
+  }
+});
+
+test("代理池使用默认收起的原生折叠区，摘要保留代理数量", () => {
+  const openingTag = html.match(/<details\b[^>]*\bid="proxyPanel"[^>]*>/)?.[0];
+  assert.ok(openingTag, "代理池应使用 details 容器");
+  assert.doesNotMatch(openingTag, /\sopen(?:\s|>)/, "代理池默认应收起");
+  const panelStart = html.indexOf(openingTag);
+  const summaryEnd = html.indexOf("</summary>", panelStart);
+  const panelEnd = html.indexOf("</details>", summaryEnd);
+  assert.ok(summaryEnd > panelStart && panelEnd > summaryEnd);
+  assert.match(html.slice(panelStart, summaryEnd), /id="proxyBadge"/);
+  const content = html.slice(summaryEnd, panelEnd);
+  for (const id of ["proxyRunner", "btnTestProxies", "btnRefreshProxies", "btnSaveProxies", "btnClearProxies", "proxyInput", "proxyTestStatus", "proxyResults"]) {
+    assert.ok(content.includes(`id="${id}"`), `${id} should be inside the collapsible content`);
+  }
 });
 
 test("代理列表显示打码地址/来源/IP，并对文本和 HTML 属性转义", async () => {

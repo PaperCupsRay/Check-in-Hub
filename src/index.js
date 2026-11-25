@@ -26,7 +26,8 @@ import {
   browserAuthSupported,
 } from "./proxy.js";
 import uiHtml from "./ui.html";
-import { sendTelegram, formatCheckinReport } from "./tg.js";
+import { appVersion } from "./version.js";
+import { sendTelegram, formatCheckinReport, redactTelegramText } from "./tg.js";
 import { startProxyTest, getProxyTestStatus, getProxyTestTask, completeProxyTest, proxyRunnerAuthenticated } from "./proxy-test.js";
 import { handleTelegramWebhook, setupTelegramWebhook, getTelegramStatus } from "./tg-bot.js";
 import _nacl from "tweetnacl";
@@ -34,6 +35,8 @@ import _naclUtil from "tweetnacl-util";
 const { box } = _nacl;
 const util = _naclUtil;
 import { blake2b } from "@noble/hashes/blake2.js";
+
+const appUiHtml = uiHtml.replaceAll("__CHECKIN_HUB_VERSION__", appVersion);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -917,6 +920,209 @@ async function runChannelCheckin(env, selection) {
   return runSelectedCheckin(env, { selection });
 }
 
+function channelMatchesTelegramTarget(channel, target) {
+  if (typeof target === "string") return !!target && channel.id === target;
+  if (!target || typeof target !== "object") return false;
+  if (typeof target.id === "string" && target.id) return channel.id === target.id;
+  if (channel.id) return false;
+  const normalized = normalizeChannel(channel);
+  return typeof target.name === "string" && target.name === normalized.name &&
+    typeof target.type === "string" && target.type === normalized.type &&
+    typeof target.baseUrl === "string" && target.baseUrl.replace(/\/+$/, "") === normalized.baseUrl;
+}
+
+async function resolveTelegramChannel(env, target) {
+  const channels = await getChannels(env);
+  const matches = channels
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item && channelMatchesTelegramTarget(item, target));
+  if (matches.length !== 1) return { ok: false, error: "渠道不存在或选择已失效，请重新选择" };
+  const { item, index } = matches[0];
+  if (!isChannelEnabled(item)) return { ok: false, error: "该渠道已停用" };
+  try {
+    const channel = normalizeChannel(item);
+    return { ok: true, channels, index, original: item, channel, adapter: getAdapter(channel.type) };
+  } catch {
+    return { ok: false, error: "该渠道类型不可用" };
+  }
+}
+
+function telegramChannelActions(adapter) {
+  const options = [];
+  for (const action of ["me", "status"]) {
+    if (typeof adapter[action] === "function") options.push({ action, label: action === "me" ? "余额" : "状态" });
+  }
+  for (const declared of Array.isArray(adapter.actions) ? adapter.actions : []) {
+    if (!declared || typeof declared.action !== "string" || typeof adapter[declared.action] !== "function") continue;
+    options.push({
+      action: declared.action,
+      label: String(declared.label || declared.action).slice(0, 32),
+      title: String(declared.title || "").slice(0, 120),
+      count: !!declared.count,
+    });
+  }
+  if (options.some((option) => option.action === "lottery")) {
+    options.push({ action: "lotteryInfo", label: "抽奖状态" });
+  }
+  return options;
+}
+
+function telegramChannelSecrets(channel) {
+  const secrets = [];
+  const visit = (value, key = "") => {
+    if (typeof value === "string") {
+      if (value && (value.length >= 4 || /password|pass|token|cookie|secret|session|authorization/i.test(key))) secrets.push(value);
+      if (/cookie/i.test(key)) {
+        for (const part of value.split(";")) {
+          const separator = part.indexOf("=");
+          const token = separator >= 0 ? part.slice(separator + 1).trim() : "";
+          if (token) secrets.push(token);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (value && typeof value === "object") Object.entries(value).forEach(([name, item]) => visit(item, name));
+  };
+  visit(channel.auth);
+  return [...new Set(secrets)].sort((left, right) => right.length - left.length);
+}
+
+function safeTelegramText(value, channel, env) {
+  let text = String(value ?? "");
+  for (const secret of telegramChannelSecrets(channel)) {
+    text = text.split(secret).join("[已隐藏]").split(encodeURIComponent(secret)).join("[已隐藏]");
+  }
+  text = text.replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [已隐藏]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[已隐藏]");
+  return redactTelegramText(text, env).slice(0, 500);
+}
+
+function safeTelegramValue(value, channel, env, depth = 0) {
+  if (depth > 5) return undefined;
+  if (value == null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return safeTelegramText(value, channel, env);
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => safeTelegramValue(item, channel, env, depth + 1));
+  if (typeof value !== "object") return undefined;
+  const output = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (/^raw$|token|cookie|secret|password|authorization|^headers?$|credential|email|base.?url|^url$/i.test(key)) continue;
+    const safe = safeTelegramValue(item, channel, env, depth + 1);
+    if (safe !== undefined) output[key] = safe;
+  }
+  return output;
+}
+
+async function persistTelegramActionTokens(env, original, channel, tokens) {
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens) || !Object.keys(tokens).length) return;
+  const latest = await resolveTelegramChannel(env, original);
+  if (!latest.ok || latest.channel.type !== channel.type || latest.channel.baseUrl !== channel.baseUrl) return;
+  const rotated = {};
+  for (const [key, value] of Object.entries(tokens)) {
+    if (latest.channel.auth[key] === channel.auth[key] && latest.channel.auth[key] !== value) rotated[key] = value;
+  }
+  if (!Object.keys(rotated).length) return;
+  latest.channels[latest.index] = { ...latest.original, auth: { ...(latest.original.auth || {}), ...rotated } };
+  await putChannels(env, latest.channels);
+}
+
+async function getTelegramChannelActionOptions(env, target) {
+  let resolved;
+  try { resolved = await resolveTelegramChannel(env, target); }
+  catch { return { ok: false, error: "读取渠道失败" }; }
+  if (!resolved.ok) return resolved;
+  const { channel, adapter, original } = resolved;
+  const last = original.lastResult && typeof original.lastResult === "object" ? original.lastResult : null;
+  const action = typeof last?.action === "string" && /^[a-zA-Z0-9_-]{1,40}$/.test(last.action) ? last.action : "";
+  return {
+    ok: true,
+    channel: { id: channel.id || null, name: String(channel.name || "渠道").slice(0, 80), type: channel.type },
+    actions: telegramChannelActions(adapter),
+    lastResult: last ? {
+      action,
+      ok: last.ok === true ? true : last.ok === false ? false : null,
+      pending: !!last.pending,
+      at: Number.isFinite(Number(last.at)) ? Number(last.at) : null,
+      summary: safeTelegramText(last.summary || last.message || last.short ||
+        (last.pending ? "等待结果" : last.ok === false ? "最近操作失败" : "最近操作成功"), channel, env),
+    } : null,
+  };
+}
+
+async function runTelegramChannelAction(env, target, action, extra = {}) {
+  let resolved;
+  try { resolved = await resolveTelegramChannel(env, target); }
+  catch { return { ok: false, action, message: "读取渠道失败" }; }
+  if (!resolved.ok) return { ok: false, action, message: resolved.error };
+  const { original, channel, adapter } = resolved;
+  const redactionChannel = { auth: { original: { ...channel.auth } } };
+  const declared = (Array.isArray(adapter.actions) ? adapter.actions : []).find((item) => item?.action === action);
+  const readOnlyLotteryInfo = action === "lotteryInfo" && typeof adapter.lotteryInfo === "function" &&
+    (Array.isArray(adapter.actions) ? adapter.actions : []).some((item) => item?.action === "lottery");
+  if (action === "checkin" || !(action === "me" || action === "status" || declared || readOnlyLotteryInfo) || typeof adapter[action] !== "function") {
+    return { ok: false, action, message: "该渠道不再支持此操作" };
+  }
+
+  try {
+    const options = extra && typeof extra === "object" && !Array.isArray(extra) ? extra : { count: extra };
+    if (options.requestId != null && (typeof options.requestId !== "string" || !/^[a-f0-9]{32}$/.test(options.requestId))) {
+      return { ok: false, action, message: "操作确认已失效，请重新选择" };
+    }
+    let count = options.count;
+    if (declared?.count) {
+      const costMode = String(channel.options?.lotteryCost ?? "").trim().toLowerCase();
+      const currentMode = ["free", "auto", "all"].includes(costMode) ? costMode : "free";
+      const confirmedMode = options.costMode || "free";
+      if (confirmedMode !== currentMode) return { ok: false, action, message: "抽奖消耗方式已变化，请重新查看状态并确认" };
+      const lotteryInfo = await runAction(channel.type, "lotteryInfo", channel);
+      await persistTelegramActionTokens(env, original, channel, lotteryInfo?.tokens);
+      redactionChannel.auth.refreshed = lotteryInfo?.tokens;
+      if (lotteryInfo?.tokens) channel.auth = { ...channel.auth, ...lotteryInfo.tokens };
+      if (!lotteryInfo?.ok) {
+        return { ok: false, action, message: safeTelegramText(lotteryInfo?.message || "读取抽奖状态失败", redactionChannel, env) };
+      }
+      const maxDraws = Number(lotteryInfo.result?.maxDraws);
+      const requested = Number(count);
+      if (lotteryInfo.result?.canDraw !== true || !Number.isSafeInteger(requested) || requested < 1 || !Number.isSafeInteger(maxDraws) || maxDraws < 1) {
+        return { ok: false, action, message: safeTelegramText(lotteryInfo.message || "当前没有可用抽奖次数", redactionChannel, env), result: safeTelegramValue(lotteryInfo.result, redactionChannel, env) };
+      }
+      if (lotteryInfo.result?.costMode && lotteryInfo.result.costMode !== confirmedMode) {
+        return { ok: false, action, message: "抽奖消耗方式已变化，请重新查看状态并确认" };
+      }
+      if (requested > maxDraws) {
+        return { ok: false, action, message: `当前最多可抽 ${maxDraws} 次，请重新选择`, result: safeTelegramValue(lotteryInfo.result, redactionChannel, env) };
+      }
+      count = Math.min(requested, 5);
+    }
+
+    const result = await runAction(channel.type, action, channel, {
+      ...(count == null ? {} : { count }),
+      ...(options.requestId == null ? {} : { requestId: options.requestId }),
+    });
+    await persistTelegramActionTokens(env, original, channel, result?.tokens);
+    redactionChannel.auth.returned = result?.tokens;
+    if (result?.tokens) channel.auth = { ...channel.auth, ...result.tokens };
+    return {
+      ok: !!result?.ok,
+      action,
+      pending: !!(result?.pending || result?.degraded),
+      skipped: !!result?.skipped,
+      message: safeTelegramText(result?.message || (result?.ok ? "操作完成" : "操作失败"), redactionChannel, env),
+      ...(result?.user ? { user: {
+        ...safeTelegramValue(result.user, redactionChannel, env),
+        quotaPerUnit: (() => {
+          const quotaPerUnit = Number(result.user.quotaPerUnit ?? result.user.raw?.quota_per_unit ?? result.user.raw?.QuotaPerUnit ?? result.user.raw?.quotaPerUnit);
+          return Number.isFinite(quotaPerUnit) && quotaPerUnit > 0 ? quotaPerUnit : 500000;
+        })(),
+      } } : {}),
+      ...(result?.status ? { status: safeTelegramValue(result.status, redactionChannel, env) } : {}),
+      ...(result?.result ? { result: safeTelegramValue(result.result, redactionChannel, env) } : {}),
+    };
+  } catch (error) {
+    return { ok: false, action, message: safeTelegramText(error?.message || "操作失败", redactionChannel, env) };
+  }
+}
+
 function cookieSecureFlag(request) {
   try {
     return new URL(request.url).protocol === "https:";
@@ -1252,7 +1458,10 @@ function sealBox(publicKeyB64, message) {
 }
 
 // 命名导出仅供本地单测/脚本复用；Worker 入口仍是 default export
-export { handleCheckin, handleBatch, runScheduled, runSelectedCheckin, checkinWithFallback, batchCheckinCore };
+export {
+  handleCheckin, handleBatch, runScheduled, runSelectedCheckin, checkinWithFallback, batchCheckinCore,
+  getTelegramChannelActionOptions, runTelegramChannelAction,
+};
 
 export default {
   async fetch(request, env, ctx) {
@@ -1277,6 +1486,7 @@ export default {
       return json({
         ok: true,
         service: "checkin-hub",
+        version: appVersion,
         authRequired: authRequired(env),
         kvBound: kvBound(env),
         adapters: listAdapters().map((a) => a.id),
@@ -1288,7 +1498,7 @@ export default {
     if (authRequired(env) && !isPublicPath(pathname, request.method)) {
       const ok = await isAuthenticated(request, env);
       if (!ok) {
-        if (pathname === "/" || pathname === "/index.html") return html(uiHtml);
+        if (pathname === "/" || pathname === "/index.html") return html(appUiHtml);
         return unauthorized();
       }
     }
@@ -1298,6 +1508,8 @@ export default {
         checkinAll: () => runScheduled(env),
         retryFailed: () => runFailedCheckins(env),
         checkinChannel: (selection) => runChannelCheckin(env, selection),
+        getChannelActionOptions: (target) => getTelegramChannelActionOptions(env, target),
+        channelAction: (target, action, extra) => runTelegramChannelAction(env, target, action, extra),
         testProxies: () => startProxyTest(env),
       });
     }
@@ -1408,7 +1620,7 @@ export default {
 
 
     if (request.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
-      return html(uiHtml);
+      return html(appUiHtml);
     }
 
 

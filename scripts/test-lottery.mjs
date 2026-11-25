@@ -777,6 +777,36 @@ try {
     ok(calls.length === 1, "非 404 失败只请求一次", String(calls.length));
 
   }
+  {
+    console.log("▶ TG 同一确认并发重放使用逐抽稳定幂等键");
+    const receipts = new Map();
+    let charged = 0;
+    const calls = mockFetch({
+      "GET /api/v1/lottery/status": () => json(200, STATUS_BODY({ today_remaining: 10 })),
+      "POST /api/v1/lottery": ({ call }) => {
+        const key = JSON.parse(call.body).idempotency_key;
+        if (!receipts.has(key)) {
+          charged++;
+          receipts.set(key, DRAW_BODY({ today_remaining: 10 - charged, today_draws: charged }));
+        }
+        return json(200, receipts.get(key));
+      },
+    });
+    const requestId = "1".repeat(32);
+    const replayed = await Promise.all([
+      sub2apiAdapter.lottery(ch(), { count: 2, requestId }),
+      sub2apiAdapter.lottery(ch(), { count: 2, requestId }),
+    ]);
+    ok(replayed.every((result) => result.ok), "同一确认的两个并发请求都能得到结果");
+    const keys = calls.filter((call) => call.method === "POST").map((call) => JSON.parse(call.body).idempotency_key);
+    ok(keys.length === 4 && new Set(keys).size === 2 && charged === 2, "同一确认仅消耗两次，两个抽次的幂等键互异");
+    ok(keys.every((key) => /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(key)), "幂等键保留 UUID 格式");
+    await sub2apiAdapter.lottery(ch(), { count: 2, requestId: "2".repeat(32) });
+    ok(charged === 4, "新的用户确认使用新的幂等键");
+    await sub2apiAdapter.lottery(ch(), { count: 2 });
+    await sub2apiAdapter.lottery(ch(), { count: 2 });
+    ok(charged === 8, "普通面板和自动抽奖仍每次生成新键");
+  }
 } finally {
   globalThis.fetch = restoreFetch;
 }

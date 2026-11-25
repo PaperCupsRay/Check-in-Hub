@@ -82,6 +82,7 @@ test("runOne preserves refreshed tokens, retry metadata, quota and lottery witho
   for (const ok of [true, false]) {
     let actionCalls = 0;
     const input = channel();
+    input.options.apiOnly = true;
     const r = await runOne(input, "gha_api", async (type, action, active) => {
       actionCalls++;
       assert.equal(type, "newapi");
@@ -95,6 +96,7 @@ test("runOne preserves refreshed tokens, retry metadata, quota and lottery witho
     assert.deepEqual(r.newTokens, tokens);
     assert.equal(r.attempts, 3);
     assert.equal(r.maxAttempts, 3);
+    assert.equal(r.apiOnly, true);
     assert.equal(r.quotaInfo.lastReward, 50);
     assert.deepEqual(r.lottery, lottery);
   }
@@ -134,6 +136,21 @@ test("API-only persists pending before dispatch and cannot overwrite an immediat
   assert.ok(!messages[1].includes("待确认"));
   assert.equal(env.CHECKIN_KV.read("channels")[0].lastResult.pending, false);
   assert.equal(env.CHECKIN_KV.read("channels")[0].lastResult.ok, true);
+});
+
+test("apiOnly channels keep gha_api failures terminal instead of dispatching browsers", async () => {
+  const env = makeEnv();
+  const { calls, messages } = mockWorkerOutbound(env);
+  const input = { ...failure({ needsBrowser: false, message: "HTTP 403" }), apiOnly: true };
+  let fallbackList;
+  const result = await reportWithBrowserFallback([input], ["gha_api"], [], {
+    writeFallback: (names) => { fallbackList = names; },
+  });
+  assert.deepEqual(fallbackList, []);
+  assert.equal(result[0].pending, undefined);
+  assert.equal(result[0].message, "HTTP 403");
+  assert.equal(calls.some((call) => call.path === "/api/gh/dispatch"), false);
+  assert.ok(messages[0].includes("❌ <b>Future API</b>"));
 });
 
 test("failed independent dispatch reports only affected channels as terminal failures", async () => {

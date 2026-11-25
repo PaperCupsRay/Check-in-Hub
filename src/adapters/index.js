@@ -34,6 +34,9 @@ export function listAdapters() {
       key: "options.retryCount", type: "number", min: 0, max: 5, step: 1,
       label: "失败重试次数（0–5；Worker 默认 0，Actions 默认 2）",
       placeholder: "留空使用执行通道默认值；0 表示不重试",
+    }, {
+      key: "options.apiOnly", type: "checkbox",
+      label: "HTTP API only（gha_api 失败不自动转浏览器通道）",
     }],
     // 适配器自报的额外动作（目前只有 linux.sb 的「抽称号」）：面板按它在卡片上
     // 渲染按钮，src/ui.html 的 actionLabel / extraButtons 据此工作。

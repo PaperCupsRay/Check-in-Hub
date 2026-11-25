@@ -40,6 +40,28 @@ await test('POST error + authoritative checked-in state prevents retries and bro
   assert.equal(posts,1);assert.equal(r.ok,true);assert.equal(r.needsBrowser,false);assert.equal(r.result.alreadyCheckedIn,true);
   assert.equal(r.tokens.accessToken,'fresh');assert.equal(r.tokens.cookie,'rotated');assert.match(r.message,/状态复查确认/);
 });
+await test('explicit already-checked responses are terminal success, including HTTP errors', async () => {
+  for (const failure of [
+    { ok: false, httpStatus: 400, message: "今天已经签到" },
+    { ok: false, httpStatus: 404, raw: { message: "already checked in today" } },
+    { ok: false, httpStatus: 409, raw: { code: "ALREADY_CHECKED_IN" } },
+  ]) {
+    let posts = 0;
+    const r = await runCheckinWithRetry({
+      checkin: async () => { posts++; return failure; },
+      status: async () => assert.fail("already checked must stop before status/retry"),
+    }, channel, {}, instant);
+    assert.equal(posts, 1);
+    assert.equal(r.ok, true);
+    assert.equal(r.result.alreadyCheckedIn, true);
+    assert.equal(r.attempts, 1);
+  }
+  const notChecked = await runCheckinWithRetry({
+    checkin: async () => ({ ok: false, httpStatus: 400, message: "not already checked in" }),
+  }, { ...channel, options: { retryCount: 0 } }, {}, instant);
+  assert.equal(notChecked.ok, false);
+});
+
 await test('unknown/failed state never implies success', async () => {
   for(const state of [{ok:true,status:{}},{ok:false,status:{checkedInToday:true}}]) {
     const r=await runCheckinWithRetry({checkin:async()=>({ok:false,needsBrowser:true}),status:async()=>state},channel,{},instant);
@@ -81,7 +103,10 @@ await test('fresh session clears a stale snake-case alias', async () => {
 });
 });
 await test('all adapters expose number field; non-checkin actions never retry', async () => {
-  for(const adapter of listAdapters()) { const f=adapter.fields.find(x=>x.key==='options.retryCount');assert.equal(f.type,'number');assert.equal(f.min,0);assert.equal(f.max,5); }
+  for(const adapter of listAdapters()) {
+    const f=adapter.fields.find(x=>x.key==='options.retryCount');assert.equal(f.type,'number');assert.equal(f.min,0);assert.equal(f.max,5);
+    const apiOnly=adapter.fields.find(x=>x.key==='options.apiOnly');assert.equal(apiOnly.type,'checkbox');assert.match(apiOnly.label,/不自动转浏览器/);
+  }
   let calls=0;
   adapters.fixture={fields:[],claim:async()=>{calls++;throw new Error('claim failed');},checkin:async()=>({ok:true})};
   try {

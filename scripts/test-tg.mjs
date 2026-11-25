@@ -480,7 +480,7 @@ async function testSetupAndStatus() {
     );
     show(setWebhook?.body.drop_pending_updates === undefined, "不 drop_pending_updates");
     const setCmd = fm.calls.find((c) => c.u.pathname.endsWith("setMyCommands"));
-    show(!!setCmd && Array.isArray(setCmd.body.commands) && setCmd.body.commands.length === 9, "setMyCommands 注册完整指令菜单");
+    show(!!setCmd && Array.isArray(setCmd.body.commands) && setCmd.body.commands.length === 10 && setCmd.body.commands.some((item) => item.command === "actions"), "setMyCommands 注册完整指令菜单");
   }
   {
     const fm = mockFetch(defaultRoutes());
@@ -708,7 +708,175 @@ async function testReportLotteryDeduplication() {
   show(true, "去重后签到和抽奖行仍分别 HTML 转义");
 }
 
-const suites = [testFailClosed, testChatAndUserFilter, testCommandsAndButtons, testSetupAndStatus, testTelegramApi, testSafetyBoundaries, testReportLotteryDeduplication];
+async function testChannelActions() {
+  console.log("▶ 渠道功能菜单、日志和抽奖确认");
+  const channels = [
+    { id: "lottery-id", name: "Alpha <safe>", type: "sub2api", baseUrl: "https://private.example", auth: { accessToken: "private-token" } },
+    { id: "gacha-id", name: "Linux", type: "linuxsb", baseUrl: "https://linux.example" },
+    { id: "claim-id", name: "Axis", type: "onyxaxis", baseUrl: "https://axis.example" },
+    { id: "disabled", name: "Disabled", type: "sub2api", enabled: false },
+  ];
+  const kv = mockKV();
+  await kv.put("channels", JSON.stringify(channels));
+  const env = { ...BASE_ENV, CHECKIN_KV: kv };
+  const calls = [], executed = [], optionsRead = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(init.body) });
+    return Response.json({ ok: true, result: { message_id: 7 } });
+  };
+  let lotteryInfo = {
+    ok: true, message: "可抽 12 次", status: { todayRemaining: 12 },
+    result: { canDraw: true, costMode: "all", costType: "paid", costAmount: 2, maxDraws: 12 },
+  };
+  const actions = {
+    getChannelActionOptions: async (target) => {
+      optionsRead.push(target);
+      const channel = channels.find((item) => item.id === target.id);
+      if (!channel || channel.enabled === false) return { ok: false, error: "该渠道已停用" };
+      const extra = {
+        sub2api: [{ action: "lottery", label: "抽奖", count: true }, { action: "lotteryInfo", label: "抽奖状态" }],
+        linuxsb: [{ action: "gacha", label: "抽称号" }],
+        onyxaxis: [{ action: "claim", label: "领里程碑" }],
+      }[channel.type];
+      return {
+        ok: true, channel: { id: channel.id, name: channel.name, type: channel.type },
+        actions: [{ action: "me", label: "余额" }, { action: "status", label: "状态" }, ...extra],
+        lastResult: { ok: false, summary: "错误 <safe> https://private.example hidden", at: 1700000000000 },
+      };
+    },
+    checkinChannel: async (target) => { executed.push({ target, action: "checkin" }); return { ok: true, message: "签到完成" }; },
+    channelAction: async (target, action, extra) => {
+      executed.push({ target, action, extra });
+      if (action === "lotteryInfo") return lotteryInfo;
+      if (action === "me") return { ok: true, message: "ok", user: { balance: 9.5 } };
+      if (action === "status") return { ok: true, message: "success", status: { checkedInToday: true, currentStreak: 4, totalCheckInDays: 8 } };
+      return { ok: true, message: `完成 ${action} <safe>` };
+    },
+  };
+  const receive = async (data) => handleTelegramWebhook(webhookRequest(callbackUpdate({ data }), secretHeader), env, null, actions);
+  const lastButtons = () => calls.filter((call) => call.body.reply_markup).at(-1)?.body.reply_markup.inline_keyboard.flat() || [];
+  const lastText = () => calls.filter((call) => call.body.text).at(-1)?.body.text || "";
+  const openChannel = async (name) => {
+    await handleTelegramWebhook(webhookRequest(messageUpdate({ text: "/actions@MyHubBot" }), secretHeader), env, null, actions);
+    const button = lastButtons().find((item) => item.text === name);
+    assert.ok(button);
+    await receive(button.callback_data);
+    return lastButtons();
+  };
+
+  const menu = await openChannel("Alpha <safe>");
+  assert.ok(menu.some((item) => item.text === "抽奖"));
+  assert.ok(menu.some((item) => item.text === "余额") && menu.some((item) => item.text === "状态"));
+  assert.ok(menu.some((item) => item.text.includes("日志")));
+  assert.ok(!menu.some((item) => item.text === "抽奖状态" || item.text === "编辑" || item.text === "删除"));
+  assert.equal(optionsRead[0].id, "lottery-id");
+  const tickets = [...kv._dump()].filter(([key]) => key.startsWith("tg_channel_action_"));
+  assert.ok(tickets.every(([, value]) => !value.includes("private-token")));
+  assert.ok(calls.filter((call) => call.body.reply_markup).every((call) => call.body.reply_markup.inline_keyboard.flat().every((item) => item.callback_data.length <= 64 && !item.callback_data.includes("private"))));
+  assert.ok(!calls.some((call) => call.body.reply_markup?.inline_keyboard.flat().some((item) => item.text === "Disabled")));
+  show(true, "/actions 按渠道发现功能，仅列启用渠道并使用无凭据短期票据");
+
+  const me = menu.find((item) => item.text === "余额");
+  await receive(me.callback_data);
+  assert.match(lastText(), /余额 \$9\.50/);
+  await receive(me.callback_data);
+  assert.equal(executed.filter((item) => item.action === "me").length, 1);
+  show(true, "余额由结构化字段显示，操作票据不可重复点击执行");
+
+  await receive(menu.find((item) => item.text === "状态").callback_data);
+  assert.match(lastText(), /今日已签到.*连续 4 天.*签到 8 次/);
+  await receive(menu.find((item) => item.text.includes("日志")).callback_data);
+  assert.match(lastText(), /错误 &lt;safe&gt;/);
+  assert.ok(!lastText().includes("private.example"));
+  show(true, "渠道状态可读，日志只展示脱敏摘要并正确转义");
+
+  await receive(menu.find((item) => item.text === "抽奖").callback_data);
+  assert.equal(executed.filter((item) => item.action === "lottery").length, 0);
+  assert.equal(executed.filter((item) => item.action === "lotteryInfo").length, 1);
+  assert.match(lastText(), /今日剩余：12 次/);
+  assert.match(lastText(), /余额 2\/次/);
+  assert.match(lastText(), /会消耗余额/);
+  const counts = lastButtons().filter((item) => item.callback_data.startsWith("op:"));
+  assert.deepEqual(counts.map((item) => item.text), ["1 次", "3 次", "5 次"]);
+  await receive(counts[1].callback_data);
+  const confirmation = executed.find((item) => item.action === "lottery").extra;
+  assert.equal(confirmation.count, 3);
+  assert.equal(confirmation.costMode, "all");
+  assert.equal(confirmation.requestId, counts[1].callback_data.slice(3));
+  await receive(counts[1].callback_data);
+  assert.equal(executed.filter((item) => item.action === "lottery").length, 1);
+  show(true, "抽奖先读剩余和消耗规则，明确选择最多 5 次，并单次消费确认票据");
+
+  for (const [name, label, action] of [["Linux", "抽称号", "gacha"], ["Axis", "领里程碑", "claim"]]) {
+    const buttons = await openChannel(name);
+    await receive(buttons.find((item) => item.text === label).callback_data);
+    assert.ok(executed.some((item) => item.action === action));
+    assert.match(lastText(), /&lt;safe&gt;/);
+  }
+  show(true, "抽称号与领里程碑共用动态功能入口");
+
+  lotteryInfo = { ok: true, message: "今日次数已用完", result: { canDraw: false, maxDraws: 0 }, status: { todayRemaining: 0 } };
+  const unavailableMenu = await openChannel("Alpha <safe>");
+  await receive(unavailableMenu.find((item) => item.text === "抽奖").callback_data);
+  assert.match(lastText(), /今日次数已用完/);
+  assert.equal(calls.filter((call) => call.body.text).at(-1).body.reply_markup, undefined);
+  channels[0].enabled = false;
+  await receive(menu.find((item) => item.text === "📝 最近日志").callback_data);
+  assert.match(lastText(), /已停用/);
+  show(true, "无次数不生成执行按钮，旧渠道按钮会重新验证启用状态");
+
+  const retryMenu = await openChannel("Linux");
+  const retryButton = retryMenu.find((item) => item.text === "抽称号");
+  const savedPut = kv.put;
+  const savedGet = kv.get;
+  const callsBeforeRetry = executed.length;
+  kv.put = async (key, value) => {
+    if (key.startsWith("tg_update_")) throw new Error("temporary KV failure");
+    return savedPut(key, value);
+  };
+  const pendingUpdate = callbackUpdate({ data: retryButton.callback_data });
+  const failedRecord = await handleTelegramWebhook(webhookRequest(pendingUpdate, secretHeader), env, null, actions);
+  assert.equal(failedRecord.status, 503);
+  assert.equal(executed.length, callsBeforeRetry);
+  assert.ok(kv._dump().has("tg_channel_action_" + retryButton.callback_data.slice(3)));
+  kv.put = savedPut;
+  await handleTelegramWebhook(webhookRequest(pendingUpdate, secretHeader), env, null, actions);
+  assert.equal(executed.length, callsBeforeRetry + 1);
+  kv.get = async (key) => {
+    if (key.startsWith("tg_channel_action_")) throw new Error("temporary KV read failure");
+    return savedGet(key);
+  };
+  const failedRead = await receive(retryButton.callback_data);
+  assert.equal(failedRead.status, 503);
+  kv.get = savedGet;
+  show(true, "去重写失败不消耗操作票据，按钮读失败返回可重试 503");
+
+  const raceToken = "a".repeat(32);
+  const raceKey = "tg_channel_action_" + raceToken;
+  await kv.put(raceKey, JSON.stringify({ kind: "channel-operation", selection: { id: "lottery-id" }, action: "lottery", count: 1, costMode: "all" }));
+  let waiters = [];
+  kv.get = async (key) => {
+    const value = await savedGet(key);
+    if (key !== raceKey) return value;
+    return new Promise((resolve) => {
+      waiters.push(() => resolve(value));
+      if (waiters.length === 2) {
+        const ready = waiters;
+        waiters = [];
+        ready.forEach((finish) => finish());
+      }
+    });
+  };
+  const confirmedBeforeRace = executed.filter((item) => item.action === "lottery").length;
+  await Promise.all([receive(`op:${raceToken}`), receive(`op:${raceToken}`)]);
+  kv.get = savedGet;
+  const raced = executed.filter((item) => item.action === "lottery").slice(confirmedBeforeRace);
+  assert.equal(raced.length, 2);
+  assert.ok(raced.every((item) => item.extra.requestId === raceToken));
+  show(true, "并发重复回调携带相同 requestId，供站点逐抽幂等去重");
+}
+
+const suites = [testFailClosed, testChatAndUserFilter, testCommandsAndButtons, testSetupAndStatus, testTelegramApi, testSafetyBoundaries, testReportLotteryDeduplication, testChannelActions];
 let aborted = false;
 for (const s of suites) {
   if (aborted) break;

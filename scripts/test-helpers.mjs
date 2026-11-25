@@ -19,7 +19,8 @@ export function memoryKV(initial = {}) {
 export async function loadWorker() {
   const src = new URL("../src/index.js", import.meta.url);
   let code = await readFile(src, "utf8");
-  code = code.replace(/^import uiHtml from "\.\/ui\.html";\r?$/m, 'const uiHtml = "<html></html>";');
+  const uiHtml = await readFile(new URL("../src/ui.html", import.meta.url), "utf8");
+  code = code.replace(/^import uiHtml from "\.\/ui\.html";\r?$/m, () => `const uiHtml = ${JSON.stringify(uiHtml)};`);
   code = code.replace(/\bfrom "([^"]+)"/g, (_, spec) => {
     const url = spec.startsWith(".") ? new URL(spec, src).href : import.meta.resolve(spec);
     return `from "${url}"`;

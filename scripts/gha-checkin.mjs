@@ -97,13 +97,14 @@ function mergeWafCookies(channel) {
 export async function runOne(channel, runner, action = null) {
   const runAction = action || (await import("../src/adapters/index.js")).runAction;
   const started = Date.now();
+  const apiOnly = channel.options?.apiOnly === true || ["1", "true", "yes", "on"].includes(String(channel.options?.apiOnly ?? "").trim().toLowerCase());
   try {
     let ch = channel;
     if (runner === "gha_browser") {
       ch = mergeWafCookies(channel);
       const hasWaf = /acw_tc|acw_sc__v2|cf_clearance|cdn_sec_tc/i.test(ch.auth?.cookie || "");
       if (!hasWaf) {
-        return { name: channel.name, type: channel.type, ok: false, runner, message: "无可用 WAF cookie（浏览器解挑战未产出）", ms: Date.now() - started };
+        return { name: channel.name, type: channel.type, ok: false, runner, apiOnly, message: "无可用 WAF cookie（浏览器解挑战未产出）", ms: Date.now() - started };
       }
     }
     const r = await runAction(channel.type, "checkin", ch);
@@ -123,21 +124,20 @@ export async function runOne(channel, runner, action = null) {
       type: channel.type,
       ok: !!r.ok,
       runner,
+      apiOnly,
       message: r.message || (r.ok ? "ok" : "failed"),
       httpStatus: r.httpStatus ?? null,
       needsBrowser: !!r.needsBrowser,
-      // runAction 已执行共享重试；这里只保留最终结论与刷新出的凭证，不再重试 HTTP。
       retryable: isPermanentCheckinFailure(r) ? false : r.retryable,
       attempts: r.attempts ?? null,
       maxAttempts: r.maxAttempts ?? null,
       newTokens: r.tokens || null,
-      // 签到顺带的抽奖结论（适配器放在 result.lottery 里）：回传后 TG 报告单独占一行
       lottery: r.result?.lottery || null,
       quotaInfo: qi,
       ms: Date.now() - started,
     };
   } catch (e) {
-    return { name: channel.name, type: channel.type, ok: false, runner,
+    return { name: channel.name, type: channel.type, ok: false, runner, apiOnly,
       httpStatus: e.status ?? null, message: e.message || String(e), ms: Date.now() - started };
   }
 }
@@ -209,7 +209,7 @@ export async function reportWithBrowserFallback(results, runners, ghaBrowserName
   dispatch = dispatchBrowserFallback,
   writeFallback = (names) => fs.writeFileSync("gha-fallback.json", JSON.stringify(names, null, 2)),
 } = {}) {
-  const fallback = results.filter((r) => r.runner === "gha_api" && !r.ok &&
+  const fallback = results.filter((r) => r.runner === "gha_api" && !r.ok && !r.apiOnly &&
     BROWSER_TYPES.has(r.type) && !isPermanentCheckinFailure(r));
   const needBrowser = [...new Set(fallback.map((r) => r.name))];
   const nameSet = new Set(needBrowser);

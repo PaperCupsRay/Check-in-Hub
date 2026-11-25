@@ -3,7 +3,10 @@ import { test, afterEach } from "node:test";
 import { adapters } from "../src/adapters/index.js";
 import { loadWorker, memoryKV } from "./test-helpers.mjs";
 
-const { default: worker, runSelectedCheckin, runScheduled, batchCheckinCore } = await loadWorker();
+const {
+  default: worker, runSelectedCheckin, runScheduled, batchCheckinCore,
+  getTelegramChannelActionOptions, runTelegramChannelAction,
+} = await loadWorker();
 const nativeFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = nativeFetch; });
 const makeEnv = () => ({
@@ -123,7 +126,8 @@ test("面板登录后注册 Telegram Webhook 与命令，未配 KV 返回友好�
   assert.equal(response.status, 200);
   assert.equal(calls[0].body.url, "https://hub.example.com/api/tg/webhook");
   assert.equal(calls[0].body.secret_token, env.TG_WEBHOOK_SECRET);
-  assert.equal(calls[1].body.commands.length, 9);
+  assert.equal(calls[1].body.commands.length, 10);
+  assert.ok(calls[1].body.commands.some((command) => command.command === "actions"));
   assert.ok(!(await response.text()).includes(env.TG_WEBHOOK_SECRET));
   const noKv = await call({ ...env, CHECKIN_KV: null }, "/api/tg/setup", { method: "POST", login: true });
   assert.equal(noKv.status, 400);
@@ -343,4 +347,329 @@ test("Worker batch check-in uses no default retries and skips exhausted subreque
     if (previous) adapters.fixture = previous;
     else delete adapters.fixture;
   }
+});
+
+test("Telegram actions use live channel configuration and expose every declared adapter action", async () => {
+  const env = makeEnv();
+  const channels = [
+    { id: "sub-id", name: "Sub", type: "sub2api", baseUrl: "https://sub.example", enabled: true, auth: { accessToken: "private-access-token" } },
+    { id: "linux-id", name: "Linux", type: "linuxsb", baseUrl: "https://linux.example", enabled: true, auth: { cookie: "session=private-cookie" } },
+    { id: "onyx-id", name: "Onyx", type: "onyxaxis", baseUrl: "https://onyx.example", enabled: true, auth: { cookie: "session=private-cookie" } },
+  ];
+  channels[0].lastResult = {
+    action: "me", ok: true, at: 12345, summary: "balance 10 private-access-token https://private.example/path",
+    data: { tokens: { accessToken: "must-not-read-this" }, raw: { private: "raw-data" } },
+  };
+  env.CHECKIN_KV = memoryKV({ channels });
+  for (const [target, action] of [["sub-id", "lottery"], ["linux-id", "gacha"], ["onyx-id", "claim"]]) {
+    const options = await getTelegramChannelActionOptions(env, target);
+    assert.equal(options.ok, true);
+    assert.ok(options.actions.some((item) => item.action === action));
+    assert.ok(options.actions.some((item) => item.action === "me"));
+    assert.ok(options.actions.some((item) => item.action === "status"));
+  }
+  const options = await getTelegramChannelActionOptions(env, "sub-id");
+  assert.match(options.lastResult.summary, /balance 10/);
+  assert.doesNotMatch(JSON.stringify(options), /private-access-token|private\.example|must-not-read-this|raw-data/);
+  assert.equal("data" in options.lastResult, false);
+  assert.equal(env.CHECKIN_KV.writes.length, 0);
+
+  const current = env.CHECKIN_KV.read("channels");
+  current[0].enabled = false;
+  await env.CHECKIN_KV.put("channels", JSON.stringify(current));
+  assert.equal((await getTelegramChannelActionOptions(env, "sub-id")).ok, false);
+  assert.equal((await runTelegramChannelAction(env, "sub-id", "me")).ok, false);
+  assert.equal((await runTelegramChannelAction(env, "missing-id", "me")).ok, false);
+});
+
+test("Telegram declared actions preserve only rotated tokens and remove credentials and raw results", async () => {
+  const previous = adapters.fixture;
+  const oldAccess = "old-private-access";
+  const rotatedAccess = "rotated-private-access";
+  const cookie = "session=private-cookie";
+  const longToken = "long-secret-".repeat(130);
+  const shortPassword = "xy";
+  const lastResult = { ok: false, action: "checkin", summary: "preserved", at: 2 };
+  const env = makeEnv();
+  env.CHECKIN_KV = memoryKV({ channels: [{
+    id: "fixture-id", name: "Fixture", type: "fixture", baseUrl: "https://fixture.example", enabled: true,
+    auth: { accessToken: oldAccess, cookie, refreshToken: longToken, password: shortPassword }, options: {}, lastResult,
+  }] });
+  const calls = [];
+  adapters.fixture = {
+    actions: [{ action: "bonus", label: "Bonus" }],
+    me: async (channel) => {
+      calls.push(["me", channel.auth.accessToken]);
+      return {
+        ok: true, message: `balance ${longToken} ${oldAccess} ${rotatedAccess} ${cookie} ${shortPassword} https://private.example`,
+        user: {
+          quota: 2000000, usedQuota: 100000, raw: { quota_per_unit: 250000, private: "raw-data" },
+          nested: { accessToken: rotatedAccess },
+          deeply: { first: { second: { third: { fourth: { fifth: { private: oldAccess } } } } } },
+        },
+        tokens: { accessToken: rotatedAccess }, raw: { private: "raw-data" },
+      };
+    },
+    bonus: async () => {
+      calls.push(["bonus"]);
+      return { ok: true, message: "Bonus claimed", result: { reward: 10, raw: { private: "raw-data" } } };
+    },
+    login: async () => assert.fail("undeclared action must not execute"),
+  };
+  try {
+    const balance = await runTelegramChannelAction(env, { id: "fixture-id" }, "me");
+    assert.equal(balance.ok, true);
+    assert.equal(balance.user.quota, 2000000);
+    assert.equal(balance.user.quotaPerUnit, 250000);
+    assert.doesNotMatch(JSON.stringify(balance), /old-private-access|rotated-private-access|private-cookie|private\.example|raw-data|accessToken|long-secret-|xy/);
+    assert.equal("tokens" in balance, false);
+    assert.equal("raw" in balance, false);
+    assert.equal(env.CHECKIN_KV.read("channels")[0].auth.accessToken, rotatedAccess);
+    assert.deepEqual(env.CHECKIN_KV.read("channels")[0].lastResult, lastResult);
+    const writeCount = env.CHECKIN_KV.writes.length;
+    const bonus = await runTelegramChannelAction(env, "fixture-id", "bonus");
+    assert.equal(bonus.ok, true);
+    assert.deepEqual(bonus.result, { reward: 10 });
+    assert.equal(env.CHECKIN_KV.writes.length, writeCount);
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "login")).ok, false);
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "checkin")).ok, false);
+    adapters.fixture.actions = [];
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "bonus")).ok, false);
+    assert.deepEqual(calls, [["me", oldAccess], ["bonus"]]);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Telegram legacy selections must uniquely match a current enabled channel", async () => {
+  const previous = adapters.fixture;
+  let calls = 0;
+  adapters.fixture = { actions: [], me: async () => { calls++; return { ok: true, user: { quota: 1 } }; } };
+  const legacy = { name: "Legacy", type: "fixture", baseUrl: "https://legacy.example", enabled: true, auth: {} };
+  const env = makeEnv();
+  env.CHECKIN_KV = memoryKV({ channels: [legacy] });
+  const target = { name: legacy.name, type: legacy.type, baseUrl: legacy.baseUrl };
+  try {
+    assert.equal((await runTelegramChannelAction(env, target, "me")).ok, true);
+    assert.equal((await runTelegramChannelAction(env, { ...target, baseUrl: "https://wrong.example" }, "me")).ok, false);
+    await env.CHECKIN_KV.put("channels", JSON.stringify([legacy, { ...legacy }]));
+    assert.equal((await runTelegramChannelAction(env, target, "me")).ok, false);
+    await env.CHECKIN_KV.put("channels", JSON.stringify([{ ...legacy, id: "now-has-id" }]));
+    assert.equal((await runTelegramChannelAction(env, target, "me")).ok, false);
+    assert.equal(calls, 1);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Telegram token rotation merges into latest KV without reverting concurrent config or credentials", async () => {
+  const previous = adapters.fixture;
+  const env = makeEnv();
+  env.CHECKIN_KV = memoryKV({ channels: [{
+    id: "fixture-id", name: "Original", type: "fixture", baseUrl: "https://fixture.example", enabled: true,
+    auth: { accessToken: "old-access", cookie: "old-cookie" }, options: {}, lastResult: { summary: "keep" },
+  }] });
+  adapters.fixture = {
+    actions: [],
+    me: async () => {
+      const current = env.CHECKIN_KV.read("channels");
+      current[0].name = "Edited while running";
+      current[0].options = { retryCount: 4 };
+      current[0].auth.cookie = "manually-updated-cookie";
+      await env.CHECKIN_KV.put("channels", JSON.stringify(current));
+      return { ok: true, tokens: { accessToken: "rotated-access", cookie: "stale-returned-cookie" } };
+    },
+  };
+  try {
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "me")).ok, true);
+    const stored = env.CHECKIN_KV.read("channels")[0];
+    assert.equal(stored.name, "Edited while running");
+    assert.deepEqual(stored.options, { retryCount: 4 });
+    assert.equal(stored.auth.accessToken, "rotated-access");
+    assert.equal(stored.auth.cookie, "manually-updated-cookie");
+    assert.deepEqual(stored.lastResult, { summary: "keep" });
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Telegram lottery revalidates availability, mode, batch cap and fresh tokens before spending", async () => {
+  const previous = adapters.fixture;
+  const env = makeEnv();
+  env.CHECKIN_KV = memoryKV({ channels: [{
+    id: "fixture-id", name: "Lottery", type: "fixture", baseUrl: "https://fixture.example", enabled: true,
+    auth: { accessToken: "old-private-access" }, options: { lotteryCost: "free" },
+  }] });
+  const draws = [];
+  const requestIds = [];
+  let infoCalls = 0;
+  let available = 10;
+  let canDraw = true;
+  let mode = "free";
+  adapters.fixture = {
+    actions: [{ action: "lottery", label: "Lottery", count: {} }],
+    lotteryInfo: async () => {
+      infoCalls++;
+      return {
+        ok: true, message: "Lottery status",
+        result: { canDraw, maxDraws: available, costMode: mode },
+        tokens: { accessToken: "fresh-private-access" },
+      };
+    },
+    lottery: async (channel, extra) => {
+      assert.equal(channel.auth.accessToken, "fresh-private-access");
+      draws.push(extra.count);
+      requestIds.push(extra.requestId);
+      return { ok: true, message: "Lottery completed", result: { count: extra.count } };
+    },
+  };
+  try {
+    const requestId = "a".repeat(32);
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 9, costMode: "free", requestId })).result.count, 5);
+    assert.equal(requestIds[0], requestId);
+    for (const invalid of ["bad", "a".repeat(33), 123, {}, "A".repeat(32)]) {
+      assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 1, costMode: "free", requestId: invalid })).ok, false);
+    }
+    available = 1;
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 3, costMode: "free" })).ok, false);
+    canDraw = false;
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 1, costMode: "free" })).ok, false);
+    canDraw = true;
+    for (const count of [undefined, 0, -1, 1.5, NaN, "bad"]) {
+      assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count, costMode: "free" })).ok, false);
+    }
+    const current = env.CHECKIN_KV.read("channels");
+    current[0].options.lotteryCost = "all";
+    await env.CHECKIN_KV.put("channels", JSON.stringify(current));
+    const priorInfoCalls = infoCalls;
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 1, costMode: "free" })).ok, false);
+    assert.equal(infoCalls, priorInfoCalls);
+    mode = "all";
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lottery", { count: 1, costMode: "all" })).ok, true);
+    adapters.fixture.actions = [];
+    assert.equal((await runTelegramChannelAction(env, "fixture-id", "lotteryInfo")).ok, false);
+    assert.equal(infoCalls, priorInfoCalls + 1);
+    assert.deepEqual(draws, [5, 1]);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Telegram actions webhook exposes balances, extra adapter actions, lottery confirmation and safe logs", async () => {
+  const env = {
+    ...makeEnv(), TG_BOT_TOKEN: "123:fake-token", TG_CHAT_ID: "123", TG_WEBHOOK_SECRET: "secret_0123456789abcdef",
+  };
+  env.CHECKIN_KV = memoryKV({ channels: [
+    {
+      id: "sub-id", name: "Sub", type: "sub2api", baseUrl: "https://sub.example", enabled: true,
+      auth: { accessToken: "private-sub-access" }, options: { lotteryCost: "free" },
+      lastResult: { ok: true, action: "me", summary: "Balance summary private-sub-access", at: 12345, data: { raw: { secret: "private-raw-result" } } },
+    },
+    { id: "linux-id", name: "Linux", type: "linuxsb", baseUrl: "https://linux.example", enabled: true, auth: { cookie: "session=private-linux-cookie" } },
+    { id: "onyx-id", name: "Onyx", type: "onyxaxis", baseUrl: "https://onyx.example", enabled: true, auth: { cookie: "obsidian_session=private-onyx-cookie" } },
+    { id: "disabled-id", name: "Disabled", type: "sub2api", baseUrl: "https://disabled.example", enabled: false },
+  ] });
+  const telegram = [];
+  const siteCalls = [];
+  let remaining = 3;
+  let draws = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "api.telegram.org") {
+      telegram.push({ method: parsed.pathname.split("/").at(-1), body: JSON.parse(init.body || "{}") });
+      return Response.json({ ok: true, result: { message_id: 77 } });
+    }
+    siteCalls.push({ host: parsed.hostname, path: parsed.pathname, init });
+    if (parsed.hostname === "sub.example") {
+      if (parsed.pathname === "/api/v1/auth/me") {
+        assert.equal(init.headers.Authorization, "Bearer private-sub-access");
+        return Response.json({ code: 0, data: { balance: 12.5, raw: "private-raw-result" } });
+      }
+      if (parsed.pathname === "/api/v1/lottery/status") return Response.json({ code: 0, data: {
+        enabled: true, can_draw: true, window_open: true, daily_draw_limit: 3, today_draws: 3 - remaining,
+        today_remaining: remaining, free_balance: 100, costs: { free: { enabled: true, amount: "1" } },
+      } });
+      if (parsed.pathname === "/api/v1/lottery") {
+        draws++;
+        remaining--;
+        return Response.json({ code: 0, data: {
+          draw: { id: draws, status: "win", prize_type: "free", prize_amount: 10, prize_amount_actual: 10, cost_type: "free", cost_free: 1 },
+          today_draws: 3 - remaining, today_remaining: remaining, free_balance: 109,
+        } });
+      }
+    }
+    if (parsed.hostname === "linux.example") {
+      if (parsed.pathname === "/") return new Response('<a href="/daily_checkin">Daily</a><div class="user-name">Tester</div><input name="_csrf" value="csrf-private">');
+      if (parsed.pathname === "/gacha_pull" && init.method === "POST") return new Response(null, { status: 302, headers: { Location: "/gacha_pull?result=private-result" } });
+      if (parsed.pathname === "/gacha_pull") return new Response('<div class="gacha-result-card"><div class="gacha-result-rarity">R</div><div class="gacha-result-name">Test title</div></div>');
+    }
+    if (parsed.hostname === "onyx.example" && parsed.pathname === "/api/checkin") return Response.json({
+      enabled: true, streak: 1, month_count: 1, rules: [{ id: "rule-five", title: "Five day reward", progress: 1, days: 5, claimable: false }],
+    });
+    assert.fail(`unexpected fixture request ${parsed.pathname}`);
+  };
+  let updateId = 1000;
+  const submit = async (payload) => {
+    const pending = [];
+    const response = await worker.fetch(new Request("https://hub.example.com/api/tg/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ["X-" + "Telegram" + "-Bot-Api-Secret-Token"]: env.TG_WEBHOOK_SECRET },
+      body: JSON.stringify({ update_id: updateId++, ...payload }),
+    }), env, { waitUntil: (promise) => pending.push(promise) });
+    assert.equal(response.status, 200);
+    await Promise.all(pending);
+  };
+  const callback = (data) => submit({ callback_query: { id: `callback-${updateId}`, from: { id: 123 }, message: { message_id: 77, chat: { id: 123 } }, data } });
+  const buttons = () => telegram.filter((call) => call.body.reply_markup).at(-1).body.reply_markup.inline_keyboard.flat();
+  const open = async (name) => {
+    await submit({ message: { chat: { id: 123 }, from: { id: 123 }, text: "/actions" } });
+    assert.equal(buttons().some((button) => button.text === "Disabled"), false);
+    const channel = buttons().find((button) => button.text === name);
+    assert.ok(channel);
+    assert.ok(channel.callback_data.startsWith("ac:"));
+    await callback(channel.callback_data);
+  };
+
+  await open("Sub");
+  const balance = buttons().find((button) => button.text === "余额");
+  await callback(balance.callback_data);
+  assert.match(telegram.at(-1).body.text, /\$12\.50/);
+  await callback(balance.callback_data);
+  assert.equal(siteCalls.filter((call) => call.path === "/api/v1/auth/me").length, 1);
+  await open("Sub");
+  await callback(buttons().find((button) => button.text.includes("最近日志")).callback_data);
+  assert.match(telegram.at(-1).body.text, /Balance summary/);
+
+  await open("Linux");
+  await callback(buttons().find((button) => button.text === "抽称号").callback_data);
+  assert.match(telegram.at(-1).body.text, /Test title/);
+  assert.equal(siteCalls.filter((call) => call.path === "/gacha_pull" && call.init.method === "POST").length, 1);
+  await open("Onyx");
+  await callback(buttons().find((button) => button.text === "领里程碑").callback_data);
+  assert.match(telegram.at(-1).body.text, /Five day reward 1\/5/);
+
+  await open("Sub");
+  await callback(buttons().find((button) => button.text === "抽奖").callback_data);
+  assert.match(telegram.at(-1).body.text, /免费额度/);
+  const three = buttons().find((button) => button.text === "3 次");
+  assert.ok(three);
+  remaining = 1;
+  await callback(three.callback_data);
+  assert.equal(draws, 0);
+  assert.match(telegram.at(-1).body.text, /最多可抽 1/);
+  await open("Sub");
+  await callback(buttons().find((button) => button.text === "抽奖").callback_data);
+  const one = buttons().find((button) => button.text === "1 次");
+  assert.ok(one);
+  await callback(one.callback_data);
+  assert.equal(draws, 1);
+  assert.match(telegram.at(-1).body.text, /抽奖 1 次/);
+  await callback(one.callback_data);
+  assert.equal(draws, 1);
+  const output = JSON.stringify(telegram.map((call) => call.body));
+  assert.doesNotMatch(output, /private-sub-access|private-linux-cookie|private-onyx-cookie|private-raw-result|csrf-private|sub\.example|linux\.example|onyx\.example/);
 });

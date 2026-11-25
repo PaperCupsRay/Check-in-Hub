@@ -42,6 +42,27 @@ function applyTokens(channel, tokens) {
   return { ...channel, auth };
 }
 
+function isAlreadyCheckedIn(result) {
+  if (result?.alreadyCheckedIn || result?.result?.alreadyCheckedIn || result?.status?.checkedInToday) return true;
+  const raw = result?.raw;
+  const text = [
+    result?.message,
+    result?.error,
+    raw?.code,
+    raw?.message,
+    raw?.msg,
+    raw?.error,
+    raw?.detail,
+    raw?.data?.code,
+    raw?.data?.message,
+    raw?.data?.msg,
+    raw?.data?.error,
+    typeof raw === "string" ? raw : "",
+  ].filter(Boolean).join(" ");
+  if (/not\s+(?:already\s+)?checked\s+in|未签到|尚未签到/i.test(text)) return false;
+  return /already[_\s-]+(?:have[_\s-]+)?checked[_\s-]+in(?:[_\s-]+today)?|already[_\s-]+signed[_\s-]+in(?:[_\s-]+today)?|今天(?:已经|已)签到|今日(?:已经|已)签到|已经签到|已签到/i.test(text);
+}
+
 export async function runCheckinWithRetry(adapter, channel, extra = {}, {
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   defaultRetryCount = DEFAULT_RETRY_COUNT,
@@ -65,6 +86,16 @@ export async function runCheckinWithRetry(adapter, channel, extra = {}, {
       result = await adapter.checkin(active, extra);
     } catch (error) {
       result = { ok: false, message: error.message || String(error), httpStatus: error.status };
+    }
+    if (!result.ok && isAlreadyCheckedIn(result)) {
+      const details = result.result && typeof result.result === "object" ? result.result : {};
+      result = {
+        ...result,
+        ok: true,
+        needsBrowser: false,
+        result: { ...details, success: true, alreadyCheckedIn: true },
+        message: result.message || "今日已签到",
+      };
     }
     accept(result);
     if (result.ok) {

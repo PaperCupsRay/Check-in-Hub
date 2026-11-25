@@ -320,6 +320,15 @@ function lotteryRequestedCount(requested) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 }
 
+async function lotteryRequestKey(requestId, drawIndex) {
+  if (!requestId) return crypto.randomUUID();
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${requestId}:${drawIndex}`)));
+  digest[6] = (digest[6] & 15) | 64;
+  digest[8] = (digest[8] & 63) | 128;
+  const hex = Array.from(digest.slice(0, 16), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 function numOrNull(v) {
   if (v == null || v === "") return null;
   const n = Number(v);
@@ -828,7 +837,8 @@ export const sub2apiAdapter = {
    *     不能因为后面一次失败就当成整体失败）。
    * 每次抽奖都带新的 idempotency_key：重复用同一个 key 会被服务端去重，等于白抽。
    */
-  async lottery(channel, { count } = {}) {
+  async lottery(channel, { count, requestId } = {}) {
+    const operationId = typeof requestId === "string" && /^[a-f0-9]{32}$/.test(requestId) ? requestId : "";
     return this.withAuthRetry(channel, async (token, authVia) => {
       const statusRes = await this.lotteryStatus(channel, { token });
       if (!statusRes.ok) {
@@ -893,7 +903,7 @@ export const sub2apiAdapter = {
         const res = await this.request(channel, LOTTERY_PATH, {
           method: "POST",
           token,
-          body: { cost_type: cost.type, idempotency_key: crypto.randomUUID(), boost: false },
+          body: { cost_type: cost.type, idempotency_key: await lotteryRequestKey(operationId, i), boost: false },
         });
         const data = res.data || {};
         if (res.status >= 400 || data.code !== 0) {

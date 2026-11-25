@@ -511,8 +511,7 @@ function httpErrorMessage(action, res) {
   if (looksLikeHtmlChallenge(data, status) || status === 403) {
     return (
       (serverMsg ? `${serverMsg} · ` : "") +
-      `${action} 被目标站 Cloudflare 拒绝 (HTTP ${status || "?"})。` +
-      `原因：请求从 Cloudflare Workers 出口发出，与浏览器 IP/人机验证不匹配；` +
+      `原因：当前纯 HTTP 出口被目标站拦截，可能与出口 IP 或人机验证限制有关；` +
       `粘贴 session/cf_clearance 通常也无效。` +
       `请改用面板渠道上的「浏览器直连」：在已登录的目标站点控制台运行脚本查询状态/签到。`
     );
