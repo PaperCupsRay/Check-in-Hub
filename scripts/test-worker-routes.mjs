@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, afterEach } from "node:test";
 import { adapters } from "../src/adapters/index.js";
+import { channelFetch } from "../src/channel-transport.js";
 import { loadWorker, memoryKV } from "./test-helpers.mjs";
 
 const {
@@ -343,6 +344,107 @@ test("Worker batch check-in uses no default retries and skips exhausted subreque
     assert.equal(outcome.via, "worker");
     assert.equal(outcome.result.attempts, 1);
     assert.match(outcome.result.message, /Too many subrequests/);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Scheduled worker budget defers remaining channels into one GHA dispatch", async () => {
+  const previous = adapters.fixture;
+  const requests = [];
+  const dispatched = [];
+  adapters.fixture = {
+    fields: [],
+    checkin: async (channel) => {
+      const response = await channelFetch(channel, `${channel.baseUrl}/check-in`, { method: "POST" });
+      return { ok: response.ok, message: "fixture check-in" };
+    },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("api.github.com")) {
+      dispatched.push(JSON.parse(init.body).client_payload);
+      return new Response(null, { status: 204 });
+    }
+    requests.push(target);
+    return Response.json({ ok: true });
+  };
+  try {
+    const items = ["one", "two", "three"].map((name) => ({
+      name,
+      type: "fixture",
+      baseUrl: `https://${name}.example`,
+      auth: {},
+      options: {},
+    }));
+    const outcomes = await batchCheckinCore(items, { GH_TOKEN: "gh-token-test", GH_REPO: "owner/repo" }, {
+      budget: { limit: 1, used: 0, deferred: false, acquire() {
+        if (this.used >= this.limit) { this.deferred = true; return false; }
+        this.used += 1;
+        return true;
+      } },
+    });
+    assert.deepEqual(requests, ["https://one.example/check-in"]);
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].names, ["two", "three"]);
+    assert.deepEqual(dispatched[0].runners, ["gha_api"]);
+    assert.equal(outcomes[0].result.ok, true);
+    assert.equal(outcomes[1].via, "gha_api");
+    assert.equal(outcomes[2].via, "gha_api");
+    assert.ok(outcomes[1].result.pending);
+    assert.match(outcomes[1].result.message, /子请求预算已用尽/);
+  } finally {
+    if (previous) adapters.fixture = previous;
+    else delete adapters.fixture;
+  }
+});
+
+test("Cron wires the channel budget and persists deferred results as pending", async () => {
+  const previous = adapters.fixture;
+  const dispatched = [];
+  adapters.fixture = {
+    fields: [],
+    checkin: async (channel) => {
+      const response = await channelFetch(channel, `${channel.baseUrl}/check-in`, { method: "POST" });
+      return { ok: response.ok, message: "fixture check-in" };
+    },
+  };
+  const channels = Array.from({ length: 33 }, (_, index) => `channel-${index + 1}`).map((name) => ({
+    name,
+    type: "fixture",
+    baseUrl: `https://${name}.example`,
+    enabled: true,
+    auth: {},
+    options: {},
+  }));
+  const env = {
+    GH_TOKEN: "gh-token-test",
+    GH_REPO: "owner/repo",
+    CHECKIN_KV: memoryKV({ channels, proxies: [] }),
+  };
+  let calls = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("api.github.com")) {
+      calls++;
+      dispatched.push(JSON.parse(init.body).client_payload);
+      return new Response(null, { status: 204 });
+    }
+    calls++;
+    return Response.json({ ok: true });
+  };
+  try {
+    const result = await runScheduled(env);
+    assert.equal(result.ok, true);
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].names, ["channel-33"]);
+    const stored = env.CHECKIN_KV.read("channels");
+    assert.equal(stored[0].lastResult.ok, true);
+    assert.equal(stored[31].lastResult.ok, true);
+    assert.equal(stored[32].lastResult.pending, true);
+    assert.match(stored[32].lastResult.summary, /子请求预算已用尽/);
+    assert.equal(calls, 33);
   } finally {
     if (previous) adapters.fixture = previous;
     else delete adapters.fixture;

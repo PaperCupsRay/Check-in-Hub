@@ -303,6 +303,13 @@ curl -X POST https://<your-worker>/api/cron/run \
 
 渠道签到按 `worker → gha_api / gha_browser` 降级，token 过期优先在本地自愈：
 
+- 定时任务在配置了 GitHub Actions 时会为 Worker 直连设置保守的批次预算（当前最多约
+  `32` 次渠道请求），为 GHA 分发、KV 回写和 Telegram 报告预留子请求额度。达到预算后，
+  剩余渠道会合并到一次 `gha_api` 分发，浏览器所需渠道仍由 Actions 的后续兜底流程处理，
+  不会把整批渠道留在 Worker 末尾才发现无法分发。
+- 这个预算只作用于定时批次；面板手动单渠道/批量操作仍按原有执行路径运行。预算是保护阈值，
+  不能替代对适配器内部登录、备用接口和抽奖请求数量的估算。
+
 - **Worker 直连**失败后看适配器结论：sub2api 站 accessToken 过期会自动
   `refreshToken` 换新 → 不行再账密重新登录 → 用新 token 重试签到；成功就完全不降级
   （文案分别标「刷新 token 后签到」「重新登录后签到」）；

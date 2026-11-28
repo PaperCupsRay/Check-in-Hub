@@ -1,6 +1,7 @@
 import { listAdapters, runAction, getAdapter } from "./adapters/index.js";
 import { stripIpBoundCookies } from "./adapters/forum.js";
 import { isPermanentCheckinFailure } from "./checkin-retry.js";
+import { hasFixedProxy, withChannelTransport } from "./channel-transport.js";
 import {
   authRequired,
   isAuthenticated,
@@ -37,6 +38,12 @@ const util = _naclUtil;
 import { blake2b } from "@noble/hashes/blake2.js";
 
 const appUiHtml = uiHtml.replaceAll("__CHECKIN_HUB_VERSION__", appVersion);
+
+// Cloudflare Workers Free has a 50-subrequest limit per invocation. Scheduled
+// check-ins must leave room for the grouped GitHub dispatches, KV writes and TG
+// report after the channel requests finish. The budget is deliberately scoped
+// to channelFetch calls; other invocation work is accounted for by this margin.
+export const SCHEDULED_CHANNEL_FETCH_BUDGET = 32;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -180,6 +187,37 @@ function ghFallbackAvailable(env) {
   return !!(env.GH_TOKEN && env.GH_REPO);
 }
 
+function createChannelRequestBudget(limit = SCHEDULED_CHANNEL_FETCH_BUDGET) {
+  const max = Math.max(1, Number.isSafeInteger(Number(limit)) ? Number(limit) : SCHEDULED_CHANNEL_FETCH_BUDGET);
+  return {
+    limit: max,
+    used: 0,
+    deferred: false,
+    acquire() {
+      if (this.used >= this.limit) {
+        this.deferred = true;
+        return false;
+      }
+      this.used += 1;
+      return true;
+    },
+  };
+}
+
+function budgetedWorkerChannel(channel, budget) {
+  // A fixed proxy is intentionally fail-closed by channel-transport. Never
+  // attach a transport here or it would silently turn that channel direct.
+  if (!budget || hasFixedProxy(channel)) return channel;
+  return withChannelTransport(channel, async (url, init) => {
+    if (!budget.acquire()) {
+      const error = new Error("Worker 子请求预算已用尽");
+      error.code = "CHANNEL_SUBREQUEST_BUDGET";
+      throw error;
+    }
+    return fetch(url, init);
+  });
+}
+
 // 换出口也不会成功的失败（凭证缺失/接口不存在/类型配错）不降级，避免浪费 Actions 运行。
 // 例外见下面的 browserOnly：适配器明确标了 needsBrowser 时以它为准，文案里的「需要」
 // 不该把「恰好只有浏览器能解」的失败拦在降级之外。
@@ -193,10 +231,39 @@ const PERMANENT_FAIL_RE = /缺少|需要|未配置|不存在|404|无可用|未�
  */
 const BROWSER_CAPABLE = new Set(["sub2api", "newapi", "nodeseek", "linuxsb"]);
 
-async function tryWorkerCheckin(channel) {
+async function tryWorkerCheckin(channel, budget = null) {
   try {
-    return await runAction(channel.type, "checkin", channel, {}, { defaultRetryCount: 0 });
+    const result = await runAction(
+      channel.type,
+      "checkin",
+      budgetedWorkerChannel(channel, budget),
+      {},
+      { defaultRetryCount: 0 },
+    );
+    // Adapters intentionally catch request errors so they can return a useful
+    // result. The budget marker is authoritative: the current channel and all
+    // following channels must not consume another Worker request. Preserve an
+    // already successful check-in (for example, an optional auto-lottery may
+    // have been skipped after the budget was reached), but defer failures.
+    if (budget?.deferred && !result?.ok) {
+      return {
+        ...result,
+        ok: false,
+        deferToGha: true,
+        retryable: false,
+        message: "Worker 子请求预算已用尽，已转 GitHub Actions",
+      };
+    }
+    return result;
   } catch (err) {
+    if (budget?.deferred || err?.code === "CHANNEL_SUBREQUEST_BUDGET") {
+      return {
+        ok: false,
+        deferToGha: true,
+        retryable: false,
+        message: "Worker 子请求预算已用尽，已转 GitHub Actions",
+      };
+    }
     return { ok: false, message: err.message || String(err) };
   }
 }
@@ -218,7 +285,7 @@ async function tryWorkerCheckin(channel) {
  * "gha_browser" 是待确认占位（ok=false, pending=true），真实结果由 GHA 回传覆盖
  * KV lastResult + TG 通知。占位保留 worker 尝试刷新出的 tokens 供持久化。
  */
-async function batchCheckinCore(items, env) {
+async function batchCheckinCore(items, env, { budget = null } = {}) {
   const out = [];
   const canFallback = !!(env && ghFallbackAvailable(env));
   const groups = new Map(); // runner -> [{ item, reason, tokens }]
@@ -242,13 +309,14 @@ async function batchCheckinCore(items, env) {
       continue;
     }
 
-    const result = await tryWorkerCheckin(channel);
+    const result = await tryWorkerCheckin(channel, budget);
     // 需要浏览器才能过的失败（登录接口要 Turnstile / WAF）直接进浏览器通道：这类失败
     // 换出口没用，而 gha_api 与 Worker 跑的是同一份纯 HTTP 适配器，分发过去只会再失败
     // 一次。2026-09-24「林夕」实测：worker 与 gha_api 双失败，浏览器通道根本没被触发。
     const browserOnly = !!result.needsBrowser && BROWSER_CAPABLE.has(channel.type);
     const permanent = !browserOnly && (isPermanentCheckinFailure(result) || PERMANENT_FAIL_RE.test(String(result.message || "")));
-    if (!result.ok && canFallback && !permanent) {
+    const deferToGha = result.deferToGha === true;
+    if (!result.ok && canFallback && (deferToGha || !permanent)) {
       const target = browserOnly ? "gha_browser" : "gha_api";
       if (!groups.has(target)) groups.set(target, []);
       // 适配器的回退说明（刷新/重登失败原因）就在 message 里，别截得太短以致丢失原因
@@ -768,8 +836,12 @@ async function runScheduled(env) {
     enabled.push(item);
   }
 
-  // 批量核心：worker 渠道直连、非 worker 渠道标记分发、失败渠道收集降级
-  const outcomes = await batchCheckinCore(enabled, env);
+  // 批量核心：worker 渠道直连、非 worker 渠道标记分发、失败渠道收集降级。
+  // When GHA is configured, reserve invocation headroom so the grouped
+  // dispatches and final persistence/report requests cannot be starved by a
+  // variable number of adapter calls (refresh, alternate routes, lottery).
+  const budget = ghFallbackAvailable(env) ? createChannelRequestBudget() : null;
+  const outcomes = await batchCheckinCore(enabled, env, { budget });
   for (const { item, result, via } of outcomes) {
     if (result.tokens) {
       item.auth = { ...(item.auth || {}), ...result.tokens };
