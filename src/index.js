@@ -39,10 +39,6 @@ import { blake2b } from "@noble/hashes/blake2.js";
 
 const appUiHtml = uiHtml.replaceAll("__CHECKIN_HUB_VERSION__", appVersion);
 
-// Cloudflare Workers Free has a 50-subrequest limit per invocation. Scheduled
-// check-ins must leave room for the grouped GitHub dispatches, KV writes and TG
-// report after the channel requests finish. The budget is deliberately scoped
-// to channelFetch calls; other invocation work is accounted for by this margin.
 export const SCHEDULED_CHANNEL_FETCH_BUDGET = 32;
 
 const corsHeaders = {
@@ -205,8 +201,6 @@ function createChannelRequestBudget(limit = SCHEDULED_CHANNEL_FETCH_BUDGET) {
 }
 
 function budgetedWorkerChannel(channel, budget) {
-  // A fixed proxy is intentionally fail-closed by channel-transport. Never
-  // attach a transport here or it would silently turn that channel direct.
   if (!budget || hasFixedProxy(channel)) return channel;
   return withChannelTransport(channel, async (url, init) => {
     if (!budget.acquire()) {
@@ -240,11 +234,6 @@ async function tryWorkerCheckin(channel, budget = null) {
       {},
       { defaultRetryCount: 0 },
     );
-    // Adapters intentionally catch request errors so they can return a useful
-    // result. The budget marker is authoritative: the current channel and all
-    // following channels must not consume another Worker request. Preserve an
-    // already successful check-in (for example, an optional auto-lottery may
-    // have been skipped after the budget was reached), but defer failures.
     if (budget?.deferred && !result?.ok) {
       return {
         ...result,
@@ -836,10 +825,6 @@ async function runScheduled(env) {
     enabled.push(item);
   }
 
-  // 批量核心：worker 渠道直连、非 worker 渠道标记分发、失败渠道收集降级。
-  // When GHA is configured, reserve invocation headroom so the grouped
-  // dispatches and final persistence/report requests cannot be starved by a
-  // variable number of adapter calls (refresh, alternate routes, lottery).
   const budget = ghFallbackAvailable(env) ? createChannelRequestBudget() : null;
   const outcomes = await batchCheckinCore(enabled, env, { budget });
   for (const { item, result, via } of outcomes) {
